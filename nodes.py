@@ -1945,38 +1945,39 @@ class QuantFuncGenerate:
 
         try:
             if ref_images is not None:
-                # Save each ref image to temp file. Keep mul/clamp/cast on GPU
-                # (4× less data to copy to CPU — 12 MB uint8 vs 48 MB float32
-                # for a 2304×1728 image), then write with OpenCV (faster BMP
-                # encode than PIL, ~2× on typical hardware).
+                # Write each ref image as a "QFRAW01" raw uint8 RGB blob to
+                # /dev/shm. Backend ImageUtils::load_image detects the magic
+                # and skips cv::imread entirely — ~80 ms saved per 1728×2304
+                # ref vs the prior BMP encode + cv::imread decode round-trip.
+                # Format: 8-byte magic "QFRAW01\0" + uint32 H + uint32 W +
+                # H*W*3 uint8 RGB bytes.
                 tmp_paths = []
                 try:
                     import cv2
                     _have_cv2 = True
                 except ImportError:
-                    from PIL import Image
                     _have_cv2 = False
+                from PIL import Image  # used only for output preview path
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
-                        fd, tmp_path = tempfile.mkstemp(suffix=".bmp", dir="/dev/shm")
+                        fd, tmp_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
                         os.close(fd)
                         t = img_tensor[i]
+                        # ComfyUI IMAGE is [B, H, W, C] FP32 in [0,1]. Convert
+                        # to HWC uint8 [0,255]. cv2.convertScaleAbs is the
+                        # fast SIMD path; numpy fallback is fine.
+                        arr_f32 = t.numpy() if t.device.type == "cpu" else t.cpu().numpy()
                         if _have_cv2:
-                            # Fused SIMD conversion: FP32 [0,1] → uint8 [0,255]
-                            # via cv2.convertScaleAbs(x, alpha=255). For
-                            # non-negative inputs this is equivalent to
-                            # (x*255).clip(0,255).astype(uint8) but single-pass
-                            # and vectorized — typically 3-4× faster than
-                            # chained numpy ops.
-                            arr_f32 = t.numpy() if t.device.type == "cpu" else t.cpu().numpy()
                             img_np = cv2.convertScaleAbs(arr_f32, alpha=255.0)
                         else:
-                            img_np = (t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                        if _have_cv2:
-                            # Need BGR for cv2.imwrite — do channel swap in-place.
-                            cv2.imwrite(tmp_path, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
-                        else:
-                            Image.fromarray(img_np).save(tmp_path)
+                            img_np = (arr_f32 * 255).clip(0, 255).astype(np.uint8)
+                        h, w = img_np.shape[0], img_np.shape[1]
+                        header = b"QFRAW01\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+                        with open(tmp_path, "wb") as f:
+                            f.write(header)
+                            # tobytes() is C-contiguous HWC uint8 — RGB order
+                            # matches ComfyUI's IMAGE convention, so no swap.
+                            f.write(img_np.tobytes())
                         tmp_paths.append(tmp_path)
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
@@ -2000,26 +2001,23 @@ class QuantFuncGenerate:
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
 
                 # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
-                # (white=mask). Save first slice as 8-bit grayscale PNG, hand
-                # the path to the worker — backend uses it as a pixel-space
-                # mask and resizes to latent dims at sample time.
+                # (white=mask). Save first slice as raw uint8 L8 with
+                # "QFRAWL1" magic header — backend skips PNG decode entirely.
+                # Format: 8-byte magic + uint32 H + uint32 W + H*W uint8.
                 mask_path = None
                 if inpaint_mask is not None and inpaint_strength > 0.0:
-                    fd, mask_path = tempfile.mkstemp(suffix=".png", dir="/dev/shm")
+                    fd, mask_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
                     os.close(fd)
                     m = inpaint_mask
-                    if hasattr(m, "dim"):
-                        # Accept [B,H,W] / [B,1,H,W] / [H,W]
-                        if m.dim() == 4: m = m[0, 0]
-                        elif m.dim() == 3: m = m[0]
-                        m_np = (m.detach().cpu().clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
-                    else:
-                        m_np = np.clip(np.asarray(m), 0.0, 1.0).astype(np.float32)
-                        m_np = (m_np * 255).astype(np.uint8)
-                    if _have_cv2:
-                        cv2.imwrite(mask_path, m_np)
-                    else:
-                        Image.fromarray(m_np, mode="L").save(mask_path)
+                    # Accept [B,H,W] / [B,1,H,W] / [H,W]
+                    if m.dim() == 4: m = m[0, 0]
+                    elif m.dim() == 3: m = m[0]
+                    m_np = (m.detach().cpu().clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+                    h, w = m_np.shape[0], m_np.shape[1]
+                    header = b"QFRAWL1\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+                    with open(mask_path, "wb") as f:
+                        f.write(header)
+                        f.write(m_np.tobytes())
 
                 arr = _manager.image_to_image(
                     cache_key=cache_key,
