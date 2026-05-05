@@ -252,6 +252,13 @@ class WorkerManager:
         self._loaded_keys = set()          # keys currently alive in worker
         self._api_keys = {}                # cache_key -> api_key last set
         self._node_refs = {}               # generate_node_id -> cache_key (owner tracking)
+        # cache_key -> unload_mode policy. Read by ComfyUI's free_memory hook
+        # to decide how aggressively to respond to VRAM pressure from other
+        # plugins. keep_on_gpu: never release (refuse ComfyUI's free_memory);
+        # follow_comfy: offload GPU on normal requests, destroy on blanket
+        # requests (Free Model and Node Cache); clean_up_every_time is
+        # handled by the generate node itself (destroys right after gen).
+        self._unload_modes = {}            # cache_key -> "keep_on_gpu" | "follow_comfy" | "clean_up_every_time"
         self._req_counter = 0
         self._lock = threading.Lock()
 
@@ -395,6 +402,7 @@ class WorkerManager:
             logging.warning("[QuantFunc] Worker process died, restarting...")
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
             self._node_refs.clear()
 
         dll_path = _LIB_PATH
@@ -467,6 +475,7 @@ class WorkerManager:
             self._process = None
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
             self._node_refs.clear()
 
     # ── IPC ──
@@ -583,15 +592,20 @@ class WorkerManager:
 
     def _unload_others_locked(self, keep_key):
         """Offload all pipelines except keep_key to CPU, to free VRAM before
-        loading/running keep_key. Must be called with self._lock held."""
+        loading/running keep_key. Must be called with self._lock held.
+
+        Uses sync=True so the worker's quantfunc_unload_sync blocks until
+        VRAM is actually released — the caller is about to load or run
+        keep_key and can't race with an async offload of the others."""
         others = [k for k in self._loaded_keys if k != keep_key]
         for k in others:
             try:
                 self._call({"cmd": "unload", "req_id": self._next_req_id(),
-                            "cache_key": k}, timeout=60)
-                logging.info("[QuantFunc] Offloaded pipeline %s to CPU", k[:8])
+                            "cache_key": k, "sync": True}, timeout=60)
+                logging.info("[QuantFunc] Evicted pipeline %s to free VRAM for %s",
+                             k[:8], keep_key[:8] if keep_key else "?")
             except Exception as e:
-                logging.warning("[QuantFunc] Failed to offload %s: %s", k[:8], e)
+                logging.warning("[QuantFunc] Failed to evict %s: %s", k[:8], e)
 
     def ensure_pipeline(self, cfg, node_id=None, alive_node_ids=None):
         """Ensure pipeline matching cfg is loaded in worker. Returns its cache key.
@@ -607,7 +621,21 @@ class WorkerManager:
             self._ensure_worker()
 
             key = _make_cache_key(cfg)
-            opts = cfg.get("options", {})
+            opts = dict(cfg.get("options", {}))
+            # Route the transformer's coalesced backup through disk-file-
+            # backed mmap whenever the caller declared they might later
+            # unload. The backing store is a real file (/var/tmp/
+            # quantfunc_backup_XXXXXX, or $QUANTFUNC_BACKUP_DIR / $TMPDIR
+            # if set), released on clean process exit. When the Generate
+            # node sets activate_unload=True and ComfyUI later requests a
+            # free_memory, we trigger releaseRamPages() on that backup so
+            # the kernel writes dirty pages to disk and reclaims ~13 GB of
+            # physical RAM — visible to other plugins. Next gen page-
+            # faults pages back in from disk.
+            # When activate_unload=False (default in the Generate node),
+            # the backup stays in pinned RAM and no disk file is created;
+            # the pipeline refuses ComfyUI's free_memory requests.
+            opts.setdefault("activate_unload", False)
             new_api_key = opts.get("api_key", "")
 
             # Evict stale refs from deleted/disconnected Generate nodes
@@ -631,6 +659,7 @@ class WorkerManager:
                             logging.warning("[QuantFunc] destroy(%s) failed: %s", dropped_key[:8], e)
                         self._loaded_keys.discard(dropped_key)
                         self._api_keys.pop(dropped_key, None)
+                        self._unload_modes.pop(dropped_key, None)
 
             # Update node→key ownership and release orphaned pipelines
             if node_id is not None:
@@ -649,6 +678,7 @@ class WorkerManager:
                             logging.warning("[QuantFunc] destroy(%s) failed: %s", old_key[:8], e)
                         self._loaded_keys.discard(old_key)
                         self._api_keys.pop(old_key, None)
+                        self._unload_modes.pop(old_key, None)
 
             if key in self._loaded_keys:
                 # Pipeline already loaded — check if API key changed
@@ -671,7 +701,6 @@ class WorkerManager:
                 "transformer_path": cfg.get("transformer", ""),
                 "scheduler_config": cfg.get("scheduler", "") or None,
                 "model_backend": cfg.get("backend", "svdq"),
-                "svdq_precision": cfg.get("precision", "int4"),
                 "device_idx": cfg.get("device", 0),
                 "config_json": json.dumps(opts),
             }
@@ -732,8 +761,13 @@ class WorkerManager:
 
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=4.0, negative_prompt="",
-                       options_json=None, pbar=None):
-        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
+                       options_json=None, pbar=None,
+                       mask_path=None, mask_strength=1.0, mask_grow=6,
+                       mask_blur=0.0, mask_no_snap=False):
+        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
+        Optional inpaint: pass `mask_path` to a pixel-space mask PNG (white=inpaint, black=preserve).
+        Mirrors ComfyUI SetLatentNoiseMask + GrowMask + MaskBlur + VAEEncodeForInpaint.grow_mask_by.
+        """
         with self._lock:
             self._ensure_worker()
 
@@ -758,6 +792,12 @@ class WorkerManager:
                 "seed": seed,
                 "options_json": options_json,
             }
+            if mask_path:
+                cmd["mask_path"] = mask_path
+                cmd["mask_strength"] = float(mask_strength)
+                cmd["mask_grow"] = int(mask_grow)
+                cmd["mask_blur"] = float(mask_blur)
+                cmd["mask_no_snap"] = bool(mask_no_snap)
 
             resp = self._call(cmd, progress_cb=on_progress, timeout=600)
             return self._read_image(resp)
@@ -772,6 +812,7 @@ class WorkerManager:
                 self._call({"cmd": "destroy", "req_id": self._next_req_id()})
                 self._loaded_keys.clear()
                 self._api_keys.clear()
+                self._unload_modes.clear()
 
             opts = dict(cfg.get("options", {}))
             sched = cfg.get("scheduler", "")
@@ -785,7 +826,6 @@ class WorkerManager:
                 "export_path": export_path,
                 "transformer_path": cfg.get("transformer", ""),
                 "model_backend": cfg.get("backend", "svdq"),
-                "svdq_precision": cfg.get("precision", "int4"),
                 "device_idx": cfg.get("device", 0),
                 "config_json": json.dumps(opts),
             }
@@ -802,23 +842,32 @@ class WorkerManager:
             except Exception:
                 pass
 
-    def unload_pipeline(self, cache_key=None):
+    def unload_pipeline(self, cache_key=None, sync=False):
         """Offload models from GPU to CPU, freeing VRAM. Pipelines stay alive for fast reload.
-        If cache_key given, unload that one; otherwise unload all."""
+        If cache_key given, unload that one; otherwise unload all.
+
+        sync=True → blocks until VRAM is actually freed (skips the 3-second
+        grace period in the worker). Use this when another component is
+        about to allocate VRAM (cross-pipeline eviction, ComfyUI's
+        free_memory hook for third-party models). Default sync=False is
+        fire-and-forget so the caller can return immediately."""
         with self._lock:
             if self._process is None or self._process.poll() is not None:
                 return
             if not self._loaded_keys:
                 return
-            cmd = {"cmd": "unload", "req_id": self._next_req_id()}
+            cmd = {"cmd": "unload", "req_id": self._next_req_id(), "sync": sync}
             if cache_key is not None:
                 if cache_key not in self._loaded_keys:
                     return
                 cmd["cache_key"] = cache_key
             try:
-                self._call(cmd, timeout=30)
-                logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed (%s)",
-                             cache_key if cache_key else "all")
+                # Sync unload can take up to ~5 s (grace skip + D2H + trim);
+                # async returns almost instantly.
+                self._call(cmd, timeout=60 if sync else 30)
+                logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed (%s%s)",
+                             cache_key if cache_key else "all",
+                             " sync" if sync else "")
             except Exception as e:
                 logging.warning("[QuantFunc] Unload failed: %s", e)
 
@@ -832,6 +881,58 @@ class WorkerManager:
                     pass
                 self._loaded_keys.clear()
                 self._api_keys.clear()
+                self._unload_modes.clear()
+
+    def release_backup_pipeline(self, cache_key):
+        """Release physical RAM pages of the mmap-backed CPU offload_backup
+        while keeping the backing files (and the pipeline handle). Next
+        generate() page-faults pages in (~2-5s via OS page cache / disk)
+        instead of full re-init (~15-25s). Used by unload_mode='gpu+cpu'.
+
+        Pair with unload_pipeline: first unload GPU → CPU (mmap), then
+        release_backup to free the physical RAM while keeping content on
+        disk for fast reload.
+
+        No-op if the DLL predates quantfunc_release_backup, or if the
+        pipeline wasn't created with activate_unload=True (e.g. export
+        mode or the user unticked the widget)."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return
+            if cache_key not in self._loaded_keys:
+                return
+            try:
+                self._call({"cmd": "release_backup",
+                            "req_id": self._next_req_id(),
+                            "cache_key": cache_key}, timeout=30)
+                logging.info("[QuantFunc] Pipeline %s backup released — RAM pages returned to OS",
+                             cache_key[:8] if cache_key else "None")
+            except Exception as e:
+                logging.warning("[QuantFunc] release_backup_pipeline(%s) failed: %s",
+                                cache_key[:8] if cache_key else "None", e)
+
+    def destroy_pipeline(self, cache_key):
+        """Fully destroy a single pipeline (frees GPU + CPU/RAM).
+        Next use will recreate from scratch — slower than unload_pipeline but
+        reclaims the ~10 GB pinned coalesced backup held in system RAM.
+        Used as a last resort / escape hatch."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return
+            if cache_key not in self._loaded_keys:
+                return
+            try:
+                self._call({"cmd": "destroy",
+                            "req_id": self._next_req_id(),
+                            "cache_key": cache_key}, timeout=60)
+                self._loaded_keys.discard(cache_key)
+                self._api_keys.pop(cache_key, None)
+                self._unload_modes.pop(cache_key, None)
+                logging.info("[QuantFunc] Pipeline %s destroyed — GPU + RAM released",
+                             cache_key[:8] if cache_key else "None")
+            except Exception as e:
+                logging.warning("[QuantFunc] destroy_pipeline(%s) failed: %s",
+                                cache_key[:8] if cache_key else "None", e)
 
     def shutdown(self):
         """Shutdown worker process."""
@@ -849,15 +950,31 @@ class WorkerManager:
             self._process = None
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
 
     def _read_image(self, resp):
-        """Read binary image data following a result response."""
+        """Read image data from worker response.
+
+        Prefers /dev/shm path (zero-copy mmap-style read) over stdout pipe
+        binary — the shm path avoids a ~3MB bytes() on worker side and
+        multiple pipe syscalls on parent side."""
         n_bytes = resp.get("image_bytes", 0)
         w = resp.get("image_width", 0)
         h = resp.get("image_height", 0)
         if n_bytes == 0 or w == 0 or h == 0:
             raise RuntimeError("No image data in response")
-        raw = self._read_binary(n_bytes)
+        shm_path = resp.get("image_shm_path")
+        if shm_path:
+            try:
+                with open(shm_path, "rb") as f:
+                    raw = f.read(n_bytes)
+            finally:
+                try:
+                    os.unlink(shm_path)
+                except OSError:
+                    pass
+        else:
+            raw = self._read_binary(n_bytes)
         fmt = resp.get("image_format", "rgb_float32")
         if fmt == "rgb_uint8":
             # uint8 [0,255] → float32 [0,1], 4x less IPC data than float32
@@ -887,25 +1004,68 @@ try:
     _UNREALISTIC_VRAM_REQUEST = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB
 
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
+        # Per-pipeline dispatch based on its configured unload_mode:
+        #   none                — refuse to release under any request
+        #   gpu                 — per-gen already offloaded; on blanket →
+        #                         destroy; on normal → unload (no-op if done)
+        #   gpu+cpu             — stay loaded after gen; on normal pressure →
+        #                         offload GPU + madvise disk backup (return
+        #                         ~10 GB RAM to OS); on blanket → destroy
+        #   clean_up_every_time — per-gen already released; blanket → destroy
         if _manager._loaded_keys and memory_required > 0:
-            # Ignore blanket "free everything" calls (e.g. unload_all_models
-            # passes 1e30).  These happen after every prompt execution when
-            # smart memory management is disabled and would needlessly destroy
-            # the pipeline, forcing expensive re-creation on the next run.
-            if memory_required >= _UNREALISTIC_VRAM_REQUEST:
-                logging.debug("[QuantFunc] Ignoring blanket free_memory call "
-                              f"(requested {memory_required:.2e} bytes)")
-            else:
-                # Only unload if there isn't enough free VRAM to satisfy the request
+            blanket = memory_required >= _UNREALISTIC_VRAM_REQUEST
+
+            if not blanket:
+                # Check if we actually need to do anything (enough free VRAM?)
                 try:
                     import torch
                     free_vram, _ = torch.cuda.mem_get_info(device)
                 except Exception:
                     free_vram = 0
-                if free_vram < memory_required:
-                    logging.info("[QuantFunc] Auto-offloading pipelines to free VRAM for other models "
-                                 f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
-                    _manager.unload_pipeline()  # offload all to CPU, keep alive
+                need_release = free_vram < memory_required
+            else:
+                need_release = True
+
+            if need_release:
+                # Snapshot under lock so we iterate a stable set
+                with _manager._lock:
+                    keys = list(_manager._loaded_keys)
+                    modes = dict(_manager._unload_modes)
+                for k in keys:
+                    mode = modes.get(k, "gpu+cpu")  # safe default
+                    if mode == "none":
+                        logging.debug(
+                            "[QuantFunc] Pipeline %s is unload_mode=none — refusing free_memory request",
+                            k[:8])
+                        continue
+                    # Third-party caller is about to allocate VRAM (or
+                    # clicked Free Model) — every branch below uses sync
+                    # paths so the caller doesn't race with our offload.
+                    if blanket:
+                        logging.info(
+                            "[QuantFunc] Blanket free_memory — destroying pipeline %s (mode=%s)",
+                            k[:8], mode)
+                        _manager.destroy_pipeline(k)
+                    elif mode == "gpu+cpu":
+                        # Full disk-backed release: sync unload (VRAM truly
+                        # freed before returning) + async release_backup
+                        # (madvise on disk file — doesn't block caller).
+                        logging.info(
+                            "[QuantFunc] VRAM pressure (gpu+cpu) — sync offload + async release "
+                            "for pipeline %s (need %d MB, free %d MB)",
+                            k[:8], memory_required // 1024**2, free_vram // 1024**2)
+                        _manager.unload_pipeline(k, sync=True)
+                        _manager.release_backup_pipeline(k)
+                    else:
+                        # gpu / clean_up_every_time: sync offload so VRAM is
+                        # actually freed for the caller. clean_up_every_time
+                        # may already have released, but sync unload is
+                        # idempotent (no-op if nothing on GPU).
+                        logging.info(
+                            "[QuantFunc] VRAM pressure (mode=%s) — sync offload pipeline %s "
+                            "(need %d MB, free %d MB)",
+                            mode, k[:8], memory_required // 1024**2, free_vram // 1024**2)
+                        _manager.unload_pipeline(k, sync=True)
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
@@ -1653,11 +1813,22 @@ class QuantFuncGenerate:
                                "0 = deterministic (no effect). Only used by stochastic samplers.\n"
                                "Recommended 0.2~0.5 for ≤20 steps. Higher eta needs more steps.",
                 }),
-                "unload_every_time": ("BOOLEAN", {
+                "activate_unload": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Offload all models from GPU to CPU after generation, freeing VRAM.\n"
-                               "Models stay in CPU RAM for fast reload on the next run.\n"
-                               "Enable this when sharing VRAM with other ComfyUI nodes.",
+                    "tooltip": "Let ComfyUI unload this pipeline when it needs VRAM for "
+                               "coexisting plugins.\n\n"
+                               "False (default): never unload. Weights stay pinned in RAM "
+                               "(~17 GB) after each generate; fastest subsequent runs (0 "
+                               "overhead). ComfyUI's free_memory requests are refused.\n\n"
+                               "True: listen to ComfyUI's memory-pressure signals. On "
+                               "pressure — another plugin needs VRAM → offload GPU and "
+                               "madvise the disk-backed transformer backup to return "
+                               "~13 GB of RAM to the OS. On 'Free Model and Node Cache' → "
+                               "full destroy. Next run page-faults the backup from disk "
+                               "(~5-15 s on SSD). Enables the disk-backed coalesced backup "
+                               "at pipeline creation, so a ~13 GB file will exist in "
+                               "$QUANTFUNC_BACKUP_DIR / $TMPDIR / /var/tmp / /tmp while "
+                               "the pipeline is alive (unlinked on clean exit).",
                 }),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
@@ -1673,8 +1844,20 @@ class QuantFuncGenerate:
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=4.0,
                  sampler_name="euler", sampler_eta=0.0,
-                 unload_every_time=False, unique_id=None,
-                 workflow_prompt=None):
+                 activate_unload=False, unload_mode=None, unload_every_time=None,
+                 unique_id=None, workflow_prompt=None):
+        # Backwards-compat with older saved workflows that used the
+        # unload_mode dropdown or the unload_every_time bool: both are
+        # collapsed onto a single activate_unload bool — true if the user
+        # asked to release under pressure (any non-"none" legacy value),
+        # false otherwise.  Silent; the new widget is the source of truth.
+        if unload_mode is not None:
+            activate_unload = activate_unload or (unload_mode != "none")
+        if unload_every_time:
+            activate_unload = True
+        # Internal _unload_modes bookkeeping still uses the string "gpu+cpu"
+        # / "none" keys the free_memory hook understands; map the bool.
+        unload_mode_internal = "gpu+cpu" if activate_unload else "none"
         import torch
 
         # Handle unload request
@@ -1692,8 +1875,23 @@ class QuantFuncGenerate:
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # Propagate activate_unload into the pipeline's comp_opts so the
+        # C++ side builds the transformer's coalesced backup on disk
+        # (enabling future releaseRamPages) instead of in pinned RAM.
+        # Must be set at create time — the coalesced backup's storage
+        # medium is baked in during warmup and can't be switched later
+        # without a 13 GB re-pack.
+        cfg["options"]["activate_unload"] = bool(activate_unload)
         # Unpack ImageList dict format
         ref_img_resize = "720"
+        ref_img_resize_others = "720"
+        edit_strength = 0.0
+        # Inpaint defaults (overridden if mask present in ref_images dict).
+        inpaint_mask = None
+        inpaint_strength = 1.0
+        inpaint_grow = 6
+        inpaint_blur = 0.0
+        inpaint_no_snap = False
         if ref_images is not None and isinstance(ref_images, dict):
             # New: ref_img_resize ("720" / "1024" / "origin")
             # Backwards compat: old workflows may still send keep_ref_img_size (bool)
@@ -1701,9 +1899,23 @@ class QuantFuncGenerate:
                 ref_img_resize = ref_images["ref_img_resize"]
             elif ref_images.get("keep_ref_img_size"):
                 ref_img_resize = "1024"
+            ref_img_resize_others = ref_images.get("ref_img_resize_others", "720")
+            edit_strength = ref_images.get("edit_strength", 0.0)
+            color_match = ref_images.get("color_match", 0.0)
+            # Inpaint payload (optional): mask tensor + 4 knobs.
+            inpaint_mask = ref_images.get("mask")
+            inpaint_strength = ref_images.get("mask_strength", 1.0)
+            inpaint_grow = ref_images.get("mask_grow", 6)
+            inpaint_blur = ref_images.get("mask_blur", 0.0)
+            inpaint_no_snap = ref_images.get("mask_no_snap", False)
             ref_images = ref_images["images"]
-        if ref_images is not None:
-            cfg["options"]["edit_mode"] = True
+        # Always create edit-capable pipelines (loads VAE encoder ~150 MB extra)
+        # so toggling ImageList connect/disconnect doesn't change cache_key →
+        # avoids forced pipeline recreate (which costs ~20 s + recently
+        # exposed weight-quant races). Pipeline can serve both t2i and edit
+        # requests; the request cmd (text_to_image vs image_to_image) picks
+        # the actual path at runtime.
+        cfg["options"]["edit_mode"] = True
 
         # Collect live QuantFuncGenerate node ids from the current workflow.
         # Exclude nodes whose required `pipeline` input isn't connected — those
@@ -1733,31 +1945,93 @@ class QuantFuncGenerate:
 
         try:
             if ref_images is not None:
-                # Save each ref image to temp file
-                from PIL import Image
+                # Save each ref image to temp file. Keep mul/clamp/cast on GPU
+                # (4× less data to copy to CPU — 12 MB uint8 vs 48 MB float32
+                # for a 2304×1728 image), then write with OpenCV (faster BMP
+                # encode than PIL, ~2× on typical hardware).
                 tmp_paths = []
+                try:
+                    import cv2
+                    _have_cv2 = True
+                except ImportError:
+                    from PIL import Image
+                    _have_cv2 = False
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
-                        fd, tmp_path = tempfile.mkstemp(suffix=".bmp")
+                        fd, tmp_path = tempfile.mkstemp(suffix=".bmp", dir="/dev/shm")
                         os.close(fd)
-                        img_np = (img_tensor[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                        Image.fromarray(img_np).save(tmp_path)
+                        t = img_tensor[i]
+                        if _have_cv2:
+                            # Fused SIMD conversion: FP32 [0,1] → uint8 [0,255]
+                            # via cv2.convertScaleAbs(x, alpha=255). For
+                            # non-negative inputs this is equivalent to
+                            # (x*255).clip(0,255).astype(uint8) but single-pass
+                            # and vectorized — typically 3-4× faster than
+                            # chained numpy ops.
+                            arr_f32 = t.numpy() if t.device.type == "cpu" else t.cpu().numpy()
+                            img_np = cv2.convertScaleAbs(arr_f32, alpha=255.0)
+                        else:
+                            img_np = (t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                        if _have_cv2:
+                            # Need BGR for cv2.imwrite — do channel swap in-place.
+                            cv2.imwrite(tmp_path, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+                        else:
+                            Image.fromarray(img_np).save(tmp_path)
                         tmp_paths.append(tmp_path)
-
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
                 if sampler_name != "euler":
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
-                i2i_opts["ref_img_resize"] = ref_img_resize
+                # Per-image resize: 主图 (refs[0]) uses main_image_resize,
+                # 参考图 2~10 (refs[1..]) use ref_image_resize_others.
+                # Build per-image array for C++ backend.
+                num_refs = len(tmp_paths)
+                if num_refs > 1 and ref_img_resize != ref_img_resize_others:
+                    resize_arr = [ref_img_resize] + [ref_img_resize_others] * (num_refs - 1)
+                    i2i_opts["ref_img_resize"] = resize_arr
+                else:
+                    i2i_opts["ref_img_resize"] = ref_img_resize
+                if edit_strength > 0.0:
+                    i2i_opts["edit_strength"] = edit_strength
+                if color_match > 0.0:
+                    i2i_opts["color_match"] = color_match
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
+
+                # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
+                # (white=mask). Save first slice as 8-bit grayscale PNG, hand
+                # the path to the worker — backend uses it as a pixel-space
+                # mask and resizes to latent dims at sample time.
+                mask_path = None
+                if inpaint_mask is not None and inpaint_strength > 0.0:
+                    fd, mask_path = tempfile.mkstemp(suffix=".png", dir="/dev/shm")
+                    os.close(fd)
+                    m = inpaint_mask
+                    if hasattr(m, "dim"):
+                        # Accept [B,H,W] / [B,1,H,W] / [H,W]
+                        if m.dim() == 4: m = m[0, 0]
+                        elif m.dim() == 3: m = m[0]
+                        m_np = (m.detach().cpu().clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+                    else:
+                        m_np = np.clip(np.asarray(m), 0.0, 1.0).astype(np.float32)
+                        m_np = (m_np * 255).astype(np.uint8)
+                    if _have_cv2:
+                        cv2.imwrite(mask_path, m_np)
+                    else:
+                        Image.fromarray(m_np, mode="L").save(mask_path)
+
                 arr = _manager.image_to_image(
                     cache_key=cache_key,
                     prompt=prompt, ref_paths=tmp_paths,
                     height=height, width=width, steps=steps, seed=seed,
                     true_cfg_scale=true_cfg_scale, negative_prompt=neg,
-                    options_json=i2i_opts_json, pbar=pbar)
+                    options_json=i2i_opts_json, pbar=pbar,
+                    mask_path=mask_path,
+                    mask_strength=inpaint_strength,
+                    mask_grow=inpaint_grow,
+                    mask_blur=inpaint_blur,
+                    mask_no_snap=inpaint_no_snap)
             else:
                 t2i_opts = {}
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
@@ -1777,10 +2051,16 @@ class QuantFuncGenerate:
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
                     options_json=opts_json, pbar=pbar)
 
-            if unload_every_time:
-                _manager.unload_pipeline(cache_key)
+            # Persist the mode so the ComfyUI free_memory hook can look it up
+            # for this pipeline. The hook inspects _unload_modes[k]:
+            #   "gpu+cpu" (activate_unload=True)  → release on memory pressure
+            #   "none"    (activate_unload=False) → refuse release requests
+            # No per-gen action needed — the hook is the sole trigger.
+            with _manager._lock:
+                _manager._unload_modes[cache_key] = unload_mode_internal
 
-            return (torch.from_numpy(arr).unsqueeze(0),)  # [1, H, W, 3]
+            out = torch.from_numpy(arr).unsqueeze(0)
+            return (out,)  # [1, H, W, 3]
 
         except InterruptedError:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
@@ -1793,21 +2073,85 @@ class QuantFuncGenerate:
 # ============================================================================
 
 class QuantFuncImageList:
-    """Reference images for edit mode. Single or multiple images supported."""
+    """Reference images for edit mode. Single or multiple images supported.
+    Optional MASK input enables inpaint (mirrors ComfyUI SetLatentNoiseMask):
+    only the white region of the mask is regenerated; black region is preserved.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {f"image{i}": ("IMAGE",) for i in range(2, 11)}
-        optional["ref_img_resize"] = (["720", "1024", "origin"], {
+        optional = {}
+        # main_image_mask = 主图遮罩(可选,触发 inpaint)
+        optional["main_image_mask"] = ("MASK", {
+            "tooltip": "主图的 inpaint 遮罩(白=重绘,黑=保留,等价 ComfyUI "
+                       "SetLatentNoiseMask)。只有白色区域被模型重绘;"
+                       "黑色区域通过后处理 snap 完整保留原图。",
+        })
+        # main_image_resize = 主图缩放
+        optional["main_image_resize"] = (["720", "1024", "origin"], {
             "default": "720",
-            "tooltip": "Reference image resize mode (edit pipelines):\n"
-                       "  720  — long-side cap at 720 px (default, fastest)\n"
-                       "  1024 — long-side cap at 1024 px (better quality, slower)\n"
-                       "  origin — keep original size, only floor each dim to a multiple of 16",
+            "tooltip": "主图缩放模式:\n"
+                       "  720  — 长边裁到 720 px(默认,最快)\n"
+                       "  1024 — 长边裁到 1024 px(更高质量,稍慢)\n"
+                       "  origin — 保留原尺寸,只把每边对齐到 16 的倍数",
+        })
+        # ref_image_2..ref_image_10 = 参考图 2-10
+        for i in range(2, 11):
+            optional[f"ref_image_{i}"] = ("IMAGE", {
+                "tooltip": f"第 {i} 张参考图(可选)。最多 10 张。",
+            })
+        # ref_image_resize_others = 参考图 2~10 缩放
+        optional["ref_image_resize_others"] = (["720", "1024", "origin"], {
+            "default": "720",
+            "tooltip": "参考图 2~10 的缩放模式:\n"
+                       "  720  — 长边裁到 720 px(默认,省 VRAM)\n"
+                       "  1024 — 长边裁到 1024 px\n"
+                       "  origin — 保留原尺寸(图大可能 OOM)",
+        })
+        optional["edit_strength"] = ("FLOAT", {
+            "default": 0.0,
+            "min": 0.0,
+            "max": 0.80,
+            "step": 0.05,
+            "tooltip": "edit 模式 img2img 强度(降色偏):\n"
+                       "  0.0 — 纯噪声起始(默认,原行为)\n"
+                       "  0.5 — 50% 参考 + 50% 噪声,2 步(强保色)\n"
+                       "  0.7 — 25% 参考 + 75% 噪声,3 步(平衡)",
+        })
+        optional["color_match"] = ("FLOAT", {
+            "default": 0.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "tooltip": "潜在色彩匹配 (0~1):\n"
+                       "  0.0 — 不校正(最锐利,可能色偏)\n"
+                       "  0.3~0.5 — 平衡(推荐)\n"
+                       "  1.0 — 完全匹配(色彩最忠实,细节略软)",
+        })
+        # 遮罩子参数 — main_image_mask 的辅助开关
+        optional["mask_strength"] = ("FLOAT", {
+            "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "遮罩强度倍数 (0..1)。0 = 关闭 inpaint。",
+        })
+        optional["mask_grow"] = ("INT", {
+            "default": 6, "min": 0, "max": 64, "step": 1,
+            "tooltip": "遮罩像素膨胀 N(对齐 ComfyUI VAEEncodeForInpaint "
+                       "grow_mask_by 默认 6)。让接缝过渡更自然。",
+        })
+        optional["mask_blur"] = ("FLOAT", {
+            "default": 0.0, "min": 0.0, "max": 64.0, "step": 0.5,
+            "tooltip": "遮罩高斯模糊 sigma(像素;对齐 ComfyUI MaskBlur)。0 = 边界硬切。",
+        })
+        optional["mask_no_snap"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "关闭最后一步对未遮罩区域的 snap 回原图。"
+                       "默认关闭(snap 开,跟 ComfyUI 一致)。"
+                       "开启 = 让模型决定整张图,边界过渡更柔和但保留区会轻微飘移。",
         })
         return {
             "required": {
-                "image1": ("IMAGE",),
+                # main_image = 主图
+                "main_image": ("IMAGE", {"tooltip": "edit 模式的主图(被遮罩区域将被重绘)"}),
             },
             "optional": optional,
         }
@@ -1817,13 +2161,94 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, image1, ref_img_resize="720", **kwargs):
-        images = [image1]
+    def combine(self, main_image, main_image_resize="720",
+                ref_image_resize_others="720",
+                edit_strength=0.0, color_match=0.0,
+                main_image_mask=None, mask_strength=1.0, mask_grow=6,
+                mask_blur=0.0, mask_no_snap=False, **kwargs):
+        images = [main_image]
         for i in range(2, 11):
-            img = kwargs.get(f"image{i}")
+            img = kwargs.get(f"ref_image_{i}")
             if img is not None:
                 images.append(img)
-        return ({"images": images, "ref_img_resize": ref_img_resize},)
+        # Internal dict keys keep the legacy `ref_img_resize` / `mask` names so
+        # QuantFuncGenerate.generate (which reads them) needs no parallel rename.
+        out = {
+            "images": images,
+            "ref_img_resize": main_image_resize,
+            "ref_img_resize_others": ref_image_resize_others,
+            "edit_strength": float(edit_strength),
+            "color_match": float(color_match),
+        }
+        if main_image_mask is not None:
+            # Auto-align mask to main_image's pixel dims. Lets users wire any
+            # ImageScale / Resize node into main_image without needing a
+            # parallel resize for the mask (ComfyUI doesn't have a dedicated
+            # MASK resize node — only Image-side scalers). main_image is
+            # [B, H, W, C], main_image_mask is [B, H, W] or [B, 1, H, W].
+            mask_t = main_image_mask
+            img_h, img_w = main_image.shape[1], main_image.shape[2]
+            mh = mask_t.shape[-2]
+            mw = mask_t.shape[-1]
+            if mh != img_h or mw != img_w:
+                import torch.nn.functional as F
+                m4 = mask_t.unsqueeze(1) if mask_t.dim() == 3 else mask_t
+                m4 = F.interpolate(m4, size=(img_h, img_w),
+                                    mode="bilinear", align_corners=False)
+                mask_t = m4.squeeze(1) if mask_t.dim() == 3 else m4
+            out["mask"] = mask_t
+            out["mask_strength"] = float(mask_strength)
+            out["mask_grow"] = int(mask_grow)
+            out["mask_blur"] = float(mask_blur)
+            out["mask_no_snap"] = bool(mask_no_snap)
+        return (out,)
+
+
+# ============================================================================
+# Node: QuantFunc Mask Scale By (mirrors ComfyUI ImageScaleBy, for MASK)
+# ============================================================================
+
+class QuantFuncMaskScaleBy:
+    """按比例缩放 MASK,对称 ComfyUI 自带 ImageScaleBy(自带的不接 MASK 类型)。
+    用法:LoadImageMask → QuantFunc Mask Scale By(同主图的 scale_by)→ main_image_mask"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK", {"tooltip": "要缩放的遮罩"}),
+                "scale_by": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 8.0, "step": 0.01,
+                    "tooltip": "缩放比例。要和主图的 ImageScaleBy 设成一样的值。",
+                }),
+                "method": (["bilinear", "nearest", "bicubic"], {
+                    "default": "bilinear",
+                    "tooltip": "插值方式。bilinear 默认平滑,nearest 保留硬边,"
+                               "bicubic 最高质量但稍慢。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "scale_by"
+    CATEGORY = "QuantFunc"
+
+    def scale_by(self, mask, scale_by, method):
+        import torch.nn.functional as F
+        # ComfyUI MASK is [B, H, W]. Add channel dim for interpolate.
+        m4 = mask.unsqueeze(1) if mask.dim() == 3 else mask
+        h, w = m4.shape[-2], m4.shape[-1]
+        new_h = max(1, int(round(h * scale_by)))
+        new_w = max(1, int(round(w * scale_by)))
+        kwargs = {"size": (new_h, new_w), "mode": method}
+        if method in ("bilinear", "bicubic"):
+            kwargs["align_corners"] = False
+        out = F.interpolate(m4, **kwargs)
+        out = out.clamp(0.0, 1.0)
+        if mask.dim() == 3:
+            out = out.squeeze(1)
+        return (out,)
 
 
 # ============================================================================
@@ -1904,6 +2329,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
     "QuantFuncImageList": QuantFuncImageList,
+    "QuantFuncMaskScaleBy": QuantFuncMaskScaleBy,
     "QuantFuncExport": QuantFuncExport,
 }
 
@@ -1922,5 +2348,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
     "QuantFuncImageList": "QuantFunc Image List",
+    "QuantFuncMaskScaleBy": "QuantFunc Mask Scale By",
     "QuantFuncExport": "QuantFunc Export",
 }
