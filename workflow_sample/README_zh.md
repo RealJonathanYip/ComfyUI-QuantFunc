@@ -4,137 +4,48 @@
 
 ## 1. 概述
 
-本目录包含 QuantFunc ComfyUI 插件的示例工作流。将 `.json` 文件导入 ComfyUI 即可快速开始。
+本目录提供一个**全家桶示例工作流**，演示所有 QuantFunc 节点、所有加载模型的方式以及所有用途。导入 ComfyUI 后，使用与你场景匹配的分组即可。
 
 | 工作流 | 说明 |
 |--------|------|
-| `QuantFunc-Easy-Gen.json` | 新手入门 3 节点工作流，自动下载模型，无需手动配置 |
-| `QuantFunc-Text-to-Image-Workflow.json` | 文生图（SVDQ + Lighting） |
-| `QuantFunc-Image-to-Image-Workflow.json` | 参考图像编辑（QwenImage-Edit） |
-| `QuantFunc-Model-Export.json` | 导出运行时量化模型（支持融合 LoRA） |
+| `QuantFunc-Sample-WorkFlow-All-In-One.json` | 一个综合工作流：**3 种加载权重方式** × **文生图 / 图像编辑 / 模型导出**。画布内的便签对每个分组做了说明。 |
 
-每个工作流包含**两组节点** —— 左侧 **SVDQ**（预量化权重），右侧 **Lighting**（运行时量化）。根据你的模型选择对应的组。
+> 此工作流替代了原先按用途拆分的多个示例文件 —— 现在全部集中在一个工作流里。
 
-## 2. 节点说明
+## 2. 工作流内容
 
-### 2.1 QuantFunc Model Loader（模型加载器）
+拖动画布到你需要的分组。
 
-入口节点，配置加载哪个模型以及如何加载。
+### 2.1 加载模型 —— 三种方式
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `model_dir` | 是 | 基础模型目录路径（diffusers 格式，含 `model_index.json`） |
-| `transformer_path` | 是* | 量化 Transformer 权重路径（`.safetensors`）。*Lighting 运行时量化从 FP16 时留空 |
-| `model_backend` | 是 | `svdq`（预量化）或 `lighting`（运行时量化） |
-| `device` | 是 | GPU 编号（0, 1, ...） |
-| `precision_config` | 仅 Lighting | 逐层精度 JSON 配置文件路径 |
-| `prequant_weights` | 仅 Lighting | 预量化 modulation 权重路径 |
-| `scheduler_config` | 可选 | 自定义调度器 JSON 路径（Lightning 蒸馏模型） |
-| `api_key` | 可选 | QuantFunc API 密钥 |
-| `fused_mod` | 可选 | 启用融合 modulation（Lighting，实验性） |
+| 方式 | 节点 | 适用场景 |
+|------|------|----------|
+| **现有 UNet / CLIP / VAE** | *Pick Diffusion Model* + *Pick CLIP* + *Pick VAE* → **Build Pipeline** | 你已有拆分好的各组件文件（ComfyUI 原生连线方式）。 |
+| **基础模型 / 预量化模型** | *Model Loader* 或 *Model Auto Loader*（一键下载） | diffusers 基础模型目录，或预量化模型。若加载原精度 diffusers 基础模型，还需接 *Precision Config (Auto) Loader*。 |
+| **全家桶 checkpoint** | *Pick Checkpoint* → **Build Pipeline** | 单文件打包的 checkpoint（AIO）。 |
 
-**输出：** `QUANTFUNC_PIPELINE` —— 连接 LoRA 节点或直接连接 Generate。
+> 加载**原精度 diffusers 基础模型**时**必须**接 **Precision Config (Auto) Loader** —— 它提供逐层精度表；预量化 / checkpoint 模型则不需要。
 
-### 2.2 QuantFunc LoRA（LoRA 加载器）
+### 2.2 用途 —— 三个示例
 
-向管线追加 LoRA 适配器。**可链式连接** —— 串联多个 LoRA 节点即可叠加 LoRA。
+- **文生图** —— pipeline → **Generate** → **Preview Image**。
+- **图像编辑** —— **Load Image** → **Image List** → **Generate**（参考图 / 局部重绘编辑）。在 Image List 上接 `MASK` 即可局部重绘（白色重绘、黑色保留）。
+- **导出** —— **Export** 节点。选 **checkpoint** 格式导出全家桶（含所有组件），或选 **diffusers** 只导出 vae / clip / transformer 其中一部分。
 
-| 参数 | 说明 |
+**LoRA：** 在任意 pipeline 上接 **LoRA Auto Loader**；串联多个即可叠加 LoRA（零成本合并）。
+
+## 3. 节点说明（v2）
+
+| 节点 | 作用 |
 |------|------|
-| `lora_path` | LoRA `.safetensors` 文件路径 |
-| `strength` | LoRA 强度倍数（默认 1.0） |
-
-### 2.3 QuantFunc LoRA Config（LoRA 配置）
-
-控制 LoRA 合并策略。**SVDQ 后端使用 LoRA 时必须添加此节点**（控制新 LoRA 与 SVDQ 权重中已有 LoRA 的合并方式）。
-
-| 参数 | 说明 |
-|------|------|
-| `merge_method` | `auto`（推荐）、`concat` 或 `replace` |
-| `max_rank` | 最大合并 LoRA 秩（-1 = 自动） |
-
-### 2.4 QuantFunc Generate（图像生成）
-
-核心推理节点。根据文本生成图像，或使用参考图编辑图像。
-
-| 参数 | 说明 |
-|------|------|
-| `prompt` | 文本提示词 |
-| `width` / `height` | 输出图像尺寸 |
-| `steps` | 去噪步数（Lightning 用 4，完整模型 8-30） |
-| `seed` | 随机种子（-1 = 随机） |
-| `guidance_scale` | CFG 引导强度 |
-| `negative_prompt` | 反向提示词（True CFG） |
-| `true_cfg_scale` | True CFG 强度（>1.0 启用双流 CFG） |
-| `ref_images` | 可选 —— 连接 QuantFunc Image List 进入编辑模式 |
-
-**输出：** `IMAGE` —— 连接 Preview Image 或 Save Image。
-
-> 连接 `ref_images` 后，节点自动切换为**图像编辑模式**（QwenImage-Edit 管线）。
-
-### 2.5 QuantFunc Image List（参考图列表）
-
-收集 1-10 张参考图用于编辑模式。将 `LoadImage` 节点连接到输入槽位。
-
-### 2.6 QuantFunc Pipeline Config（管线配置）
-
-高级配置（可选）。连接到 Model Loader 时覆盖 `auto_optimize` 默认值。
-
-| 参数 | 说明 |
-|------|------|
-| `cpu_offload` | 空闲模型卸载到 CPU |
-| `layer_offload` | 逐层 Transformer 卸载（更省显存，更慢） |
-| `tiled_vae` | 分块 VAE 解码（高分辨率） |
-| `attention_backend` | `auto`、`sage`、`flash` 或 `sdpa` |
-| `precision` | `bf16` 或 `fp16` |
-| `text_precision` | 文本编码器精度：`int4`、`int8`、`fp4`、`fp8`、`fp16` |
-| `adaptive_offload` | `off`、`normal`、`aggressive` |
-
-> 大多数用户不需要此节点 —— `auto_optimize` 会自动处理一切。
-
-### 2.7 QuantFunc Export（模型导出）
-
-将所有运行时量化的模型导出到磁盘（支持融合 LoRA），后续加载无需重新量化。
-
-| 参数 | 说明 |
-|------|------|
-| `export_path` | 导出目录 |
-| `export_models` | 导出组件：`transformer`、`text_encoder`、`all` |
-
-## 3. 快速上手
-
-### 3.1 文生图（SVDQ）
-
-1. 在 ComfyUI 中导入 `QuantFunc-Text-to-Image-Workflow.json`
-2. 设置 `model_dir` 为基础模型路径
-3. 设置 `transformer_path` 为 SVDQ `.safetensors` 文件
-4. 设置 `model_backend` = `svdq`
-5. 输入提示词，点击 **Queue Prompt**
-
-### 3.2 文生图（Lighting）
-
-1. 同一工作流，使用**右侧 Lighting 组**
-2. 设置 `model_dir` 为 FP16 基础模型路径
-3. `transformer_path` 留空（或指向已导出的预量化权重）
-4. 设置 `model_backend` = `lighting`
-5. 设置 `precision_config` 为精度 JSON 配置路径
-6. 按需添加 LoRA 节点（零成本合并）
-
-### 3.3 图像编辑
-
-1. 导入 `QuantFunc-Image-to-Image-Workflow.json`
-2. 配置 Model Loader（同文生图）
-3. 通过 `LoadImage` → `QuantFunc Image List` 加载参考图
-4. 将 Image List 连接到 Generate 的 `ref_images` 输入
-5. 输入编辑提示词（如"把天空变成日落"）
-
-### 3.4 模型导出
-
-1. 导入 `QuantFunc-Model-Export.json`
-2. 配置 Model Loader（Lighting 后端 + LoRA）
-3. 在 Export 节点设置 `export_path`
-4. 点击 **Queue Prompt** —— 模型运行时量化并将所有量化权重保存
-5. 后续使用：在 `transformer_path` 填入导出的权重路径，即时加载（无需重新量化）
+| **Pick Diffusion Model / Pick CLIP / Pick VAE / Pick Checkpoint** | 选择各组件文件（UNet / CLIP / VAE）或单文件全家桶 checkpoint。 |
+| **Build Pipeline** | 把选好的组件组装成可运行的管线，支持逐组件精度 / 后端控制。 |
+| **Model Loader / Model Auto Loader** | 直接加载基础模型或预量化模型目录（Auto Loader 支持一键下载 + 按模型系列过滤下拉）。 |
+| **Precision Config Loader / Precision Config Auto Loader** | 逐层精度表 —— 加载**原精度 diffusers 基础模型时必填**。 |
+| **LoRA Auto Loader** | 向管线追加 LoRA 适配器（可链式叠加多个）。 |
+| **Generate** | 推理 —— 文生图，或接入 Image List 后做参考图编辑。 |
+| **Image List** | 打包 1~N 张参考图及可选的局部重绘蒙版用于编辑。 |
+| **Export** | 导出运行时量化模型（checkpoint = 全家桶，diffusers = 分组件）。 |
 
 ## 4. 模型下载
 
