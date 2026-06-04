@@ -18,6 +18,43 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - Export runtime-quantized models with LoRA fusion support
 - Auto-update from ModelScope
 
+## Version History
+
+| Plugin (`comfy`) | Engine (`lib`) | Summary |
+|:---:|:---:|---|
+| **0.0.02** *(current)* | **0.0.07** | v2 loader architecture · inpainting · full GPU coverage · faster editing — details below |
+| 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
+
+### What's New in 0.0.02 (engine 0.0.07)
+
+**🎯 Ease of Use**
+- **v2 loaders** — separate `MODEL` / `CLIP` / `VAE` sockets feed a **Build Pipeline** node, so models wire up the ComfyUI-native way instead of one monolithic loader.
+- **Universal format adapters** — load **diffusers / BFL (Flux) / nunchaku SVDQ / bundled-checkpoint (全家桶) / HF** layouts automatically, with no manual conversion.
+- **Base Model Auto Loader** with one-click download; the plugin also auto-pulls the matching engine on first startup.
+
+**🧩 Model Support**
+- **SVDQ** (offline quantization) **+ Lighting** (runtime BF16/FP16 → 4-bit) dual engine.
+- Pipelines: **Z-Image · QwenImage · QwenImage-Edit · Flux.2 Klein**.
+- **Full GPU coverage** (engine 0.0.07): consumer **RTX 20 / 30 / 40 / 50-series**, datacenter **A100 / H100 / H200 / B100 / B200 / GB300**, workstation **RTX 6000 Ada / RTX PRO 6000 Blackwell** — across **CUDA 12 & 13**.
+
+**⚡ Performance**
+- **Consumer GPUs run native SASS** — *no first-run JIT compile stall* on 20/30/40/50-series (datacenter/workstation cards JIT once, then cache).
+- Native **FP4 (NVFP4)** on Blackwell (SM120) — the fastest 4-bit path.
+- **QFRAW raw staging** for reference images & masks skips the PNG/BMP encode (~80 ms saved per ref).
+- **Multi-pipeline CPU↔GPU coexistence** — swap pipelines without a full reload; idle workers auto-free VRAM.
+
+**✨ New Features**
+- **Inpainting** — `MASK` input plus **Mask Config** and **Mask Scale By** nodes (white = regenerate, black = preserve), mirroring ComfyUI's SetLatentNoiseMask.
+- **Build Pipeline** node (v2 assembly) with per-component precision control.
+- Robust **worker-process architecture** — CPU↔GPU model swap + zombie-worker cleanup.
+
+**🛡️ Stability & Security**
+- Fixed a **`/dev/shm` RAM leak** — edit/inpaint staging files are now always cleaned up.
+- **Zip-slip guard** on dependency-archive extraction.
+- **IPC bound-check** on the worker → host image transfer.
+
+> The plugin auto-pulls the matching engine on startup: bumping `comfy` to **0.0.02** lets the updater fetch engine **0.0.07** from ModelScope (older `comfy` stays capped at engine 0.0.06).
+
 ## 2. Installation
 
 ### 2.1 Method A: Clone from Git (Recommended)
