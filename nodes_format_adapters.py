@@ -350,6 +350,123 @@ class QuantFuncPickCheckpoint:
 # Build Pipeline
 # ============================================================================
 
+# Map an arch fingerprint to its ModelScope precision-config series. Each
+# series ships precision-config/{50x-above-fp4,50x-below-int4}-sample.json whose
+# keys match THAT arch's real (engine-internal) layer structure, so downloading
+# the matching series' config is correct regardless of the source weight layout.
+_ARCH_TO_SERIES = {
+    "QwenImage":     "QuantFunc/Qwen-Image-Series",
+    "QwenImageEdit": "QuantFunc/Qwen-Image-Edit-Series",
+    "ZImage":        "QuantFunc/Z-Image-Series",
+    # Klein 4B (K=3072) and 9B (K=4096) deliberately share ONE precision-config:
+    # the keys are layer-NAME patterns (transformer_blocks.attn / .ff / .ff_context
+    # / single_transformer_blocks.attn / modulation / embedders / head), NOT
+    # dimension-specific shapes, so the same file applies to both. fingerprint_arch
+    # returns "Flux2Klein" for both and does not disambiguate size. Klein-9B-Series
+    # exists for prequant-WEIGHT downloads; if it ever ships its own precision-config,
+    # add a size-disambiguated entry here (and teach the fingerprint to tell 4B/9B apart).
+    "Flux2Klein":    "QuantFunc/Klein-4B-Series",
+}
+
+
+def _device_sm(device_idx: int) -> int:
+    """Compute capability (e.g. 120, 89, 86) of the user-selected CUDA device.
+    Returns 0 if it can't be determined."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(int(device_idx))
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+    # No reliable per-device query → 0. 0 < 120, so the caller falls back to INT4
+    # (50x-below) — the conservative choice that runs on EVERY GPU. We deliberately
+    # do NOT probe a first GPU here (nvidia-smi / device 0): nvidia-smi orders by
+    # PCI bus while CUDA orders by capability, so it can return the WRONG device's
+    # SM and wrongly pick FP4 on a non-Blackwell card (the 本地 4090/3060 trap —
+    # FP4 __trap()s below SM120, a far worse failure than INT4 on a Blackwell card).
+    return 0
+
+
+# POSITIVE allowlist of kinds that get a config injected — only genuine
+# full-precision weights. A blocklist was fragile: any quant format the detector
+# can't name (kind=="") would slip through and get a fresh-quant config injected
+# over already-quantized weights (double-quant / shape mismatch). Kinds come from
+# `fingerprint_kind_from_metadata` (already on `xfm_ref.kind`):
+#   raw_highprec       — a plain FP16/BF16/F32 transformer (needs online-quant)
+#   bundled_checkpoint — an all-in-one 全家桶 checkpoint; MAY itself be a
+#                        QuantFunc-stamped (already-quantized) export, so it gets
+#                        an extra stamped-metadata check below before injecting.
+# Everything else (nvfp4_disk / raw_fp8 / raw_int8 / prequant_lighting_separate /
+# unknown "") is left untouched — the engine / SVDQ path uses its on-disk precision.
+_FULL_PRECISION_KINDS = frozenset({"raw_highprec", "bundled_checkpoint"})
+
+
+def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
+                                       data_source="modelscope"):
+    """Auto-pick a precision config for a FULL-PRECISION model when the user
+    left precision_config on [auto-derive] (no explicit config).
+
+    A full-precision diffusers base model OR an all-in-one (全家桶) checkpoint
+    carries no quant metadata, so the engine's [auto-derive] would leave it at
+    full precision. Instead, IDENTIFY the model — reusing the arch + kind that
+    `build()` already fingerprinted onto `xfm_ref` — and load its CORRESPONDING
+    precision config through the precision auto loader: the matching series' own
+    per-layer config, at the variant suited to the selected GPU (FP4
+    `50x-above` on Blackwell SM120+, INT4 `50x-below` otherwise);
+    `download_precision_config` fetches + caches it. Already-quantized inputs
+    (nunchaku NVFP4, raw FP8/INT8/FP4, or any QuantFunc-stamped export) are left
+    untouched — the engine consumes their on-disk precision directly."""
+    # Only act on the [auto-derive] preset (empty path, preset == 'auto').
+    if not (isinstance(precision_map_xfm, dict)
+            and precision_map_xfm.get("preset") == "auto"
+            and not (precision_map_xfm.get("path") or "").strip()):
+        return precision_map_xfm
+    arch = getattr(xfm_ref, "arch", "") or ""
+    path = getattr(xfm_ref, "path", "") or ""
+    kind = getattr(xfm_ref, "kind", "") or ""
+    series = _ARCH_TO_SERIES.get(arch)
+    if not series:
+        logger.info("[BuildPipeline] [auto-derive]: arch '%s' has no precision-"
+                    "config series; leaving to engine auto-derive", arch or "?")
+        return precision_map_xfm
+    # Only inject onto GENUINE full-precision weights; everything else keeps its
+    # on-disk precision (already quantized, or an unrecognized kind we won't touch).
+    if kind not in _FULL_PRECISION_KINDS:
+        logger.info("[BuildPipeline] [auto-derive]: %s kind=%s is not full-"
+                    "precision; engine uses its on-disk precision", arch, kind or "?")
+        return precision_map_xfm
+    if kind == "bundled_checkpoint":
+        # A 全家桶 bundle may itself be a QuantFunc-stamped (already-quantized)
+        # export whose marker is hidden behind force_kind='bundled_checkpoint'.
+        # Inject ONLY when positively confirmed NOT stamped; if we can't read it
+        # (no path) or the probe errors, skip — the safe default (the engine's own
+        # [auto-derive] still reads any stamped map from the bundle).
+        try:
+            from .format_adapters.tools.auto_precision import _precision_map_from_metadata
+            full_precision_bundle = bool(path) and not _precision_map_from_metadata(path)
+        except Exception:
+            full_precision_bundle = False
+        if not full_precision_bundle:
+            logger.info("[BuildPipeline] [auto-derive]: %s bundle is stamped or "
+                        "unverifiable; engine uses its on-disk precision", arch)
+            return precision_map_xfm
+    try:
+        from .model_auto_loader import download_precision_config
+        sm = _device_sm(device_idx)
+        fname = ("50x-above-fp4-sample.json" if sm >= 120      # native NVFP4
+                 else "50x-below-int4-sample.json")             # INT4 (RTX 20/30/40)
+        local = download_precision_config(series, fname, data_source)
+        logger.info("[BuildPipeline] full-precision %s (kind=%s) + [auto-derive]: "
+                     "device %d (SM%d) -> %s / %s",
+                     arch, kind or "?", device_idx, sm, series, fname)
+        return {"path": local, "target": "transformer", "preset": fname}
+    except Exception as e:
+        logger.warning("[BuildPipeline] precision auto-pick failed (%s); "
+                        "falling back to engine [auto-derive]", e)
+        return precision_map_xfm
+
+
 class QuantFuncBuildPipeline:
     """Assemble a QuantFunc pipeline from official ComfyUI loaders.
 
@@ -390,10 +507,12 @@ class QuantFuncBuildPipeline:
                 "vae": ("VAE",),
                 "device": (devices,),
                 "precision_config": (presets, {"default": PRECISION_AUTO_LABEL,
-                    "tooltip": "[auto-derive] (default) — derive precision_map from "
-                               "per-tensor dtypes for full-precision / AIO checkpoints; "
-                               "no-op for SVDQ / pre-quantized models (they bring their "
-                               "own per-layer config in safetensors metadata).\n"
+                    "tooltip": "[auto-derive] (default) — for a full-precision "
+                               "diffusers base / AIO checkpoint with no quant metadata, "
+                               "identify the model and load its matching precision config "
+                               "for the selected GPU (FP4 50x-above on Blackwell SM120+, "
+                               "INT4 50x-below otherwise); SVDQ / pre-quantized models keep "
+                               "their own per-layer config from safetensors metadata.\n"
                                "[none] — never inject a precision_map.\n"
                                "[builtin] / [series] — use a fixed JSON config.",
                 }),
@@ -562,6 +681,14 @@ class QuantFuncBuildPipeline:
         )
 
         device_idx = int(device.split(":")[0]) if isinstance(device, str) else int(device)
+        # Full-precision auto-pick: a full-precision diffusers base / all-in-one
+        # checkpoint with no quant metadata + no explicit precision_config would
+        # stay at full precision under [auto-derive]. Identify the model (via the
+        # arch + kind already fingerprinted onto xfm_ref) and load its matching
+        # precision config for the selected GPU (FP4 on Blackwell SM120+, INT4
+        # otherwise); already-quantized inputs are left untouched.
+        precision_map_xfm = _autopick_precision_for_full_model(
+            precision_map_xfm, xfm_ref, device_idx)
         context = BuildContext(
             precision_map_xfm=precision_map_xfm,
             precision_map_te=precision_map_te,
