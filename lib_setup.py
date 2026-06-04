@@ -367,6 +367,16 @@ def _download_dep_zip(cuda_major: int, dest_dir: str) -> bool:
         print(f"[QuantFunc] Extracting to {dest_dir}...")
         os.makedirs(dest_dir, exist_ok=True)
         with zipfile.ZipFile(local_path, "r") as zf:
+            # zip-slip guard: validate every member resolves INSIDE dest_dir
+            # before extracting. A malicious/corrupt archive with "../" or
+            # absolute-path members could otherwise overwrite files outside
+            # dest_dir (incl. the libquantfunc.so about to be loaded). The zip
+            # is from our own ModelScope but is unverified — defense-in-depth.
+            dest_real = os.path.realpath(dest_dir)
+            for member in zf.namelist():
+                target = os.path.realpath(os.path.join(dest_dir, member))
+                if target != dest_real and not target.startswith(dest_real + os.sep):
+                    raise ValueError(f"unsafe zip member (path traversal): {member!r}")
             zf.extractall(dest_dir)
         print(f"[QuantFunc] Dependencies installed")
         return True

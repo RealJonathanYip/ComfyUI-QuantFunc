@@ -13,12 +13,15 @@ from ComfyUI's PyTorch (avoids DLL version conflicts on Windows).
 
 import atexit
 import ctypes
+import datetime as _datetime
 import hashlib
 import json
 import logging
 import numpy as np
 import os
 import platform
+import queue as _queue
+import re as _re
 import signal
 import struct
 import subprocess
@@ -26,6 +29,172 @@ import sys
 import tempfile
 import threading
 import time
+
+# Worker stderr noise filter: every line lands in the per-worker temp log
+# (see _stderr_reader); only lines that match these patterns are echoed to
+# the ComfyUI console. Keeps the user informed of per-stage timings + errors
+# without the engine's verbose info dump (every block-quant warn, every
+# auth handshake, every VAE-DIAG trace).
+_WORKER_CONSOLE_KEEP = _re.compile(
+    r'\[load\] '                          # component load timings
+    r'|Progress: \d+/\d+'                 # per-step diffusion progress
+    r'|\[total\]'                         # end-to-end timing
+    r'|\[\d+/\d+\] [a-z_]+:'              # per-stage component time (e.g. [3/5] vae_encoder: 178 ms)
+    r'|Saving image|Done!'                # image save
+    r'|Bundle export complete'            # export
+    r'|Pipeline type:'                    # pipeline kind
+    r'|Strategy:'                         # auto-optimize summary
+    r'|Error|Failed|fatal|exception|terminate|segfault'  # error keywords
+    r'|out of memory|OOM'                 # OOM
+    r'|Tensor .* not found'               # missing tensor
+    r'|abort'                             # abort
+)
+
+
+class _WorkerLogWriter:
+    """Singleton background writer for worker stderr logs.
+
+    Why a global thread?  The stderr reader per-WorkerManager is on the
+    critical path of every engine log line (info, warn, debug). Doing the
+    file write + flush() inline meant a syscall per line, blocking the
+    reader thread; if the kernel pipe buffer fills (~64 KB on Linux) the
+    engine's own stderr write() blocks, stalling generation.
+
+    With a dedicated writer:
+      - readers only `put_nowait` into a bounded queue (microseconds)
+      - one OS thread owns all file handles; ~64 KB block-buffered writes
+        + flush every 2 s of idle/work and on error keywords
+      - multi-pipeline isolation: each WorkerManager registers its own
+        log path; the writer keys file handles by path and never mixes
+        streams across workers
+      - bounded queue (8192 entries): if the writer is briefly behind,
+        readers drop the oldest entries rather than blocking the worker
+        (we prefer "lost log lines" over "stalled generation")
+    """
+    _instance = None
+    _init_lock = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        if cls._instance is not None:
+            return cls._instance
+        with cls._init_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._q: "_queue.Queue[tuple[str, str|None, bool]]" = _queue.Queue(maxsize=8192)
+        self._fhs: "dict[str, object]" = {}
+        self._stop = threading.Event()
+        self._t = threading.Thread(
+            target=self._loop, daemon=True, name="QuantFuncLogWriter")
+        self._t.start()
+        atexit.register(self._shutdown)
+
+    def open(self, path: str) -> None:
+        """Pre-open log file. Idempotent."""
+        if path in self._fhs:
+            return
+        try:
+            self._fhs[path] = open(
+                path, "w", buffering=64 * 1024,
+                encoding="utf-8", errors="replace")
+        except Exception as e:
+            logging.warning("[QuantFunc-worker] log open failed for %s: %s", path, e)
+
+    def write(self, path: str, text: str, *, flush: bool = False) -> None:
+        """Enqueue a write. Non-blocking — drops oldest if queue full."""
+        try:
+            self._q.put_nowait((path, text, flush))
+        except _queue.Full:
+            # Backpressure: drop one to free a slot, then enqueue. Avoids
+            # blocking the stderr reader on transient writer stalls.
+            try:
+                self._q.get_nowait()
+            except _queue.Empty:
+                pass
+            try:
+                self._q.put_nowait((path, text, flush))
+            except _queue.Full:
+                pass
+
+    def close(self, path: str) -> None:
+        """Schedule final flush + close of one path's handle."""
+        try:
+            # text=None signals "close this fd"
+            self._q.put_nowait((path, None, True))
+        except _queue.Full:
+            pass
+
+    def _loop(self) -> None:
+        last_flush = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=1.0)
+            except _queue.Empty:
+                # Idle: periodic flush so `tail -f` sees recent progress
+                now = time.monotonic()
+                if now - last_flush > 2.0:
+                    for fh in list(self._fhs.values()):
+                        try: fh.flush()
+                        except Exception: pass
+                    last_flush = now
+                continue
+            path, text, do_flush = item
+            fh = self._fhs.get(path)
+            if fh is None:
+                # Lazy open if writer race ahead of open()
+                try:
+                    fh = open(path, "a", buffering=64 * 1024,
+                              encoding="utf-8", errors="replace")
+                    self._fhs[path] = fh
+                except Exception:
+                    continue
+            if text is None:
+                # Close request
+                try:
+                    fh.flush(); fh.close()
+                except Exception: pass
+                self._fhs.pop(path, None)
+                continue
+            try:
+                fh.write(text)
+                fh.write("\n")
+                if do_flush:
+                    fh.flush()
+                    last_flush = time.monotonic()
+            except Exception:
+                pass
+            # Opportunistic periodic flush (cheap monotonic compare per item)
+            now = time.monotonic()
+            if now - last_flush > 2.0:
+                for f in list(self._fhs.values()):
+                    try: f.flush()
+                    except Exception: pass
+                last_flush = now
+
+    def _shutdown(self) -> None:
+        self._stop.set()
+        try:
+            self._t.join(timeout=2.0)
+        except Exception:
+            pass
+        # Drain any remaining items + close all handles
+        while True:
+            try:
+                path, text, _ = self._q.get_nowait()
+            except _queue.Empty:
+                break
+            fh = self._fhs.get(path)
+            if fh is None or text is None:
+                continue
+            try: fh.write(text + "\n")
+            except Exception: pass
+        for fh in self._fhs.values():
+            try: fh.flush(); fh.close()
+            except Exception: pass
+        self._fhs.clear()
 
 # ============================================================================
 # Library path resolution
@@ -91,6 +260,106 @@ def _get_available_devices():
 
 
 _AVAILABLE_DEVICES = _get_available_devices()
+
+
+def _detect_model_backend(transformer_path: str, model_dir: str) -> str:
+    """Auto-detect svdq vs lighting from transformer safetensors (metadata first,
+    then tensor-key fingerprint). Returns "svdq" or "lighting"; defaults to
+    "lighting" when nothing matches the SVDQ signature (Lighting handles both
+    FP16-base runtime-quant and `lighting_precomputed` reload).
+
+    SVDQ signature (Nunchaku export):
+      - metadata `quantization_config.method == "svdquant"`
+      - or tensor keys like `transformer_blocks.0.attn.to_qkv.qweight`
+        (BARE `qweight`, no underscore prefix) co-existing with
+        `*.lora_down` / `*.smooth_orig` sidecars
+
+    Lighting signature:
+      - metadata method `lighting_precomputed` / `lighting` / `flux2klein_runtime`
+      - or tensor keys with `_qweight_w4a4` / `_qweight` (underscore prefix
+        → QuantFunc Lighting export's persistent buffers)
+      - or only FP16 `*.weight` tensors (FP16 base, runtime-quantize)
+    """
+    # Resolve probe target: explicit transformer arg → model_dir/transformer/
+    candidates = []
+    if transformer_path:
+        if os.path.isfile(transformer_path):
+            candidates.append(transformer_path)
+        elif os.path.isdir(transformer_path):
+            try:
+                candidates += sorted(
+                    os.path.join(transformer_path, f)
+                    for f in os.listdir(transformer_path)
+                    if f.endswith(".safetensors")
+                )[:1]
+            except OSError:
+                pass
+    if not candidates and model_dir:
+        xfm_dir = os.path.join(model_dir, "transformer")
+        if os.path.isdir(xfm_dir):
+            try:
+                candidates += sorted(
+                    os.path.join(xfm_dir, f) for f in os.listdir(xfm_dir)
+                    if f.endswith(".safetensors")
+                )[:1]
+            except OSError:
+                pass
+    if not candidates:
+        return "lighting"  # safe fallback — engine errors clearly if file missing
+
+    probe = candidates[0]
+    try:
+        from .format_adapters.tools.safetensors_io import read_safetensors_header
+    except Exception as e:
+        logging.debug("[QuantFunc] backend detect: cannot import helpers: %s", e)
+        return "lighting"
+
+    # ONE header read — JSON-only, no tensor data. Typical < 1 MB even for
+    # 17 GB transformers; ~5-20 ms on warm cache.
+    try:
+        header = read_safetensors_header(probe)
+    except Exception as e:
+        logging.debug("[QuantFunc] backend detect: header read failed: %s", e)
+        return "lighting"
+
+    # 1. Metadata `method` — ground truth when present.
+    meta = header.get("__metadata__", {}) or {}
+    qc_str = meta.get("quantization_config", "")
+    if qc_str:
+        try:
+            method = json.loads(qc_str).get("method", "")
+            if method == "svdquant":
+                return "svdq"
+            if method in ("lighting_precomputed", "lighting", "flux2klein_runtime"):
+                return "lighting"
+        except json.JSONDecodeError:
+            pass
+    if meta.get("model_class", "").find("Nunchaku") >= 0:
+        return "svdq"
+
+    # 2. Tensor-key fingerprint — first ~200 keys from the same header dict.
+    seen_underscore_qweight = False
+    seen_bare_qweight = False
+    seen_lora_sidecar = False
+    scanned = 0
+    for k in header:
+        if k == "__metadata__":
+            continue
+        scanned += 1
+        if scanned > 200:
+            break
+        if "._qweight" in k:
+            seen_underscore_qweight = True
+        elif k.endswith(".qweight"):
+            seen_bare_qweight = True
+        if k.endswith(".lora_down") or ".lora_down." in k or k.endswith(".smooth_orig"):
+            seen_lora_sidecar = True
+    if seen_underscore_qweight:
+        return "lighting"
+    if seen_bare_qweight and seen_lora_sidecar:
+        return "svdq"
+
+    return "lighting"
 
 
 def _load_lib_config():
@@ -325,6 +594,17 @@ class WorkerManager:
         self._stdin = self._process.stdin
         self._stdout = self._process.stdout
 
+        # Allocate this worker's log path NOW (before the stderr reader
+        # spawns) so we can print it to the ComfyUI console at the same
+        # init point as "Starting worker:" / "Worker ready". Pipeline
+        # isolation: per-pid path → each WorkerManager owns its own file.
+        log_ts = _datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._worker_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"quantfunc_worker_{self._process.pid}_{log_ts}.log")
+        _WorkerLogWriter.get().open(self._worker_log_path)
+        logging.info("[QuantFunc] Worker log: %s", self._worker_log_path)
+
         self._stderr_thread = threading.Thread(
             target=self._stderr_reader, daemon=True)
         self._stderr_thread.start()
@@ -431,20 +711,61 @@ class WorkerManager:
         raise RuntimeError(err)
 
     def _stderr_reader(self):
-        """Forward worker's stderr to logging and cache recent error lines."""
+        """Forward worker's stderr to console + per-worker temp log.
+
+        ComfyUI console gets only the lines we'd want a user to see
+        (per-stage timings, progress, errors, OOM). The full stream goes
+        to /tmp/quantfunc_worker_<pid>_<ts>.log so engine debug output is
+        still available when diagnosing.
+        """
         self._recent_stderr = []
+        # Log path + writer-side file handle are set up by _start_worker
+        # so the path can be printed to the ComfyUI console at the same
+        # `[QuantFunc] Worker log: ...` moment as `Starting worker:` /
+        # `Worker ready`. Defensive default: if the field is missing (e.g.
+        # legacy entry into this method), still write somewhere sane.
+        log_path = getattr(self, "_worker_log_path", None) or os.path.join(
+            tempfile.gettempdir(),
+            f"quantfunc_worker_unknown_"
+            f"{_datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        writer = _WorkerLogWriter.get()
+        if not getattr(self, "_worker_log_path", None):
+            writer.open(log_path)
+            self._worker_log_path = log_path
+            logging.info("[QuantFunc] Worker log: %s", log_path)
+        _ERROR_FLUSH_KW = ("error", "fatal", "exception", "oom",
+                            "abort", "segfault", "terminate")
         try:
             for line in self._process.stderr:
                 text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
+                if not text:
+                    continue
+                # Detect error keywords (cheap substring scan) — used both
+                # for crash-diagnostic cache and to request immediate flush
+                # on the writer thread (so a subsequent crash leaves a
+                # complete log on disk).
+                is_error = False
+                low = text.lower()
+                for k in _ERROR_FLUSH_KW:
+                    if k in low:
+                        is_error = True
+                        break
+                if is_error:
+                    self._recent_stderr.append(text)
+                    if len(self._recent_stderr) > 10:
+                        self._recent_stderr.pop(0)
+                # All disk I/O is delegated to the global writer thread;
+                # this hot path only does substring/regex + a non-blocking
+                # queue put. No syscalls per line → stderr pipe stays
+                # drained → engine never blocks on stderr write().
+                writer.write(log_path, text, flush=is_error)
+                # Console echo only for key lines (full stream in log_path)
+                if _WORKER_CONSOLE_KEEP.search(text):
                     logging.info("[QuantFunc-worker] %s", text)
-                    # Cache recent lines with error/warning keywords for crash diagnostics
-                    if any(k in text.lower() for k in ("error", "fatal", "exception", "oom", "abort", "segfault")):
-                        self._recent_stderr.append(text)
-                        if len(self._recent_stderr) > 10:
-                            self._recent_stderr.pop(0)
         except Exception:
             pass
+        finally:
+            writer.close(log_path)
 
     def _kill_worker(self):
         if self._process is not None:
@@ -963,6 +1284,16 @@ class WorkerManager:
         h = resp.get("image_height", 0)
         if n_bytes == 0 or w == 0 or h == 0:
             raise RuntimeError("No image data in response")
+        # Bound + consistency-check the worker-reported sizes BEFORE the read /
+        # reshape: a desynced or compromised worker could otherwise force an
+        # unbounded blocking read, or a reshape mismatch deep in numpy.
+        _MAX_IMG_DIM = 16384
+        if w > _MAX_IMG_DIM or h > _MAX_IMG_DIM:
+            raise RuntimeError(f"Worker reported implausible image dims {w}x{h}")
+        _bpp = 3 if resp.get("image_format", "rgb_float32") == "rgb_uint8" else 12
+        if n_bytes != w * h * _bpp:
+            raise RuntimeError(
+                f"Worker image_bytes={n_bytes} != expected {w * h * _bpp} ({w}x{h})")
         shm_path = resp.get("image_shm_path")
         if shm_path:
             try:
@@ -1100,6 +1431,14 @@ class QuantFuncPipelineConfig:
                                     "tooltip": "Text encoder quantization precision (fp4 requires SM120+/Blackwell)"}),
                 "vision_quant": (["int8", "int4", "fp8", "fp4", "fp16"], {"default": "int8",
                                   "tooltip": "Vision encoder quantization (int8 = INT8 weights + FP16 compute, best quality/size tradeoff)"}),
+                "vae_precision": (["auto", "fp16", "fp8", "int8"], {"default": "auto",
+                                  "tooltip": "VAE precision (auto picks fp8/int8 on SM120+ via cuDNN, falls back to fp16 elsewhere)"}),
+                "act_quant_mode": (["auto", "absmax", "mse"], {"default": "auto",
+                                  "tooltip": "Activation quantization scale algorithm (Lighting backend, INT4 only):\n"
+                                             "• auto — engine picks: MSE-search when rotation>0 (best quality), else absmax\n"
+                                             "• absmax — fast, scale = absmax/7\n"
+                                             "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)\n"
+                                             "FP4 / INT8 / FP8 ignore this setting (kernel uses its own scaling)."}),
             },
             "optional": {
                 "vae_tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 64,
@@ -1114,13 +1453,16 @@ class QuantFuncPipelineConfig:
     CATEGORY = "QuantFunc"
 
     def build_config(self, tiled_vae, attention_backend, precision, text_precision,
-                     vision_quant="int8", vae_tile_size=0, pinned_memory_limit=""):
+                     vision_quant="int8", vae_precision="auto", act_quant_mode="absmax",
+                     vae_tile_size=0, pinned_memory_limit=""):
         config = {
             "tiled_vae": tiled_vae,
             "attention_backend": attention_backend,
             "precision": precision,
             "text_precision": text_precision,
             "vision_quant": vision_quant,
+            "vae_precision": vae_precision,
+            "act_quant_mode": act_quant_mode,
         }
 
         if vae_tile_size > 0:
@@ -1133,10 +1475,83 @@ class QuantFuncPipelineConfig:
         return (config,)
 
 
+def _first_safetensors(dir_path: str) -> str:
+    """First .safetensors file inside `dir_path`, alphabetical. Returns ""
+    when the directory doesn't exist or has none.
+    """
+    if not dir_path or not os.path.isdir(dir_path):
+        return ""
+    try:
+        for f in sorted(os.listdir(dir_path)):
+            if f.endswith(".safetensors"):
+                return os.path.join(dir_path, f)
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_to_safetensors(p: str) -> str:
+    """Accepts a `.safetensors` file path or a directory and returns a
+    concrete file path. Empty / missing → "".
+    """
+    if not p or not isinstance(p, str):
+        return ""
+    p = p.strip()
+    if not p:
+        return ""
+    if os.path.isfile(p):
+        return p
+    if os.path.isdir(p):
+        return _first_safetensors(p)
+    return ""
+
+
+def _build_model_refs(model_dir: str, transformer_path: str,
+                       prequant_weights: str = "") -> tuple:
+    """Common helper for ModelLoader / ModelAutoLoader: produce three
+    `_QFPathStub` instances typed as comfy MODEL / CLIP / VAE so they plug
+    directly into QuantFunc Build Pipeline (same socket types as ComfyUI's
+    UNETLoader / CLIPLoader / VAELoader). Mirrors format_adapters' Pick*.
+    """
+    from .nodes_format_adapters import _QFPathStub
+
+    prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
+
+    # Resolve concrete file paths inside the standard HF model_dir layout.
+    # User-provided transformer_path may be either a file or a directory —
+    # both are normalised to a concrete .safetensors here.
+    xfm_path = _resolve_to_safetensors(transformer_path) or _first_safetensors(
+        os.path.join(model_dir, "transformer"))
+    te_path  = _first_safetensors(os.path.join(model_dir, "text_encoder"))
+    vae_path = _first_safetensors(os.path.join(model_dir, "vae"))
+
+    if not xfm_path:
+        raise RuntimeError(
+            "QuantFunc Model Loader: no transformer .safetensors found. "
+            f"transformer_path={transformer_path!r}, "
+            f"model_dir={model_dir!r}/transformer/ has no .safetensors. "
+            "Provide an explicit transformer_path or check model_dir layout.")
+
+    backend = _detect_model_backend(xfm_path, model_dir)
+    logging.info("[QuantFunc] model_backend → %s (xfm=%s)",
+                  backend, os.path.basename(xfm_path))
+
+    model_stub = _QFPathStub(xfm_path, kind="transformer")
+    clip_stub  = _QFPathStub(te_path,  kind="te")
+    vae_stub   = _QFPathStub(vae_path, kind="vae")
+    # Stash QuantFunc-specific hints onto the model stub so BuildPipeline
+    # can recover model_dir context, backend, and prequant sidecar.
+    model_stub.qf_model_dir = model_dir
+    model_stub.qf_backend_hint = backend
+    if prequant_weights:
+        model_stub.qf_prequant_weights = prequant_weights
+    return (model_stub, clip_stub, vae_stub)
+
+
 class QuantFuncModelLoader:
-    """Load a QuantFunc model. Uses auto_optimize by default.
-    Connect a PipelineConfig node to override init settings.
-    Edit mode is auto-detected when ref_image is connected to Generate.
+    """Load a QuantFunc model — outputs three handles (transformer / text_encoder
+    / vae), mirroring ComfyUI's Load Checkpoint shape. Wire all three into
+    `QuantFunc Build Pipeline`, which carries device + advanced runtime config.
     """
 
     @classmethod
@@ -1145,87 +1560,29 @@ class QuantFuncModelLoader:
             "required": {
                 "model_dir": ("STRING", {"default": "", "tooltip": "Base model directory (contains model_index.json)"}),
                 "transformer_path": ("STRING", {"default": "", "tooltip": "Transformer weights path (safetensors file or directory)"}),
-                "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
-                "device": (_AVAILABLE_DEVICES,),
             },
             "optional": {
-                "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node). If not connected, uses auto_optimize defaults."}),
-                "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication (e.g. qf_xxx). Server URL is read from config.json next to the library."}),
-                "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
-                "precision_config": ("STRING", {"default": "", "tooltip": "Per-layer precision config JSON path (Lighting backend only)"}),
-                "prequant_weights": ("STRING", {"default": "", "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)"}),
-                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
-                "act_quant_mode": (["absmax", "mse"], {
-                    "default": "absmax",
-                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
-                               "• absmax — fast, scale = absmax/7 (default)\n"
-                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
+                "prequant_weights": ("STRING", {
+                    "default": "",
+                    "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)",
                 }),
-                "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory. No image will be generated."}),
-            }
+            },
         }
 
-    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
+    # Output comfy native MODEL/CLIP/VAE types so this loader interoperates
+    # with QuantFunc Build Pipeline (and any other node accepting these
+    # sockets — e.g. comfy CheckpointLoaderSimple / UNETLoader / CLIPLoader
+    # / VAELoader output the same types). The values are `_QFPathStub`
+    # objects carrying qf_source_path; non-QuantFunc consumers will crash
+    # on these stubs by design (per format_adapters convention).
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_model"
     CATEGORY = "QuantFunc"
 
-    def load_model(self, model_dir, transformer_path, model_backend,
-                   device, config=None, manual_unload_model=False,
-                   api_key="", scheduler_config="",
-                   precision_config="", prequant_weights="",
-                   fused_mod=False, act_quant_mode="absmax", **kwargs):
-        scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
-        # Validate: scheduler_config must be a file path (not a bare number or random text)
-        if scheduler_config and not os.path.exists(scheduler_config):
-            logging.warning(f"[QuantFunc] scheduler_config path does not exist: {scheduler_config!r}, ignoring")
-            scheduler_config = ""
-        precision_config = precision_config.strip() if isinstance(precision_config, str) else ""
-        prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
-        transformer_path = transformer_path if isinstance(transformer_path, str) and transformer_path else ""
-
-        api_key = api_key.strip() if isinstance(api_key, str) else ""
-        if api_key.lower() == "none":
-            api_key = ""
-
-        # Load server_url (and fallback api_key) from config.json next to the library
-        lib_config = _load_lib_config()
-        if not api_key:
-            api_key = lib_config.get("api_key", "")
-        server_url = lib_config.get("server_url", "")
-
-        options = {"auto_optimize": True}
-        if precision_config:
-            options["precision_config"] = precision_config
-        if prequant_weights:
-            options["mod_weights"] = prequant_weights
-        if fused_mod:
-            options["fused_mod"] = True
-        if api_key:
-            options["api_key"] = api_key
-        if server_url:
-            options["server_url"] = server_url
-        if model_backend == "lighting":
-            options.setdefault("rotation_block_size", 256)
-        options["act_quant_mode"] = act_quant_mode
-
-        text_precision = "int4"
-        if config and isinstance(config, dict):
-            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
-            text_precision = config.pop("text_precision", text_precision)
-            options.update(config)
-
-        cfg = {
-            "model_dir": model_dir,
-            "transformer": transformer_path,
-            "backend": model_backend,
-            "precision": text_precision,
-            "scheduler": scheduler_config,
-            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
-            "options": options,
-            "unload": manual_unload_model,
-        }
-        return (cfg,)
+    def load_model(self, model_dir, transformer_path,
+                   prequant_weights="", **kwargs):
+        return _build_model_refs(model_dir, transformer_path, prequant_weights)
 
 
 # ============================================================================
@@ -1274,34 +1631,23 @@ class QuantFuncModelAutoLoader:
         return {
             "required": {
                 "model_series": (MODEL_SERIES_LIST, {"tooltip": "Model series to download and load"}),
-                "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
-                "device": (_AVAILABLE_DEVICES,),
                 "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
             },
             "optional": {
                 "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
-                "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
-                "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
-                "act_quant_mode": (["absmax", "mse"], {
-                    "default": "absmax",
-                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
-                               "• absmax — fast, scale = absmax/7 (default)\n"
-                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
-                }),
-                "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
-            }
+            },
         }
 
-    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
+    # Output comfy native MODEL/CLIP/VAE types — same rationale as
+    # QuantFuncModelLoader above: interoperates with BuildPipeline and any
+    # node accepting these sockets.
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_model"
     CATEGORY = "QuantFunc"
 
-    def load_model(self, model_series, model_backend, device, data_source,
-                   config=None, manual_unload_model=False,
-                   transformer="None", api_key="",
-                   act_quant_mode="absmax",
-                   **kwargs):
+    def load_model(self, model_series, data_source,
+                   transformer="None", **kwargs):
         from .model_auto_loader import (
             detect_gpu_variant, download_base_model,
             download_transformer, resolve_transformer_selection,
@@ -1318,41 +1664,7 @@ class QuantFuncModelAutoLoader:
             if t_series and t_name:
                 transformer_path = download_transformer(t_series, t_name, data_source)
 
-        # ── Build pipeline config (same structure as ModelLoader) ──
-        api_key = api_key.strip() if isinstance(api_key, str) else ""
-        if api_key.lower() == "none":
-            api_key = ""
-
-        lib_config = _load_lib_config()
-        if not api_key:
-            api_key = lib_config.get("api_key", "")
-        server_url = lib_config.get("server_url", "")
-
-        options = {"auto_optimize": True}
-        if api_key:
-            options["api_key"] = api_key
-        if server_url:
-            options["server_url"] = server_url
-        if model_backend == "lighting":
-            options.setdefault("rotation_block_size", 256)
-        options["act_quant_mode"] = act_quant_mode
-
-        text_precision = "int4"
-        if config and isinstance(config, dict):
-            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
-            text_precision = config.pop("text_precision", text_precision)
-            options.update(config)
-
-        cfg = {
-            "model_dir": model_dir,
-            "transformer": transformer_path,
-            "backend": model_backend,
-            "precision": text_precision,
-            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
-            "options": options,
-            "unload": manual_unload_model,
-        }
-        return (cfg,)
+        return _build_model_refs(model_dir, transformer_path)
 
 
 # ============================================================================
@@ -1860,18 +2172,6 @@ class QuantFuncGenerate:
         unload_mode_internal = "gpu+cpu" if activate_unload else "none"
         import torch
 
-        # Handle unload request
-        if pipeline.get("unload"):
-            _manager.destroy_all()
-            from PIL import Image as PILImage, ImageDraw
-            msg_img = PILImage.new("RGB", (512, 128), color=(40, 40, 40))
-            draw = ImageDraw.Draw(msg_img)
-            draw.text((20, 45), "Model unloaded successfully.", fill=(200, 200, 200))
-            msg_np = np.array(msg_img, dtype=np.float32) / 255.0
-            msg_tensor = torch.from_numpy(msg_np).unsqueeze(0)
-            logging.info("[QuantFunc] Model unloaded successfully.")
-            return (msg_tensor,)
-
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
@@ -1885,7 +2185,6 @@ class QuantFuncGenerate:
         # Unpack ImageList dict format
         ref_img_resize = "720"
         ref_img_resize_others = "720"
-        edit_strength = 0.0
         # Inpaint defaults (overridden if mask present in ref_images dict).
         inpaint_mask = None
         inpaint_strength = 1.0
@@ -1900,8 +2199,6 @@ class QuantFuncGenerate:
             elif ref_images.get("keep_ref_img_size"):
                 ref_img_resize = "1024"
             ref_img_resize_others = ref_images.get("ref_img_resize_others", "720")
-            edit_strength = ref_images.get("edit_strength", 0.0)
-            color_match = ref_images.get("color_match", 0.0)
             # Inpaint payload (optional): mask tensor + 4 knobs.
             inpaint_mask = ref_images.get("mask")
             inpaint_strength = ref_images.get("mask_strength", 1.0)
@@ -1909,13 +2206,15 @@ class QuantFuncGenerate:
             inpaint_blur = ref_images.get("mask_blur", 0.0)
             inpaint_no_snap = ref_images.get("mask_no_snap", False)
             ref_images = ref_images["images"]
-        # Always create edit-capable pipelines (loads VAE encoder ~150 MB extra)
-        # so toggling ImageList connect/disconnect doesn't change cache_key →
-        # avoids forced pipeline recreate (which costs ~20 s + recently
-        # exposed weight-quant races). Pipeline can serve both t2i and edit
-        # requests; the request cmd (text_to_image vs image_to_image) picks
-        # the actual path at runtime.
-        cfg["options"]["edit_mode"] = True
+        # edit_mode controls which Pipeline class the C++ engine instantiates:
+        #   - QwenImage / QwenImageEdit are SEPARATE classes; QwenImageEditPipeline
+        #     only supports generate_edit() and rejects generate() at runtime.
+        #     So edit_mode MUST track ref_images presence for these.
+        #   - Klein uses ONE pipeline class for both modes (edit_mode=true just
+        #     pre-loads VAE encoder); toggling triggers recreate but t2i still
+        #     works since the pipeline serves both.
+        # Set conditionally — accept the recreate cost when toggling ref_images.
+        cfg["options"]["edit_mode"] = ref_images is not None
 
         # Collect live QuantFuncGenerate node ids from the current workflow.
         # Exclude nodes whose required `pipeline` input isn't connected — those
@@ -1943,6 +2242,11 @@ class QuantFuncGenerate:
         except Exception:
             pass
 
+        # /dev/shm QFRAW staging files — RAM-backed (tmpfs); MUST be unlinked
+        # once the engine has consumed them (see the `finally` below) or every
+        # edit/inpaint generation leaks a raw RGB blob (+ mask) into RAM.
+        tmp_paths = []
+        mask_path = None
         try:
             if ref_images is not None:
                 # Write each ref image as a "QFRAW01" raw uint8 RGB blob to
@@ -1994,10 +2298,6 @@ class QuantFuncGenerate:
                     i2i_opts["ref_img_resize"] = resize_arr
                 else:
                     i2i_opts["ref_img_resize"] = ref_img_resize
-                if edit_strength > 0.0:
-                    i2i_opts["edit_strength"] = edit_strength
-                if color_match > 0.0:
-                    i2i_opts["color_match"] = color_match
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
 
                 # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
@@ -2064,6 +2364,21 @@ class QuantFuncGenerate:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
             blank = torch.zeros(1, height, width, 3, dtype=torch.float32)
             return (blank,)
+        finally:
+            # Unlink the /dev/shm QFRAW staging files. By image_to_image's return
+            # the engine has already read them; on interrupt they're unused. Either
+            # way they must not accumulate in tmpfs (RAM). Output shm is freed
+            # separately in the reader path.
+            for _p in tmp_paths:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
+            if mask_path:
+                try:
+                    os.unlink(mask_path)
+                except OSError:
+                    pass
 
 
 # ============================================================================
@@ -2106,45 +2421,11 @@ class QuantFuncImageList:
                        "  1024 — 长边裁到 1024 px\n"
                        "  origin — 保留原尺寸(图大可能 OOM)",
         })
-        optional["edit_strength"] = ("FLOAT", {
-            "default": 0.0,
-            "min": 0.0,
-            "max": 0.80,
-            "step": 0.05,
-            "tooltip": "edit 模式 img2img 强度(降色偏):\n"
-                       "  0.0 — 纯噪声起始(默认,原行为)\n"
-                       "  0.5 — 50% 参考 + 50% 噪声,2 步(强保色)\n"
-                       "  0.7 — 25% 参考 + 75% 噪声,3 步(平衡)",
-        })
-        optional["color_match"] = ("FLOAT", {
-            "default": 0.0,
-            "min": 0.0,
-            "max": 1.0,
-            "step": 0.05,
-            "tooltip": "潜在色彩匹配 (0~1):\n"
-                       "  0.0 — 不校正(最锐利,可能色偏)\n"
-                       "  0.3~0.5 — 平衡(推荐)\n"
-                       "  1.0 — 完全匹配(色彩最忠实,细节略软)",
-        })
-        # 遮罩子参数 — main_image_mask 的辅助开关
-        optional["mask_strength"] = ("FLOAT", {
-            "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-            "tooltip": "遮罩强度倍数 (0..1)。0 = 关闭 inpaint。",
-        })
-        optional["mask_grow"] = ("INT", {
-            "default": 6, "min": 0, "max": 64, "step": 1,
-            "tooltip": "遮罩像素膨胀 N(对齐 ComfyUI VAEEncodeForInpaint "
-                       "grow_mask_by 默认 6)。让接缝过渡更自然。",
-        })
-        optional["mask_blur"] = ("FLOAT", {
-            "default": 0.0, "min": 0.0, "max": 64.0, "step": 0.5,
-            "tooltip": "遮罩高斯模糊 sigma(像素;对齐 ComfyUI MaskBlur)。0 = 边界硬切。",
-        })
-        optional["mask_no_snap"] = ("BOOLEAN", {
-            "default": False,
-            "tooltip": "关闭最后一步对未遮罩区域的 snap 回原图。"
-                       "默认关闭(snap 开,跟 ComfyUI 一致)。"
-                       "开启 = 让模型决定整张图,边界过渡更柔和但保留区会轻微飘移。",
+        # mask_config = MASK 高级配置(可选,不连接走默认)。
+        # 默认 = QuantFuncMaskConfig 的默认 = strength=1.0, grow=6, blur=0.0, no_snap=False。
+        optional["mask_config"] = ("QUANTFUNC_MASK_CONFIG", {
+            "tooltip": "可选:用 QuantFunc Mask Config 节点配置遮罩高级参数"
+                       "(strength / grow / blur / no_snap)。不连接 = 全用默认值。",
         })
         return {
             "required": {
@@ -2161,9 +2442,7 @@ class QuantFuncImageList:
 
     def combine(self, main_image, main_image_resize="720",
                 ref_image_resize_others="720",
-                edit_strength=0.0, color_match=0.0,
-                main_image_mask=None, mask_strength=1.0, mask_grow=6,
-                mask_blur=0.0, mask_no_snap=False, **kwargs):
+                main_image_mask=None, mask_config=None, **kwargs):
         images = [main_image]
         for i in range(2, 11):
             img = kwargs.get(f"ref_image_{i}")
@@ -2175,8 +2454,6 @@ class QuantFuncImageList:
             "images": images,
             "ref_img_resize": main_image_resize,
             "ref_img_resize_others": ref_image_resize_others,
-            "edit_strength": float(edit_strength),
-            "color_match": float(color_match),
         }
         if main_image_mask is not None:
             # Auto-align mask to main_image's pixel dims. Lets users wire any
@@ -2195,11 +2472,64 @@ class QuantFuncImageList:
                                     mode="bilinear", align_corners=False)
                 mask_t = m4.squeeze(1) if mask_t.dim() == 3 else m4
             out["mask"] = mask_t
-            out["mask_strength"] = float(mask_strength)
-            out["mask_grow"] = int(mask_grow)
-            out["mask_blur"] = float(mask_blur)
-            out["mask_no_snap"] = bool(mask_no_snap)
+            # Defaults match QuantFuncMaskConfig defaults exactly.
+            cfg = mask_config if isinstance(mask_config, dict) else {}
+            out["mask_strength"] = float(cfg.get("mask_strength", 1.0))
+            out["mask_grow"]     = int(cfg.get("mask_grow", 6))
+            out["mask_blur"]     = float(cfg.get("mask_blur", 0.0))
+            out["mask_no_snap"]  = bool(cfg.get("mask_no_snap", False))
         return (out,)
+
+
+# ============================================================================
+# Node: QuantFunc Mask Config (advanced inpaint knobs, optional)
+# ============================================================================
+
+class QuantFuncMaskConfig:
+    """Inpaint MASK 高级配置(可选)。把 4 个边界参数打包成一个输出,接到
+    QuantFunc Image List 的 `mask_config` 入口。不接就走默认值,跟 ComfyUI
+    的 VAEEncodeForInpaint / SetLatentNoiseMask 保持一致。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "遮罩强度倍数 (0..1)。0 = 关闭 inpaint。",
+                }),
+                "mask_grow": ("INT", {
+                    "default": 6, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "遮罩像素膨胀 N(对齐 ComfyUI VAEEncodeForInpaint "
+                               "grow_mask_by 默认 6)。让接缝过渡更自然。",
+                }),
+                "mask_blur": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 64.0, "step": 0.5,
+                    "tooltip": "遮罩高斯模糊 sigma(像素;对齐 ComfyUI MaskBlur)。"
+                               "0 = 边界硬切。",
+                }),
+                "mask_no_snap": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "关闭最后一步对未遮罩区域的 snap 回原图。"
+                               "默认关闭(snap 开,跟 ComfyUI 一致)。"
+                               "开启 = 让模型决定整张图,边界过渡更柔和但"
+                               "保留区会轻微飘移。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_MASK_CONFIG",)
+    RETURN_NAMES = ("mask_config",)
+    FUNCTION = "build"
+    CATEGORY = "QuantFunc"
+
+    def build(self, mask_strength, mask_grow, mask_blur, mask_no_snap):
+        return ({
+            "mask_strength": float(mask_strength),
+            "mask_grow": int(mask_grow),
+            "mask_blur": float(mask_blur),
+            "mask_no_snap": bool(mask_no_snap),
+        },)
 
 
 # ============================================================================
@@ -2254,17 +2584,42 @@ class QuantFuncMaskScaleBy:
 # ============================================================================
 
 class QuantFuncExport:
-    """Export a pre-quantized model directory."""
+    """Export a pre-quantized model directory.
+
+    Two output formats:
+      - diffusers (formerly "separated") — HF-style directory:
+                     transformer/, text_encoder/, vae/, ... each component
+                     its own safetensors. The traditional layout,
+                     compatible with `--model-dir <out>` reload.
+      - comfy_checkpoint (formerly "bundle", aka 全家桶) — single
+                     safetensors with all components packed under
+                     per-component prefixes (model.diffusion_model.*,
+                     text_encoder.*, vae.*, vision_encoder.*). One file,
+                     loadable directly as a ComfyUI checkpoint via the
+                     QuantFunc plugin's bundled-checkpoint adapter.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "pipeline": ("QUANTFUNC_PIPELINE",),
-                "export_path": ("STRING", {"default": "", "tooltip": "Output directory for exported model"}),
+                "export_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "diffusers 模式: 输出到这个目录, 每个组件一个 safetensors\n"
+                               "comfy_checkpoint 模式: 输出到这个目录下的单个 model.safetensors (全家桶)",
+                }),
+                "export_format": (["diffusers", "comfy_checkpoint"], {
+                    "default": "diffusers",
+                    "tooltip": "diffusers = HF 标准目录(每个组件独立文件)\n"
+                               "comfy_checkpoint = 单文件 safetensors 打包所有组件 (全家桶)\n"
+                               "  ↳ comfy_checkpoint 模式下 export_mode 强制为 'all'\n"
+                               "    (transformer + text_encoder + vae + vision_encoder)",
+                }),
                 "export_mode": (["all", "custom"], {
                     "default": "all",
-                    "tooltip": "'all' copies entire model (vae, tokenizer, etc.) for standalone use; 'custom' selects individual components"
+                    "tooltip": "(仅 diffusers) 'all' 复制整个模型(vae、tokenizer 等)用于独立使用; "
+                               "'custom' 选择单个组件",
                 }),
             },
             "optional": {
@@ -2279,32 +2634,45 @@ class QuantFuncExport:
     FUNCTION = "export_model"
     CATEGORY = "QuantFunc"
 
-    def export_model(self, pipeline, export_path, export_mode="all",
+    def export_model(self, pipeline, export_path,
+                     export_format="diffusers", export_mode="all",
                      export_transformer=True, export_text_encoder=False,
                      export_vision_encoder=False):
         if not export_path:
             raise ValueError("export_path is required")
 
-        if export_mode == "all":
-            components = ["all"]
-        else:
-            components = []
-            if export_transformer:
-                components.append("transformer")
-            if export_text_encoder:
-                components.append("text_encoder")
-            if export_vision_encoder:
-                components.append("vision_encoder")
-            if not components:
-                raise ValueError("At least one component must be selected for export")
-
-        # Inject export_models into pipeline config options
         if "options" not in pipeline:
             pipeline["options"] = {}
-        pipeline["options"]["export_models"] = ",".join(components)
+
+        # Accept both the new UI labels (diffusers / comfy_checkpoint) and the
+        # legacy labels (separated / bundle) so old workflow JSON keeps working.
+        # Engine-side string is unchanged: "bundle" or absent (= separated).
+        is_bundle = export_format in ("comfy_checkpoint", "bundle")
+
+        if is_bundle:
+            # Bundle (= ComfyUI checkpoint) always packs the whole pipeline —
+            # per-component selection doesn't apply. Force `all` so the worker
+            # doesn't filter components and break the layout.
+            pipeline["options"]["export_format"] = "bundle"
+            pipeline["options"]["export_models"] = "all"
+        else:
+            pipeline["options"].pop("export_format", None)  # default = separated/diffusers
+            if export_mode == "all":
+                components = ["all"]
+            else:
+                components = []
+                if export_transformer:
+                    components.append("transformer")
+                if export_text_encoder:
+                    components.append("text_encoder")
+                if export_vision_encoder:
+                    components.append("vision_encoder")
+                if not components:
+                    raise ValueError("At least one component must be selected for export")
+            pipeline["options"]["export_models"] = ",".join(components)
 
         _manager.export_model(pipeline, export_path)
-        logging.info("[QuantFunc] Export complete: %s", export_path)
+        logging.info("[QuantFunc] Export complete (%s): %s", export_format, export_path)
         return {}
 
 
@@ -2316,6 +2684,9 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
+    # QuantFuncBuildPipeline lives in nodes_format_adapters.py (one canonical
+    # implementation; loaded after this map → __init__.py's update() lifts it
+    # under the same registration key).
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncBaseSeriesModelAutoLoader": QuantFuncBaseSeriesModelAutoLoader,
@@ -2327,6 +2698,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
     "QuantFuncImageList": QuantFuncImageList,
+    "QuantFuncMaskConfig": QuantFuncMaskConfig,
     "QuantFuncMaskScaleBy": QuantFuncMaskScaleBy,
     "QuantFuncExport": QuantFuncExport,
 }
@@ -2335,6 +2707,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
+    # QuantFuncBuildPipeline display name is set in nodes_format_adapters.py.
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncBaseSeriesModelAutoLoader": "QuantFunc Base Series Model Auto Loader",
@@ -2346,6 +2719,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
     "QuantFuncImageList": "QuantFunc Image List",
+    "QuantFuncMaskConfig": "QuantFunc Mask Config",
     "QuantFuncMaskScaleBy": "QuantFunc Mask Scale By",
     "QuantFuncExport": "QuantFunc Export",
 }

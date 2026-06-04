@@ -15,6 +15,31 @@ except Exception:
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+# Sprint 1: format-adapter nodes (LoadDiffusionModel / LoadCLIP / LoadVAE /
+# LoadCheckpoint / LoadLoRA / LoadPrecisionMap / BuildPipeline). These plug
+# into ComfyUI's standard model directories and feed QuantFuncGenerate.
+try:
+    from .nodes_format_adapters import (
+        NODE_CLASS_MAPPINGS as _FA_NODE_CLS,
+        NODE_DISPLAY_NAME_MAPPINGS as _FA_NODE_NAMES,
+    )
+    NODE_CLASS_MAPPINGS.update(_FA_NODE_CLS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_FA_NODE_NAMES)
+except Exception as _e:
+    logging.getLogger("QuantFunc").warning(
+        "format_adapters nodes failed to load: %s", _e)
+
+# Install monkey-patches on comfy.sd loaders so the loaded MODEL/CLIP/VAE
+# objects carry the source file path — needed because ComfyUI itself does
+# not retain it. Required for QuantFuncBuildPipeline to accept official
+# loader outputs (UNETLoader / CLIPLoader / VAELoader / CheckpointLoaderSimple).
+try:
+    from .nodes_pipeline_builder import install_loader_path_patches as _pb_install_patches
+    _pb_install_patches()
+except Exception as _e:
+    logging.getLogger("QuantFunc").warning(
+        "comfy loader path patches failed to install: %s", _e)
+
 WEB_DIRECTORY = "./web"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
