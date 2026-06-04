@@ -29,7 +29,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 **🎯 Ease of Use**
 - **v2 loaders** — separate `MODEL` / `CLIP` / `VAE` sockets feed a **Build Pipeline** node, so models wire up the ComfyUI-native way instead of one monolithic loader.
-- **Universal format adapters** — load **diffusers / BFL (Flux) / nunchaku SVDQ / bundled-checkpoint (全家桶) / HF** layouts automatically, with no manual conversion.
+- **Universal format adapters** — load **diffusers / BFL (Flux) / nunchaku SVDQ / bundled-checkpoint / HF** layouts automatically, with no manual conversion.
 - **Base Model Auto Loader** with one-click download; the plugin also auto-pulls the matching engine on first startup.
 
 **🧩 Model Support**
