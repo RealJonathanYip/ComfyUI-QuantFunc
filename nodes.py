@@ -13,12 +13,15 @@ from ComfyUI's PyTorch (avoids DLL version conflicts on Windows).
 
 import atexit
 import ctypes
+import datetime as _datetime
 import hashlib
 import json
 import logging
 import numpy as np
 import os
 import platform
+import queue as _queue
+import re as _re
 import signal
 import struct
 import subprocess
@@ -26,6 +29,172 @@ import sys
 import tempfile
 import threading
 import time
+
+# Worker stderr noise filter: every line lands in the per-worker temp log
+# (see _stderr_reader); only lines that match these patterns are echoed to
+# the ComfyUI console. Keeps the user informed of per-stage timings + errors
+# without the engine's verbose info dump (every block-quant warn, every
+# auth handshake, every VAE-DIAG trace).
+_WORKER_CONSOLE_KEEP = _re.compile(
+    r'\[load\] '                          # component load timings
+    r'|Progress: \d+/\d+'                 # per-step diffusion progress
+    r'|\[total\]'                         # end-to-end timing
+    r'|\[\d+/\d+\] [a-z_]+:'              # per-stage component time (e.g. [3/5] vae_encoder: 178 ms)
+    r'|Saving image|Done!'                # image save
+    r'|Bundle export complete'            # export
+    r'|Pipeline type:'                    # pipeline kind
+    r'|Strategy:'                         # auto-optimize summary
+    r'|Error|Failed|fatal|exception|terminate|segfault'  # error keywords
+    r'|out of memory|OOM'                 # OOM
+    r'|Tensor .* not found'               # missing tensor
+    r'|abort'                             # abort
+)
+
+
+class _WorkerLogWriter:
+    """Singleton background writer for worker stderr logs.
+
+    Why a global thread?  The stderr reader per-WorkerManager is on the
+    critical path of every engine log line (info, warn, debug). Doing the
+    file write + flush() inline meant a syscall per line, blocking the
+    reader thread; if the kernel pipe buffer fills (~64 KB on Linux) the
+    engine's own stderr write() blocks, stalling generation.
+
+    With a dedicated writer:
+      - readers only `put_nowait` into a bounded queue (microseconds)
+      - one OS thread owns all file handles; ~64 KB block-buffered writes
+        + flush every 2 s of idle/work and on error keywords
+      - multi-pipeline isolation: each WorkerManager registers its own
+        log path; the writer keys file handles by path and never mixes
+        streams across workers
+      - bounded queue (8192 entries): if the writer is briefly behind,
+        readers drop the oldest entries rather than blocking the worker
+        (we prefer "lost log lines" over "stalled generation")
+    """
+    _instance = None
+    _init_lock = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        if cls._instance is not None:
+            return cls._instance
+        with cls._init_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._q: "_queue.Queue[tuple[str, str|None, bool]]" = _queue.Queue(maxsize=8192)
+        self._fhs: "dict[str, object]" = {}
+        self._stop = threading.Event()
+        self._t = threading.Thread(
+            target=self._loop, daemon=True, name="QuantFuncLogWriter")
+        self._t.start()
+        atexit.register(self._shutdown)
+
+    def open(self, path: str) -> None:
+        """Pre-open log file. Idempotent."""
+        if path in self._fhs:
+            return
+        try:
+            self._fhs[path] = open(
+                path, "w", buffering=64 * 1024,
+                encoding="utf-8", errors="replace")
+        except Exception as e:
+            logging.warning("[QuantFunc-worker] log open failed for %s: %s", path, e)
+
+    def write(self, path: str, text: str, *, flush: bool = False) -> None:
+        """Enqueue a write. Non-blocking — drops oldest if queue full."""
+        try:
+            self._q.put_nowait((path, text, flush))
+        except _queue.Full:
+            # Backpressure: drop one to free a slot, then enqueue. Avoids
+            # blocking the stderr reader on transient writer stalls.
+            try:
+                self._q.get_nowait()
+            except _queue.Empty:
+                pass
+            try:
+                self._q.put_nowait((path, text, flush))
+            except _queue.Full:
+                pass
+
+    def close(self, path: str) -> None:
+        """Schedule final flush + close of one path's handle."""
+        try:
+            # text=None signals "close this fd"
+            self._q.put_nowait((path, None, True))
+        except _queue.Full:
+            pass
+
+    def _loop(self) -> None:
+        last_flush = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=1.0)
+            except _queue.Empty:
+                # Idle: periodic flush so `tail -f` sees recent progress
+                now = time.monotonic()
+                if now - last_flush > 2.0:
+                    for fh in list(self._fhs.values()):
+                        try: fh.flush()
+                        except Exception: pass
+                    last_flush = now
+                continue
+            path, text, do_flush = item
+            fh = self._fhs.get(path)
+            if fh is None:
+                # Lazy open if writer race ahead of open()
+                try:
+                    fh = open(path, "a", buffering=64 * 1024,
+                              encoding="utf-8", errors="replace")
+                    self._fhs[path] = fh
+                except Exception:
+                    continue
+            if text is None:
+                # Close request
+                try:
+                    fh.flush(); fh.close()
+                except Exception: pass
+                self._fhs.pop(path, None)
+                continue
+            try:
+                fh.write(text)
+                fh.write("\n")
+                if do_flush:
+                    fh.flush()
+                    last_flush = time.monotonic()
+            except Exception:
+                pass
+            # Opportunistic periodic flush (cheap monotonic compare per item)
+            now = time.monotonic()
+            if now - last_flush > 2.0:
+                for f in list(self._fhs.values()):
+                    try: f.flush()
+                    except Exception: pass
+                last_flush = now
+
+    def _shutdown(self) -> None:
+        self._stop.set()
+        try:
+            self._t.join(timeout=2.0)
+        except Exception:
+            pass
+        # Drain any remaining items + close all handles
+        while True:
+            try:
+                path, text, _ = self._q.get_nowait()
+            except _queue.Empty:
+                break
+            fh = self._fhs.get(path)
+            if fh is None or text is None:
+                continue
+            try: fh.write(text + "\n")
+            except Exception: pass
+        for fh in self._fhs.values():
+            try: fh.flush(); fh.close()
+            except Exception: pass
+        self._fhs.clear()
 
 # ============================================================================
 # Library path resolution
@@ -91,6 +260,106 @@ def _get_available_devices():
 
 
 _AVAILABLE_DEVICES = _get_available_devices()
+
+
+def _detect_model_backend(transformer_path: str, model_dir: str) -> str:
+    """Auto-detect svdq vs lighting from transformer safetensors (metadata first,
+    then tensor-key fingerprint). Returns "svdq" or "lighting"; defaults to
+    "lighting" when nothing matches the SVDQ signature (Lighting handles both
+    FP16-base runtime-quant and `lighting_precomputed` reload).
+
+    SVDQ signature (Nunchaku export):
+      - metadata `quantization_config.method == "svdquant"`
+      - or tensor keys like `transformer_blocks.0.attn.to_qkv.qweight`
+        (BARE `qweight`, no underscore prefix) co-existing with
+        `*.lora_down` / `*.smooth_orig` sidecars
+
+    Lighting signature:
+      - metadata method `lighting_precomputed` / `lighting` / `flux2klein_runtime`
+      - or tensor keys with `_qweight_w4a4` / `_qweight` (underscore prefix
+        → QuantFunc Lighting export's persistent buffers)
+      - or only FP16 `*.weight` tensors (FP16 base, runtime-quantize)
+    """
+    # Resolve probe target: explicit transformer arg → model_dir/transformer/
+    candidates = []
+    if transformer_path:
+        if os.path.isfile(transformer_path):
+            candidates.append(transformer_path)
+        elif os.path.isdir(transformer_path):
+            try:
+                candidates += sorted(
+                    os.path.join(transformer_path, f)
+                    for f in os.listdir(transformer_path)
+                    if f.endswith(".safetensors")
+                )[:1]
+            except OSError:
+                pass
+    if not candidates and model_dir:
+        xfm_dir = os.path.join(model_dir, "transformer")
+        if os.path.isdir(xfm_dir):
+            try:
+                candidates += sorted(
+                    os.path.join(xfm_dir, f) for f in os.listdir(xfm_dir)
+                    if f.endswith(".safetensors")
+                )[:1]
+            except OSError:
+                pass
+    if not candidates:
+        return "lighting"  # safe fallback — engine errors clearly if file missing
+
+    probe = candidates[0]
+    try:
+        from .format_adapters.tools.safetensors_io import read_safetensors_header
+    except Exception as e:
+        logging.debug("[QuantFunc] backend detect: cannot import helpers: %s", e)
+        return "lighting"
+
+    # ONE header read — JSON-only, no tensor data. Typical < 1 MB even for
+    # 17 GB transformers; ~5-20 ms on warm cache.
+    try:
+        header = read_safetensors_header(probe)
+    except Exception as e:
+        logging.debug("[QuantFunc] backend detect: header read failed: %s", e)
+        return "lighting"
+
+    # 1. Metadata `method` — ground truth when present.
+    meta = header.get("__metadata__", {}) or {}
+    qc_str = meta.get("quantization_config", "")
+    if qc_str:
+        try:
+            method = json.loads(qc_str).get("method", "")
+            if method == "svdquant":
+                return "svdq"
+            if method in ("lighting_precomputed", "lighting", "flux2klein_runtime"):
+                return "lighting"
+        except json.JSONDecodeError:
+            pass
+    if meta.get("model_class", "").find("Nunchaku") >= 0:
+        return "svdq"
+
+    # 2. Tensor-key fingerprint — first ~200 keys from the same header dict.
+    seen_underscore_qweight = False
+    seen_bare_qweight = False
+    seen_lora_sidecar = False
+    scanned = 0
+    for k in header:
+        if k == "__metadata__":
+            continue
+        scanned += 1
+        if scanned > 200:
+            break
+        if "._qweight" in k:
+            seen_underscore_qweight = True
+        elif k.endswith(".qweight"):
+            seen_bare_qweight = True
+        if k.endswith(".lora_down") or ".lora_down." in k or k.endswith(".smooth_orig"):
+            seen_lora_sidecar = True
+    if seen_underscore_qweight:
+        return "lighting"
+    if seen_bare_qweight and seen_lora_sidecar:
+        return "svdq"
+
+    return "lighting"
 
 
 def _load_lib_config():
@@ -252,6 +521,13 @@ class WorkerManager:
         self._loaded_keys = set()          # keys currently alive in worker
         self._api_keys = {}                # cache_key -> api_key last set
         self._node_refs = {}               # generate_node_id -> cache_key (owner tracking)
+        # cache_key -> unload_mode policy. Read by ComfyUI's free_memory hook
+        # to decide how aggressively to respond to VRAM pressure from other
+        # plugins. keep_on_gpu: never release (refuse ComfyUI's free_memory);
+        # follow_comfy: offload GPU on normal requests, destroy on blanket
+        # requests (Free Model and Node Cache); clean_up_every_time is
+        # handled by the generate node itself (destroys right after gen).
+        self._unload_modes = {}            # cache_key -> "keep_on_gpu" | "follow_comfy" | "clean_up_every_time"
         self._req_counter = 0
         self._lock = threading.Lock()
 
@@ -317,6 +593,17 @@ class WorkerManager:
 
         self._stdin = self._process.stdin
         self._stdout = self._process.stdout
+
+        # Allocate this worker's log path NOW (before the stderr reader
+        # spawns) so we can print it to the ComfyUI console at the same
+        # init point as "Starting worker:" / "Worker ready". Pipeline
+        # isolation: per-pid path → each WorkerManager owns its own file.
+        log_ts = _datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._worker_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"quantfunc_worker_{self._process.pid}_{log_ts}.log")
+        _WorkerLogWriter.get().open(self._worker_log_path)
+        logging.info("[QuantFunc] Worker log: %s", self._worker_log_path)
 
         self._stderr_thread = threading.Thread(
             target=self._stderr_reader, daemon=True)
@@ -395,6 +682,7 @@ class WorkerManager:
             logging.warning("[QuantFunc] Worker process died, restarting...")
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
             self._node_refs.clear()
 
         dll_path = _LIB_PATH
@@ -423,20 +711,61 @@ class WorkerManager:
         raise RuntimeError(err)
 
     def _stderr_reader(self):
-        """Forward worker's stderr to logging and cache recent error lines."""
+        """Forward worker's stderr to console + per-worker temp log.
+
+        ComfyUI console gets only the lines we'd want a user to see
+        (per-stage timings, progress, errors, OOM). The full stream goes
+        to /tmp/quantfunc_worker_<pid>_<ts>.log so engine debug output is
+        still available when diagnosing.
+        """
         self._recent_stderr = []
+        # Log path + writer-side file handle are set up by _start_worker
+        # so the path can be printed to the ComfyUI console at the same
+        # `[QuantFunc] Worker log: ...` moment as `Starting worker:` /
+        # `Worker ready`. Defensive default: if the field is missing (e.g.
+        # legacy entry into this method), still write somewhere sane.
+        log_path = getattr(self, "_worker_log_path", None) or os.path.join(
+            tempfile.gettempdir(),
+            f"quantfunc_worker_unknown_"
+            f"{_datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        writer = _WorkerLogWriter.get()
+        if not getattr(self, "_worker_log_path", None):
+            writer.open(log_path)
+            self._worker_log_path = log_path
+            logging.info("[QuantFunc] Worker log: %s", log_path)
+        _ERROR_FLUSH_KW = ("error", "fatal", "exception", "oom",
+                            "abort", "segfault", "terminate")
         try:
             for line in self._process.stderr:
                 text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
+                if not text:
+                    continue
+                # Detect error keywords (cheap substring scan) — used both
+                # for crash-diagnostic cache and to request immediate flush
+                # on the writer thread (so a subsequent crash leaves a
+                # complete log on disk).
+                is_error = False
+                low = text.lower()
+                for k in _ERROR_FLUSH_KW:
+                    if k in low:
+                        is_error = True
+                        break
+                if is_error:
+                    self._recent_stderr.append(text)
+                    if len(self._recent_stderr) > 10:
+                        self._recent_stderr.pop(0)
+                # All disk I/O is delegated to the global writer thread;
+                # this hot path only does substring/regex + a non-blocking
+                # queue put. No syscalls per line → stderr pipe stays
+                # drained → engine never blocks on stderr write().
+                writer.write(log_path, text, flush=is_error)
+                # Console echo only for key lines (full stream in log_path)
+                if _WORKER_CONSOLE_KEEP.search(text):
                     logging.info("[QuantFunc-worker] %s", text)
-                    # Cache recent lines with error/warning keywords for crash diagnostics
-                    if any(k in text.lower() for k in ("error", "fatal", "exception", "oom", "abort", "segfault")):
-                        self._recent_stderr.append(text)
-                        if len(self._recent_stderr) > 10:
-                            self._recent_stderr.pop(0)
         except Exception:
             pass
+        finally:
+            writer.close(log_path)
 
     def _kill_worker(self):
         if self._process is not None:
@@ -467,6 +796,7 @@ class WorkerManager:
             self._process = None
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
             self._node_refs.clear()
 
     # ── IPC ──
@@ -583,15 +913,20 @@ class WorkerManager:
 
     def _unload_others_locked(self, keep_key):
         """Offload all pipelines except keep_key to CPU, to free VRAM before
-        loading/running keep_key. Must be called with self._lock held."""
+        loading/running keep_key. Must be called with self._lock held.
+
+        Uses sync=True so the worker's quantfunc_unload_sync blocks until
+        VRAM is actually released — the caller is about to load or run
+        keep_key and can't race with an async offload of the others."""
         others = [k for k in self._loaded_keys if k != keep_key]
         for k in others:
             try:
                 self._call({"cmd": "unload", "req_id": self._next_req_id(),
-                            "cache_key": k}, timeout=60)
-                logging.info("[QuantFunc] Offloaded pipeline %s to CPU", k[:8])
+                            "cache_key": k, "sync": True}, timeout=60)
+                logging.info("[QuantFunc] Evicted pipeline %s to free VRAM for %s",
+                             k[:8], keep_key[:8] if keep_key else "?")
             except Exception as e:
-                logging.warning("[QuantFunc] Failed to offload %s: %s", k[:8], e)
+                logging.warning("[QuantFunc] Failed to evict %s: %s", k[:8], e)
 
     def ensure_pipeline(self, cfg, node_id=None, alive_node_ids=None):
         """Ensure pipeline matching cfg is loaded in worker. Returns its cache key.
@@ -607,7 +942,21 @@ class WorkerManager:
             self._ensure_worker()
 
             key = _make_cache_key(cfg)
-            opts = cfg.get("options", {})
+            opts = dict(cfg.get("options", {}))
+            # Route the transformer's coalesced backup through disk-file-
+            # backed mmap whenever the caller declared they might later
+            # unload. The backing store is a real file (/var/tmp/
+            # quantfunc_backup_XXXXXX, or $QUANTFUNC_BACKUP_DIR / $TMPDIR
+            # if set), released on clean process exit. When the Generate
+            # node sets activate_unload=True and ComfyUI later requests a
+            # free_memory, we trigger releaseRamPages() on that backup so
+            # the kernel writes dirty pages to disk and reclaims ~13 GB of
+            # physical RAM — visible to other plugins. Next gen page-
+            # faults pages back in from disk.
+            # When activate_unload=False (default in the Generate node),
+            # the backup stays in pinned RAM and no disk file is created;
+            # the pipeline refuses ComfyUI's free_memory requests.
+            opts.setdefault("activate_unload", False)
             new_api_key = opts.get("api_key", "")
 
             # Evict stale refs from deleted/disconnected Generate nodes
@@ -631,6 +980,7 @@ class WorkerManager:
                             logging.warning("[QuantFunc] destroy(%s) failed: %s", dropped_key[:8], e)
                         self._loaded_keys.discard(dropped_key)
                         self._api_keys.pop(dropped_key, None)
+                        self._unload_modes.pop(dropped_key, None)
 
             # Update node→key ownership and release orphaned pipelines
             if node_id is not None:
@@ -649,6 +999,7 @@ class WorkerManager:
                             logging.warning("[QuantFunc] destroy(%s) failed: %s", old_key[:8], e)
                         self._loaded_keys.discard(old_key)
                         self._api_keys.pop(old_key, None)
+                        self._unload_modes.pop(old_key, None)
 
             if key in self._loaded_keys:
                 # Pipeline already loaded — check if API key changed
@@ -671,7 +1022,6 @@ class WorkerManager:
                 "transformer_path": cfg.get("transformer", ""),
                 "scheduler_config": cfg.get("scheduler", "") or None,
                 "model_backend": cfg.get("backend", "svdq"),
-                "svdq_precision": cfg.get("precision", "int4"),
                 "device_idx": cfg.get("device", 0),
                 "config_json": json.dumps(opts),
             }
@@ -732,8 +1082,13 @@ class WorkerManager:
 
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=4.0, negative_prompt="",
-                       options_json=None, pbar=None):
-        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
+                       options_json=None, pbar=None,
+                       mask_path=None, mask_strength=1.0, mask_grow=6,
+                       mask_blur=0.0, mask_no_snap=False):
+        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
+        Optional inpaint: pass `mask_path` to a pixel-space mask PNG (white=inpaint, black=preserve).
+        Mirrors ComfyUI SetLatentNoiseMask + GrowMask + MaskBlur + VAEEncodeForInpaint.grow_mask_by.
+        """
         with self._lock:
             self._ensure_worker()
 
@@ -758,6 +1113,12 @@ class WorkerManager:
                 "seed": seed,
                 "options_json": options_json,
             }
+            if mask_path:
+                cmd["mask_path"] = mask_path
+                cmd["mask_strength"] = float(mask_strength)
+                cmd["mask_grow"] = int(mask_grow)
+                cmd["mask_blur"] = float(mask_blur)
+                cmd["mask_no_snap"] = bool(mask_no_snap)
 
             resp = self._call(cmd, progress_cb=on_progress, timeout=600)
             return self._read_image(resp)
@@ -772,6 +1133,7 @@ class WorkerManager:
                 self._call({"cmd": "destroy", "req_id": self._next_req_id()})
                 self._loaded_keys.clear()
                 self._api_keys.clear()
+                self._unload_modes.clear()
 
             opts = dict(cfg.get("options", {}))
             sched = cfg.get("scheduler", "")
@@ -785,7 +1147,6 @@ class WorkerManager:
                 "export_path": export_path,
                 "transformer_path": cfg.get("transformer", ""),
                 "model_backend": cfg.get("backend", "svdq"),
-                "svdq_precision": cfg.get("precision", "int4"),
                 "device_idx": cfg.get("device", 0),
                 "config_json": json.dumps(opts),
             }
@@ -802,23 +1163,32 @@ class WorkerManager:
             except Exception:
                 pass
 
-    def unload_pipeline(self, cache_key=None):
+    def unload_pipeline(self, cache_key=None, sync=False):
         """Offload models from GPU to CPU, freeing VRAM. Pipelines stay alive for fast reload.
-        If cache_key given, unload that one; otherwise unload all."""
+        If cache_key given, unload that one; otherwise unload all.
+
+        sync=True → blocks until VRAM is actually freed (skips the 3-second
+        grace period in the worker). Use this when another component is
+        about to allocate VRAM (cross-pipeline eviction, ComfyUI's
+        free_memory hook for third-party models). Default sync=False is
+        fire-and-forget so the caller can return immediately."""
         with self._lock:
             if self._process is None or self._process.poll() is not None:
                 return
             if not self._loaded_keys:
                 return
-            cmd = {"cmd": "unload", "req_id": self._next_req_id()}
+            cmd = {"cmd": "unload", "req_id": self._next_req_id(), "sync": sync}
             if cache_key is not None:
                 if cache_key not in self._loaded_keys:
                     return
                 cmd["cache_key"] = cache_key
             try:
-                self._call(cmd, timeout=30)
-                logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed (%s)",
-                             cache_key if cache_key else "all")
+                # Sync unload can take up to ~5 s (grace skip + D2H + trim);
+                # async returns almost instantly.
+                self._call(cmd, timeout=60 if sync else 30)
+                logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed (%s%s)",
+                             cache_key if cache_key else "all",
+                             " sync" if sync else "")
             except Exception as e:
                 logging.warning("[QuantFunc] Unload failed: %s", e)
 
@@ -832,6 +1202,58 @@ class WorkerManager:
                     pass
                 self._loaded_keys.clear()
                 self._api_keys.clear()
+                self._unload_modes.clear()
+
+    def release_backup_pipeline(self, cache_key):
+        """Release physical RAM pages of the mmap-backed CPU offload_backup
+        while keeping the backing files (and the pipeline handle). Next
+        generate() page-faults pages in (~2-5s via OS page cache / disk)
+        instead of full re-init (~15-25s). Used by unload_mode='gpu+cpu'.
+
+        Pair with unload_pipeline: first unload GPU → CPU (mmap), then
+        release_backup to free the physical RAM while keeping content on
+        disk for fast reload.
+
+        No-op if the DLL predates quantfunc_release_backup, or if the
+        pipeline wasn't created with activate_unload=True (e.g. export
+        mode or the user unticked the widget)."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return
+            if cache_key not in self._loaded_keys:
+                return
+            try:
+                self._call({"cmd": "release_backup",
+                            "req_id": self._next_req_id(),
+                            "cache_key": cache_key}, timeout=30)
+                logging.info("[QuantFunc] Pipeline %s backup released — RAM pages returned to OS",
+                             cache_key[:8] if cache_key else "None")
+            except Exception as e:
+                logging.warning("[QuantFunc] release_backup_pipeline(%s) failed: %s",
+                                cache_key[:8] if cache_key else "None", e)
+
+    def destroy_pipeline(self, cache_key):
+        """Fully destroy a single pipeline (frees GPU + CPU/RAM).
+        Next use will recreate from scratch — slower than unload_pipeline but
+        reclaims the ~10 GB pinned coalesced backup held in system RAM.
+        Used as a last resort / escape hatch."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return
+            if cache_key not in self._loaded_keys:
+                return
+            try:
+                self._call({"cmd": "destroy",
+                            "req_id": self._next_req_id(),
+                            "cache_key": cache_key}, timeout=60)
+                self._loaded_keys.discard(cache_key)
+                self._api_keys.pop(cache_key, None)
+                self._unload_modes.pop(cache_key, None)
+                logging.info("[QuantFunc] Pipeline %s destroyed — GPU + RAM released",
+                             cache_key[:8] if cache_key else "None")
+            except Exception as e:
+                logging.warning("[QuantFunc] destroy_pipeline(%s) failed: %s",
+                                cache_key[:8] if cache_key else "None", e)
 
     def shutdown(self):
         """Shutdown worker process."""
@@ -849,15 +1271,41 @@ class WorkerManager:
             self._process = None
             self._loaded_keys.clear()
             self._api_keys.clear()
+            self._unload_modes.clear()
 
     def _read_image(self, resp):
-        """Read binary image data following a result response."""
+        """Read image data from worker response.
+
+        Prefers /dev/shm path (zero-copy mmap-style read) over stdout pipe
+        binary — the shm path avoids a ~3MB bytes() on worker side and
+        multiple pipe syscalls on parent side."""
         n_bytes = resp.get("image_bytes", 0)
         w = resp.get("image_width", 0)
         h = resp.get("image_height", 0)
         if n_bytes == 0 or w == 0 or h == 0:
             raise RuntimeError("No image data in response")
-        raw = self._read_binary(n_bytes)
+        # Bound + consistency-check the worker-reported sizes BEFORE the read /
+        # reshape: a desynced or compromised worker could otherwise force an
+        # unbounded blocking read, or a reshape mismatch deep in numpy.
+        _MAX_IMG_DIM = 16384
+        if w > _MAX_IMG_DIM or h > _MAX_IMG_DIM:
+            raise RuntimeError(f"Worker reported implausible image dims {w}x{h}")
+        _bpp = 3 if resp.get("image_format", "rgb_float32") == "rgb_uint8" else 12
+        if n_bytes != w * h * _bpp:
+            raise RuntimeError(
+                f"Worker image_bytes={n_bytes} != expected {w * h * _bpp} ({w}x{h})")
+        shm_path = resp.get("image_shm_path")
+        if shm_path:
+            try:
+                with open(shm_path, "rb") as f:
+                    raw = f.read(n_bytes)
+            finally:
+                try:
+                    os.unlink(shm_path)
+                except OSError:
+                    pass
+        else:
+            raw = self._read_binary(n_bytes)
         fmt = resp.get("image_format", "rgb_float32")
         if fmt == "rgb_uint8":
             # uint8 [0,255] → float32 [0,1], 4x less IPC data than float32
@@ -887,25 +1335,68 @@ try:
     _UNREALISTIC_VRAM_REQUEST = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB
 
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
+        # Per-pipeline dispatch based on its configured unload_mode:
+        #   none                — refuse to release under any request
+        #   gpu                 — per-gen already offloaded; on blanket →
+        #                         destroy; on normal → unload (no-op if done)
+        #   gpu+cpu             — stay loaded after gen; on normal pressure →
+        #                         offload GPU + madvise disk backup (return
+        #                         ~10 GB RAM to OS); on blanket → destroy
+        #   clean_up_every_time — per-gen already released; blanket → destroy
         if _manager._loaded_keys and memory_required > 0:
-            # Ignore blanket "free everything" calls (e.g. unload_all_models
-            # passes 1e30).  These happen after every prompt execution when
-            # smart memory management is disabled and would needlessly destroy
-            # the pipeline, forcing expensive re-creation on the next run.
-            if memory_required >= _UNREALISTIC_VRAM_REQUEST:
-                logging.debug("[QuantFunc] Ignoring blanket free_memory call "
-                              f"(requested {memory_required:.2e} bytes)")
-            else:
-                # Only unload if there isn't enough free VRAM to satisfy the request
+            blanket = memory_required >= _UNREALISTIC_VRAM_REQUEST
+
+            if not blanket:
+                # Check if we actually need to do anything (enough free VRAM?)
                 try:
                     import torch
                     free_vram, _ = torch.cuda.mem_get_info(device)
                 except Exception:
                     free_vram = 0
-                if free_vram < memory_required:
-                    logging.info("[QuantFunc] Auto-offloading pipelines to free VRAM for other models "
-                                 f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
-                    _manager.unload_pipeline()  # offload all to CPU, keep alive
+                need_release = free_vram < memory_required
+            else:
+                need_release = True
+
+            if need_release:
+                # Snapshot under lock so we iterate a stable set
+                with _manager._lock:
+                    keys = list(_manager._loaded_keys)
+                    modes = dict(_manager._unload_modes)
+                for k in keys:
+                    mode = modes.get(k, "gpu+cpu")  # safe default
+                    if mode == "none":
+                        logging.debug(
+                            "[QuantFunc] Pipeline %s is unload_mode=none — refusing free_memory request",
+                            k[:8])
+                        continue
+                    # Third-party caller is about to allocate VRAM (or
+                    # clicked Free Model) — every branch below uses sync
+                    # paths so the caller doesn't race with our offload.
+                    if blanket:
+                        logging.info(
+                            "[QuantFunc] Blanket free_memory — destroying pipeline %s (mode=%s)",
+                            k[:8], mode)
+                        _manager.destroy_pipeline(k)
+                    elif mode == "gpu+cpu":
+                        # Full disk-backed release: sync unload (VRAM truly
+                        # freed before returning) + async release_backup
+                        # (madvise on disk file — doesn't block caller).
+                        logging.info(
+                            "[QuantFunc] VRAM pressure (gpu+cpu) — sync offload + async release "
+                            "for pipeline %s (need %d MB, free %d MB)",
+                            k[:8], memory_required // 1024**2, free_vram // 1024**2)
+                        _manager.unload_pipeline(k, sync=True)
+                        _manager.release_backup_pipeline(k)
+                    else:
+                        # gpu / clean_up_every_time: sync offload so VRAM is
+                        # actually freed for the caller. clean_up_every_time
+                        # may already have released, but sync unload is
+                        # idempotent (no-op if nothing on GPU).
+                        logging.info(
+                            "[QuantFunc] VRAM pressure (mode=%s) — sync offload pipeline %s "
+                            "(need %d MB, free %d MB)",
+                            mode, k[:8], memory_required // 1024**2, free_vram // 1024**2)
+                        _manager.unload_pipeline(k, sync=True)
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
@@ -940,6 +1431,14 @@ class QuantFuncPipelineConfig:
                                     "tooltip": "Text encoder quantization precision (fp4 requires SM120+/Blackwell)"}),
                 "vision_quant": (["int8", "int4", "fp8", "fp4", "fp16"], {"default": "int8",
                                   "tooltip": "Vision encoder quantization (int8 = INT8 weights + FP16 compute, best quality/size tradeoff)"}),
+                "vae_precision": (["auto", "fp16", "fp8", "int8"], {"default": "auto",
+                                  "tooltip": "VAE precision (auto picks fp8/int8 on SM120+ via cuDNN, falls back to fp16 elsewhere)"}),
+                "act_quant_mode": (["auto", "absmax", "mse"], {"default": "auto",
+                                  "tooltip": "Activation quantization scale algorithm (Lighting backend, INT4 only):\n"
+                                             "• auto — engine picks: MSE-search when rotation>0 (best quality), else absmax\n"
+                                             "• absmax — fast, scale = absmax/7\n"
+                                             "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)\n"
+                                             "FP4 / INT8 / FP8 ignore this setting (kernel uses its own scaling)."}),
             },
             "optional": {
                 "vae_tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 64,
@@ -954,13 +1453,16 @@ class QuantFuncPipelineConfig:
     CATEGORY = "QuantFunc"
 
     def build_config(self, tiled_vae, attention_backend, precision, text_precision,
-                     vision_quant="int8", vae_tile_size=0, pinned_memory_limit=""):
+                     vision_quant="int8", vae_precision="auto", act_quant_mode="absmax",
+                     vae_tile_size=0, pinned_memory_limit=""):
         config = {
             "tiled_vae": tiled_vae,
             "attention_backend": attention_backend,
             "precision": precision,
             "text_precision": text_precision,
             "vision_quant": vision_quant,
+            "vae_precision": vae_precision,
+            "act_quant_mode": act_quant_mode,
         }
 
         if vae_tile_size > 0:
@@ -973,10 +1475,83 @@ class QuantFuncPipelineConfig:
         return (config,)
 
 
+def _first_safetensors(dir_path: str) -> str:
+    """First .safetensors file inside `dir_path`, alphabetical. Returns ""
+    when the directory doesn't exist or has none.
+    """
+    if not dir_path or not os.path.isdir(dir_path):
+        return ""
+    try:
+        for f in sorted(os.listdir(dir_path)):
+            if f.endswith(".safetensors"):
+                return os.path.join(dir_path, f)
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_to_safetensors(p: str) -> str:
+    """Accepts a `.safetensors` file path or a directory and returns a
+    concrete file path. Empty / missing → "".
+    """
+    if not p or not isinstance(p, str):
+        return ""
+    p = p.strip()
+    if not p:
+        return ""
+    if os.path.isfile(p):
+        return p
+    if os.path.isdir(p):
+        return _first_safetensors(p)
+    return ""
+
+
+def _build_model_refs(model_dir: str, transformer_path: str,
+                       prequant_weights: str = "") -> tuple:
+    """Common helper for ModelLoader / ModelAutoLoader: produce three
+    `_QFPathStub` instances typed as comfy MODEL / CLIP / VAE so they plug
+    directly into QuantFunc Build Pipeline (same socket types as ComfyUI's
+    UNETLoader / CLIPLoader / VAELoader). Mirrors format_adapters' Pick*.
+    """
+    from .nodes_format_adapters import _QFPathStub
+
+    prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
+
+    # Resolve concrete file paths inside the standard HF model_dir layout.
+    # User-provided transformer_path may be either a file or a directory —
+    # both are normalised to a concrete .safetensors here.
+    xfm_path = _resolve_to_safetensors(transformer_path) or _first_safetensors(
+        os.path.join(model_dir, "transformer"))
+    te_path  = _first_safetensors(os.path.join(model_dir, "text_encoder"))
+    vae_path = _first_safetensors(os.path.join(model_dir, "vae"))
+
+    if not xfm_path:
+        raise RuntimeError(
+            "QuantFunc Model Loader: no transformer .safetensors found. "
+            f"transformer_path={transformer_path!r}, "
+            f"model_dir={model_dir!r}/transformer/ has no .safetensors. "
+            "Provide an explicit transformer_path or check model_dir layout.")
+
+    backend = _detect_model_backend(xfm_path, model_dir)
+    logging.info("[QuantFunc] model_backend → %s (xfm=%s)",
+                  backend, os.path.basename(xfm_path))
+
+    model_stub = _QFPathStub(xfm_path, kind="transformer")
+    clip_stub  = _QFPathStub(te_path,  kind="te")
+    vae_stub   = _QFPathStub(vae_path, kind="vae")
+    # Stash QuantFunc-specific hints onto the model stub so BuildPipeline
+    # can recover model_dir context, backend, and prequant sidecar.
+    model_stub.qf_model_dir = model_dir
+    model_stub.qf_backend_hint = backend
+    if prequant_weights:
+        model_stub.qf_prequant_weights = prequant_weights
+    return (model_stub, clip_stub, vae_stub)
+
+
 class QuantFuncModelLoader:
-    """Load a QuantFunc model. Uses auto_optimize by default.
-    Connect a PipelineConfig node to override init settings.
-    Edit mode is auto-detected when ref_image is connected to Generate.
+    """Load a QuantFunc model — outputs three handles (transformer / text_encoder
+    / vae), mirroring ComfyUI's Load Checkpoint shape. Wire all three into
+    `QuantFunc Build Pipeline`, which carries device + advanced runtime config.
     """
 
     @classmethod
@@ -985,87 +1560,29 @@ class QuantFuncModelLoader:
             "required": {
                 "model_dir": ("STRING", {"default": "", "tooltip": "Base model directory (contains model_index.json)"}),
                 "transformer_path": ("STRING", {"default": "", "tooltip": "Transformer weights path (safetensors file or directory)"}),
-                "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
-                "device": (_AVAILABLE_DEVICES,),
             },
             "optional": {
-                "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node). If not connected, uses auto_optimize defaults."}),
-                "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication (e.g. qf_xxx). Server URL is read from config.json next to the library."}),
-                "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
-                "precision_config": ("STRING", {"default": "", "tooltip": "Per-layer precision config JSON path (Lighting backend only)"}),
-                "prequant_weights": ("STRING", {"default": "", "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)"}),
-                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
-                "act_quant_mode": (["absmax", "mse"], {
-                    "default": "absmax",
-                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
-                               "• absmax — fast, scale = absmax/7 (default)\n"
-                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
+                "prequant_weights": ("STRING", {
+                    "default": "",
+                    "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)",
                 }),
-                "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory. No image will be generated."}),
-            }
+            },
         }
 
-    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
+    # Output comfy native MODEL/CLIP/VAE types so this loader interoperates
+    # with QuantFunc Build Pipeline (and any other node accepting these
+    # sockets — e.g. comfy CheckpointLoaderSimple / UNETLoader / CLIPLoader
+    # / VAELoader output the same types). The values are `_QFPathStub`
+    # objects carrying qf_source_path; non-QuantFunc consumers will crash
+    # on these stubs by design (per format_adapters convention).
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_model"
     CATEGORY = "QuantFunc"
 
-    def load_model(self, model_dir, transformer_path, model_backend,
-                   device, config=None, manual_unload_model=False,
-                   api_key="", scheduler_config="",
-                   precision_config="", prequant_weights="",
-                   fused_mod=False, act_quant_mode="absmax", **kwargs):
-        scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
-        # Validate: scheduler_config must be a file path (not a bare number or random text)
-        if scheduler_config and not os.path.exists(scheduler_config):
-            logging.warning(f"[QuantFunc] scheduler_config path does not exist: {scheduler_config!r}, ignoring")
-            scheduler_config = ""
-        precision_config = precision_config.strip() if isinstance(precision_config, str) else ""
-        prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
-        transformer_path = transformer_path if isinstance(transformer_path, str) and transformer_path else ""
-
-        api_key = api_key.strip() if isinstance(api_key, str) else ""
-        if api_key.lower() == "none":
-            api_key = ""
-
-        # Load server_url (and fallback api_key) from config.json next to the library
-        lib_config = _load_lib_config()
-        if not api_key:
-            api_key = lib_config.get("api_key", "")
-        server_url = lib_config.get("server_url", "")
-
-        options = {"auto_optimize": True}
-        if precision_config:
-            options["precision_config"] = precision_config
-        if prequant_weights:
-            options["mod_weights"] = prequant_weights
-        if fused_mod:
-            options["fused_mod"] = True
-        if api_key:
-            options["api_key"] = api_key
-        if server_url:
-            options["server_url"] = server_url
-        if model_backend == "lighting":
-            options.setdefault("rotation_block_size", 256)
-        options["act_quant_mode"] = act_quant_mode
-
-        text_precision = "int4"
-        if config and isinstance(config, dict):
-            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
-            text_precision = config.pop("text_precision", text_precision)
-            options.update(config)
-
-        cfg = {
-            "model_dir": model_dir,
-            "transformer": transformer_path,
-            "backend": model_backend,
-            "precision": text_precision,
-            "scheduler": scheduler_config,
-            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
-            "options": options,
-            "unload": manual_unload_model,
-        }
-        return (cfg,)
+    def load_model(self, model_dir, transformer_path,
+                   prequant_weights="", **kwargs):
+        return _build_model_refs(model_dir, transformer_path, prequant_weights)
 
 
 # ============================================================================
@@ -1114,34 +1631,23 @@ class QuantFuncModelAutoLoader:
         return {
             "required": {
                 "model_series": (MODEL_SERIES_LIST, {"tooltip": "Model series to download and load"}),
-                "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
-                "device": (_AVAILABLE_DEVICES,),
                 "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
             },
             "optional": {
                 "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
-                "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
-                "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
-                "act_quant_mode": (["absmax", "mse"], {
-                    "default": "absmax",
-                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
-                               "• absmax — fast, scale = absmax/7 (default)\n"
-                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
-                }),
-                "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
-            }
+            },
         }
 
-    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
-    RETURN_NAMES = ("pipeline",)
+    # Output comfy native MODEL/CLIP/VAE types — same rationale as
+    # QuantFuncModelLoader above: interoperates with BuildPipeline and any
+    # node accepting these sockets.
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_model"
     CATEGORY = "QuantFunc"
 
-    def load_model(self, model_series, model_backend, device, data_source,
-                   config=None, manual_unload_model=False,
-                   transformer="None", api_key="",
-                   act_quant_mode="absmax",
-                   **kwargs):
+    def load_model(self, model_series, data_source,
+                   transformer="None", **kwargs):
         from .model_auto_loader import (
             detect_gpu_variant, download_base_model,
             download_transformer, resolve_transformer_selection,
@@ -1158,41 +1664,7 @@ class QuantFuncModelAutoLoader:
             if t_series and t_name:
                 transformer_path = download_transformer(t_series, t_name, data_source)
 
-        # ── Build pipeline config (same structure as ModelLoader) ──
-        api_key = api_key.strip() if isinstance(api_key, str) else ""
-        if api_key.lower() == "none":
-            api_key = ""
-
-        lib_config = _load_lib_config()
-        if not api_key:
-            api_key = lib_config.get("api_key", "")
-        server_url = lib_config.get("server_url", "")
-
-        options = {"auto_optimize": True}
-        if api_key:
-            options["api_key"] = api_key
-        if server_url:
-            options["server_url"] = server_url
-        if model_backend == "lighting":
-            options.setdefault("rotation_block_size", 256)
-        options["act_quant_mode"] = act_quant_mode
-
-        text_precision = "int4"
-        if config and isinstance(config, dict):
-            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
-            text_precision = config.pop("text_precision", text_precision)
-            options.update(config)
-
-        cfg = {
-            "model_dir": model_dir,
-            "transformer": transformer_path,
-            "backend": model_backend,
-            "precision": text_precision,
-            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
-            "options": options,
-            "unload": manual_unload_model,
-        }
-        return (cfg,)
+        return _build_model_refs(model_dir, transformer_path)
 
 
 # ============================================================================
@@ -1653,11 +2125,22 @@ class QuantFuncGenerate:
                                "0 = deterministic (no effect). Only used by stochastic samplers.\n"
                                "Recommended 0.2~0.5 for ≤20 steps. Higher eta needs more steps.",
                 }),
-                "unload_every_time": ("BOOLEAN", {
+                "activate_unload": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Offload all models from GPU to CPU after generation, freeing VRAM.\n"
-                               "Models stay in CPU RAM for fast reload on the next run.\n"
-                               "Enable this when sharing VRAM with other ComfyUI nodes.",
+                    "tooltip": "Let ComfyUI unload this pipeline when it needs VRAM for "
+                               "coexisting plugins.\n\n"
+                               "False (default): never unload. Weights stay pinned in RAM "
+                               "(~17 GB) after each generate; fastest subsequent runs (0 "
+                               "overhead). ComfyUI's free_memory requests are refused.\n\n"
+                               "True: listen to ComfyUI's memory-pressure signals. On "
+                               "pressure — another plugin needs VRAM → offload GPU and "
+                               "madvise the disk-backed transformer backup to return "
+                               "~13 GB of RAM to the OS. On 'Free Model and Node Cache' → "
+                               "full destroy. Next run page-faults the backup from disk "
+                               "(~5-15 s on SSD). Enables the disk-backed coalesced backup "
+                               "at pipeline creation, so a ~13 GB file will exist in "
+                               "$QUANTFUNC_BACKUP_DIR / $TMPDIR / /var/tmp / /tmp while "
+                               "the pipeline is alive (unlinked on clean exit).",
                 }),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
@@ -1673,27 +2156,41 @@ class QuantFuncGenerate:
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=4.0,
                  sampler_name="euler", sampler_eta=0.0,
-                 unload_every_time=False, unique_id=None,
-                 workflow_prompt=None):
+                 activate_unload=False, unload_mode=None, unload_every_time=None,
+                 unique_id=None, workflow_prompt=None):
+        # Backwards-compat with older saved workflows that used the
+        # unload_mode dropdown or the unload_every_time bool: both are
+        # collapsed onto a single activate_unload bool — true if the user
+        # asked to release under pressure (any non-"none" legacy value),
+        # false otherwise.  Silent; the new widget is the source of truth.
+        if unload_mode is not None:
+            activate_unload = activate_unload or (unload_mode != "none")
+        if unload_every_time:
+            activate_unload = True
+        # Internal _unload_modes bookkeeping still uses the string "gpu+cpu"
+        # / "none" keys the free_memory hook understands; map the bool.
+        unload_mode_internal = "gpu+cpu" if activate_unload else "none"
         import torch
-
-        # Handle unload request
-        if pipeline.get("unload"):
-            _manager.destroy_all()
-            from PIL import Image as PILImage, ImageDraw
-            msg_img = PILImage.new("RGB", (512, 128), color=(40, 40, 40))
-            draw = ImageDraw.Draw(msg_img)
-            draw.text((20, 45), "Model unloaded successfully.", fill=(200, 200, 200))
-            msg_np = np.array(msg_img, dtype=np.float32) / 255.0
-            msg_tensor = torch.from_numpy(msg_np).unsqueeze(0)
-            logging.info("[QuantFunc] Model unloaded successfully.")
-            return (msg_tensor,)
 
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # Propagate activate_unload into the pipeline's comp_opts so the
+        # C++ side builds the transformer's coalesced backup on disk
+        # (enabling future releaseRamPages) instead of in pinned RAM.
+        # Must be set at create time — the coalesced backup's storage
+        # medium is baked in during warmup and can't be switched later
+        # without a 13 GB re-pack.
+        cfg["options"]["activate_unload"] = bool(activate_unload)
         # Unpack ImageList dict format
         ref_img_resize = "720"
+        ref_img_resize_others = "720"
+        # Inpaint defaults (overridden if mask present in ref_images dict).
+        inpaint_mask = None
+        inpaint_strength = 1.0
+        inpaint_grow = 6
+        inpaint_blur = 0.0
+        inpaint_no_snap = False
         if ref_images is not None and isinstance(ref_images, dict):
             # New: ref_img_resize ("720" / "1024" / "origin")
             # Backwards compat: old workflows may still send keep_ref_img_size (bool)
@@ -1701,9 +2198,23 @@ class QuantFuncGenerate:
                 ref_img_resize = ref_images["ref_img_resize"]
             elif ref_images.get("keep_ref_img_size"):
                 ref_img_resize = "1024"
+            ref_img_resize_others = ref_images.get("ref_img_resize_others", "720")
+            # Inpaint payload (optional): mask tensor + 4 knobs.
+            inpaint_mask = ref_images.get("mask")
+            inpaint_strength = ref_images.get("mask_strength", 1.0)
+            inpaint_grow = ref_images.get("mask_grow", 6)
+            inpaint_blur = ref_images.get("mask_blur", 0.0)
+            inpaint_no_snap = ref_images.get("mask_no_snap", False)
             ref_images = ref_images["images"]
-        if ref_images is not None:
-            cfg["options"]["edit_mode"] = True
+        # edit_mode controls which Pipeline class the C++ engine instantiates:
+        #   - QwenImage / QwenImageEdit are SEPARATE classes; QwenImageEditPipeline
+        #     only supports generate_edit() and rejects generate() at runtime.
+        #     So edit_mode MUST track ref_images presence for these.
+        #   - Klein uses ONE pipeline class for both modes (edit_mode=true just
+        #     pre-loads VAE encoder); toggling triggers recreate but t2i still
+        #     works since the pipeline serves both.
+        # Set conditionally — accept the recreate cost when toggling ref_images.
+        cfg["options"]["edit_mode"] = ref_images is not None
 
         # Collect live QuantFuncGenerate node ids from the current workflow.
         # Exclude nodes whose required `pipeline` input isn't connected — those
@@ -1731,33 +2242,94 @@ class QuantFuncGenerate:
         except Exception:
             pass
 
+        # /dev/shm QFRAW staging files — RAM-backed (tmpfs); MUST be unlinked
+        # once the engine has consumed them (see the `finally` below) or every
+        # edit/inpaint generation leaks a raw RGB blob (+ mask) into RAM.
+        tmp_paths = []
+        mask_path = None
         try:
             if ref_images is not None:
-                # Save each ref image to temp file
-                from PIL import Image
+                # Write each ref image as a "QFRAW01" raw uint8 RGB blob to
+                # /dev/shm. Backend ImageUtils::load_image detects the magic
+                # and skips cv::imread entirely — ~80 ms saved per 1728×2304
+                # ref vs the prior BMP encode + cv::imread decode round-trip.
+                # Format: 8-byte magic "QFRAW01\0" + uint32 H + uint32 W +
+                # H*W*3 uint8 RGB bytes.
                 tmp_paths = []
+                try:
+                    import cv2
+                    _have_cv2 = True
+                except ImportError:
+                    _have_cv2 = False
+                from PIL import Image  # used only for output preview path
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
-                        fd, tmp_path = tempfile.mkstemp(suffix=".bmp")
+                        fd, tmp_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
                         os.close(fd)
-                        img_np = (img_tensor[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                        Image.fromarray(img_np).save(tmp_path)
+                        t = img_tensor[i]
+                        # ComfyUI IMAGE is [B, H, W, C] FP32 in [0,1]. Convert
+                        # to HWC uint8 [0,255]. cv2.convertScaleAbs is the
+                        # fast SIMD path; numpy fallback is fine.
+                        arr_f32 = t.numpy() if t.device.type == "cpu" else t.cpu().numpy()
+                        if _have_cv2:
+                            img_np = cv2.convertScaleAbs(arr_f32, alpha=255.0)
+                        else:
+                            img_np = (arr_f32 * 255).clip(0, 255).astype(np.uint8)
+                        h, w = img_np.shape[0], img_np.shape[1]
+                        header = b"QFRAW01\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+                        with open(tmp_path, "wb") as f:
+                            f.write(header)
+                            # tobytes() is C-contiguous HWC uint8 — RGB order
+                            # matches ComfyUI's IMAGE convention, so no swap.
+                            f.write(img_np.tobytes())
                         tmp_paths.append(tmp_path)
-
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
                 if sampler_name != "euler":
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
-                i2i_opts["ref_img_resize"] = ref_img_resize
+                # Per-image resize: 主图 (refs[0]) uses main_image_resize,
+                # 参考图 2~10 (refs[1..]) use ref_image_resize_others.
+                # Build per-image array for C++ backend.
+                num_refs = len(tmp_paths)
+                if num_refs > 1 and ref_img_resize != ref_img_resize_others:
+                    resize_arr = [ref_img_resize] + [ref_img_resize_others] * (num_refs - 1)
+                    i2i_opts["ref_img_resize"] = resize_arr
+                else:
+                    i2i_opts["ref_img_resize"] = ref_img_resize
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
+
+                # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
+                # (white=mask). Save first slice as raw uint8 L8 with
+                # "QFRAWL1" magic header — backend skips PNG decode entirely.
+                # Format: 8-byte magic + uint32 H + uint32 W + H*W uint8.
+                mask_path = None
+                if inpaint_mask is not None and inpaint_strength > 0.0:
+                    fd, mask_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
+                    os.close(fd)
+                    m = inpaint_mask
+                    # Accept [B,H,W] / [B,1,H,W] / [H,W]
+                    if m.dim() == 4: m = m[0, 0]
+                    elif m.dim() == 3: m = m[0]
+                    m_np = (m.detach().cpu().clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+                    h, w = m_np.shape[0], m_np.shape[1]
+                    header = b"QFRAWL1\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+                    with open(mask_path, "wb") as f:
+                        f.write(header)
+                        f.write(m_np.tobytes())
+
                 arr = _manager.image_to_image(
                     cache_key=cache_key,
                     prompt=prompt, ref_paths=tmp_paths,
                     height=height, width=width, steps=steps, seed=seed,
                     true_cfg_scale=true_cfg_scale, negative_prompt=neg,
-                    options_json=i2i_opts_json, pbar=pbar)
+                    options_json=i2i_opts_json, pbar=pbar,
+                    mask_path=mask_path,
+                    mask_strength=inpaint_strength,
+                    mask_grow=inpaint_grow,
+                    mask_blur=inpaint_blur,
+                    mask_no_snap=inpaint_no_snap)
             else:
                 t2i_opts = {}
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
@@ -1777,15 +2349,36 @@ class QuantFuncGenerate:
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
                     options_json=opts_json, pbar=pbar)
 
-            if unload_every_time:
-                _manager.unload_pipeline(cache_key)
+            # Persist the mode so the ComfyUI free_memory hook can look it up
+            # for this pipeline. The hook inspects _unload_modes[k]:
+            #   "gpu+cpu" (activate_unload=True)  → release on memory pressure
+            #   "none"    (activate_unload=False) → refuse release requests
+            # No per-gen action needed — the hook is the sole trigger.
+            with _manager._lock:
+                _manager._unload_modes[cache_key] = unload_mode_internal
 
-            return (torch.from_numpy(arr).unsqueeze(0),)  # [1, H, W, 3]
+            out = torch.from_numpy(arr).unsqueeze(0)
+            return (out,)  # [1, H, W, 3]
 
         except InterruptedError:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
             blank = torch.zeros(1, height, width, 3, dtype=torch.float32)
             return (blank,)
+        finally:
+            # Unlink the /dev/shm QFRAW staging files. By image_to_image's return
+            # the engine has already read them; on interrupt they're unused. Either
+            # way they must not accumulate in tmpfs (RAM). Output shm is freed
+            # separately in the reader path.
+            for _p in tmp_paths:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
+            if mask_path:
+                try:
+                    os.unlink(mask_path)
+                except OSError:
+                    pass
 
 
 # ============================================================================
@@ -1793,21 +2386,51 @@ class QuantFuncGenerate:
 # ============================================================================
 
 class QuantFuncImageList:
-    """Reference images for edit mode. Single or multiple images supported."""
+    """Reference images for edit mode. Single or multiple images supported.
+    Optional MASK input enables inpaint (mirrors ComfyUI SetLatentNoiseMask):
+    only the white region of the mask is regenerated; black region is preserved.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {f"image{i}": ("IMAGE",) for i in range(2, 11)}
-        optional["ref_img_resize"] = (["720", "1024", "origin"], {
+        optional = {}
+        # main_image_mask = 主图遮罩(可选,触发 inpaint)
+        optional["main_image_mask"] = ("MASK", {
+            "tooltip": "主图的 inpaint 遮罩(白=重绘,黑=保留,等价 ComfyUI "
+                       "SetLatentNoiseMask)。只有白色区域被模型重绘;"
+                       "黑色区域通过后处理 snap 完整保留原图。",
+        })
+        # main_image_resize = 主图缩放
+        optional["main_image_resize"] = (["720", "1024", "origin"], {
             "default": "720",
-            "tooltip": "Reference image resize mode (edit pipelines):\n"
-                       "  720  — long-side cap at 720 px (default, fastest)\n"
-                       "  1024 — long-side cap at 1024 px (better quality, slower)\n"
-                       "  origin — keep original size, only floor each dim to a multiple of 16",
+            "tooltip": "主图缩放模式:\n"
+                       "  720  — 长边裁到 720 px(默认,最快)\n"
+                       "  1024 — 长边裁到 1024 px(更高质量,稍慢)\n"
+                       "  origin — 保留原尺寸,只把每边对齐到 16 的倍数",
+        })
+        # ref_image_2..ref_image_10 = 参考图 2-10
+        for i in range(2, 11):
+            optional[f"ref_image_{i}"] = ("IMAGE", {
+                "tooltip": f"第 {i} 张参考图(可选)。最多 10 张。",
+            })
+        # ref_image_resize_others = 参考图 2~10 缩放
+        optional["ref_image_resize_others"] = (["720", "1024", "origin"], {
+            "default": "720",
+            "tooltip": "参考图 2~10 的缩放模式:\n"
+                       "  720  — 长边裁到 720 px(默认,省 VRAM)\n"
+                       "  1024 — 长边裁到 1024 px\n"
+                       "  origin — 保留原尺寸(图大可能 OOM)",
+        })
+        # mask_config = MASK 高级配置(可选,不连接走默认)。
+        # 默认 = QuantFuncMaskConfig 的默认 = strength=1.0, grow=6, blur=0.0, no_snap=False。
+        optional["mask_config"] = ("QUANTFUNC_MASK_CONFIG", {
+            "tooltip": "可选:用 QuantFunc Mask Config 节点配置遮罩高级参数"
+                       "(strength / grow / blur / no_snap)。不连接 = 全用默认值。",
         })
         return {
             "required": {
-                "image1": ("IMAGE",),
+                # main_image = 主图
+                "main_image": ("IMAGE", {"tooltip": "edit 模式的主图(被遮罩区域将被重绘)"}),
             },
             "optional": optional,
         }
@@ -1817,13 +2440,143 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, image1, ref_img_resize="720", **kwargs):
-        images = [image1]
+    def combine(self, main_image, main_image_resize="720",
+                ref_image_resize_others="720",
+                main_image_mask=None, mask_config=None, **kwargs):
+        images = [main_image]
         for i in range(2, 11):
-            img = kwargs.get(f"image{i}")
+            img = kwargs.get(f"ref_image_{i}")
             if img is not None:
                 images.append(img)
-        return ({"images": images, "ref_img_resize": ref_img_resize},)
+        # Internal dict keys keep the legacy `ref_img_resize` / `mask` names so
+        # QuantFuncGenerate.generate (which reads them) needs no parallel rename.
+        out = {
+            "images": images,
+            "ref_img_resize": main_image_resize,
+            "ref_img_resize_others": ref_image_resize_others,
+        }
+        if main_image_mask is not None:
+            # Auto-align mask to main_image's pixel dims. Lets users wire any
+            # ImageScale / Resize node into main_image without needing a
+            # parallel resize for the mask (ComfyUI doesn't have a dedicated
+            # MASK resize node — only Image-side scalers). main_image is
+            # [B, H, W, C], main_image_mask is [B, H, W] or [B, 1, H, W].
+            mask_t = main_image_mask
+            img_h, img_w = main_image.shape[1], main_image.shape[2]
+            mh = mask_t.shape[-2]
+            mw = mask_t.shape[-1]
+            if mh != img_h or mw != img_w:
+                import torch.nn.functional as F
+                m4 = mask_t.unsqueeze(1) if mask_t.dim() == 3 else mask_t
+                m4 = F.interpolate(m4, size=(img_h, img_w),
+                                    mode="bilinear", align_corners=False)
+                mask_t = m4.squeeze(1) if mask_t.dim() == 3 else m4
+            out["mask"] = mask_t
+            # Defaults match QuantFuncMaskConfig defaults exactly.
+            cfg = mask_config if isinstance(mask_config, dict) else {}
+            out["mask_strength"] = float(cfg.get("mask_strength", 1.0))
+            out["mask_grow"]     = int(cfg.get("mask_grow", 6))
+            out["mask_blur"]     = float(cfg.get("mask_blur", 0.0))
+            out["mask_no_snap"]  = bool(cfg.get("mask_no_snap", False))
+        return (out,)
+
+
+# ============================================================================
+# Node: QuantFunc Mask Config (advanced inpaint knobs, optional)
+# ============================================================================
+
+class QuantFuncMaskConfig:
+    """Inpaint MASK 高级配置(可选)。把 4 个边界参数打包成一个输出,接到
+    QuantFunc Image List 的 `mask_config` 入口。不接就走默认值,跟 ComfyUI
+    的 VAEEncodeForInpaint / SetLatentNoiseMask 保持一致。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "遮罩强度倍数 (0..1)。0 = 关闭 inpaint。",
+                }),
+                "mask_grow": ("INT", {
+                    "default": 6, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "遮罩像素膨胀 N(对齐 ComfyUI VAEEncodeForInpaint "
+                               "grow_mask_by 默认 6)。让接缝过渡更自然。",
+                }),
+                "mask_blur": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 64.0, "step": 0.5,
+                    "tooltip": "遮罩高斯模糊 sigma(像素;对齐 ComfyUI MaskBlur)。"
+                               "0 = 边界硬切。",
+                }),
+                "mask_no_snap": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "关闭最后一步对未遮罩区域的 snap 回原图。"
+                               "默认关闭(snap 开,跟 ComfyUI 一致)。"
+                               "开启 = 让模型决定整张图,边界过渡更柔和但"
+                               "保留区会轻微飘移。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_MASK_CONFIG",)
+    RETURN_NAMES = ("mask_config",)
+    FUNCTION = "build"
+    CATEGORY = "QuantFunc"
+
+    def build(self, mask_strength, mask_grow, mask_blur, mask_no_snap):
+        return ({
+            "mask_strength": float(mask_strength),
+            "mask_grow": int(mask_grow),
+            "mask_blur": float(mask_blur),
+            "mask_no_snap": bool(mask_no_snap),
+        },)
+
+
+# ============================================================================
+# Node: QuantFunc Mask Scale By (mirrors ComfyUI ImageScaleBy, for MASK)
+# ============================================================================
+
+class QuantFuncMaskScaleBy:
+    """按比例缩放 MASK,对称 ComfyUI 自带 ImageScaleBy(自带的不接 MASK 类型)。
+    用法:LoadImageMask → QuantFunc Mask Scale By(同主图的 scale_by)→ main_image_mask"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK", {"tooltip": "要缩放的遮罩"}),
+                "scale_by": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 8.0, "step": 0.01,
+                    "tooltip": "缩放比例。要和主图的 ImageScaleBy 设成一样的值。",
+                }),
+                "method": (["bilinear", "nearest", "bicubic"], {
+                    "default": "bilinear",
+                    "tooltip": "插值方式。bilinear 默认平滑,nearest 保留硬边,"
+                               "bicubic 最高质量但稍慢。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "scale_by"
+    CATEGORY = "QuantFunc"
+
+    def scale_by(self, mask, scale_by, method):
+        import torch.nn.functional as F
+        # ComfyUI MASK is [B, H, W]. Add channel dim for interpolate.
+        m4 = mask.unsqueeze(1) if mask.dim() == 3 else mask
+        h, w = m4.shape[-2], m4.shape[-1]
+        new_h = max(1, int(round(h * scale_by)))
+        new_w = max(1, int(round(w * scale_by)))
+        kwargs = {"size": (new_h, new_w), "mode": method}
+        if method in ("bilinear", "bicubic"):
+            kwargs["align_corners"] = False
+        out = F.interpolate(m4, **kwargs)
+        out = out.clamp(0.0, 1.0)
+        if mask.dim() == 3:
+            out = out.squeeze(1)
+        return (out,)
 
 
 # ============================================================================
@@ -1831,17 +2584,42 @@ class QuantFuncImageList:
 # ============================================================================
 
 class QuantFuncExport:
-    """Export a pre-quantized model directory."""
+    """Export a pre-quantized model directory.
+
+    Two output formats:
+      - diffusers (formerly "separated") — HF-style directory:
+                     transformer/, text_encoder/, vae/, ... each component
+                     its own safetensors. The traditional layout,
+                     compatible with `--model-dir <out>` reload.
+      - comfy_checkpoint (formerly "bundle", aka 全家桶) — single
+                     safetensors with all components packed under
+                     per-component prefixes (model.diffusion_model.*,
+                     text_encoder.*, vae.*, vision_encoder.*). One file,
+                     loadable directly as a ComfyUI checkpoint via the
+                     QuantFunc plugin's bundled-checkpoint adapter.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "pipeline": ("QUANTFUNC_PIPELINE",),
-                "export_path": ("STRING", {"default": "", "tooltip": "Output directory for exported model"}),
+                "export_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "diffusers 模式: 输出到这个目录, 每个组件一个 safetensors\n"
+                               "comfy_checkpoint 模式: 输出到这个目录下的单个 model.safetensors (全家桶)",
+                }),
+                "export_format": (["diffusers", "comfy_checkpoint"], {
+                    "default": "diffusers",
+                    "tooltip": "diffusers = HF 标准目录(每个组件独立文件)\n"
+                               "comfy_checkpoint = 单文件 safetensors 打包所有组件 (全家桶)\n"
+                               "  ↳ comfy_checkpoint 模式下 export_mode 强制为 'all'\n"
+                               "    (transformer + text_encoder + vae + vision_encoder)",
+                }),
                 "export_mode": (["all", "custom"], {
                     "default": "all",
-                    "tooltip": "'all' copies entire model (vae, tokenizer, etc.) for standalone use; 'custom' selects individual components"
+                    "tooltip": "(仅 diffusers) 'all' 复制整个模型(vae、tokenizer 等)用于独立使用; "
+                               "'custom' 选择单个组件",
                 }),
             },
             "optional": {
@@ -1856,32 +2634,45 @@ class QuantFuncExport:
     FUNCTION = "export_model"
     CATEGORY = "QuantFunc"
 
-    def export_model(self, pipeline, export_path, export_mode="all",
+    def export_model(self, pipeline, export_path,
+                     export_format="diffusers", export_mode="all",
                      export_transformer=True, export_text_encoder=False,
                      export_vision_encoder=False):
         if not export_path:
             raise ValueError("export_path is required")
 
-        if export_mode == "all":
-            components = ["all"]
-        else:
-            components = []
-            if export_transformer:
-                components.append("transformer")
-            if export_text_encoder:
-                components.append("text_encoder")
-            if export_vision_encoder:
-                components.append("vision_encoder")
-            if not components:
-                raise ValueError("At least one component must be selected for export")
-
-        # Inject export_models into pipeline config options
         if "options" not in pipeline:
             pipeline["options"] = {}
-        pipeline["options"]["export_models"] = ",".join(components)
+
+        # Accept both the new UI labels (diffusers / comfy_checkpoint) and the
+        # legacy labels (separated / bundle) so old workflow JSON keeps working.
+        # Engine-side string is unchanged: "bundle" or absent (= separated).
+        is_bundle = export_format in ("comfy_checkpoint", "bundle")
+
+        if is_bundle:
+            # Bundle (= ComfyUI checkpoint) always packs the whole pipeline —
+            # per-component selection doesn't apply. Force `all` so the worker
+            # doesn't filter components and break the layout.
+            pipeline["options"]["export_format"] = "bundle"
+            pipeline["options"]["export_models"] = "all"
+        else:
+            pipeline["options"].pop("export_format", None)  # default = separated/diffusers
+            if export_mode == "all":
+                components = ["all"]
+            else:
+                components = []
+                if export_transformer:
+                    components.append("transformer")
+                if export_text_encoder:
+                    components.append("text_encoder")
+                if export_vision_encoder:
+                    components.append("vision_encoder")
+                if not components:
+                    raise ValueError("At least one component must be selected for export")
+            pipeline["options"]["export_models"] = ",".join(components)
 
         _manager.export_model(pipeline, export_path)
-        logging.info("[QuantFunc] Export complete: %s", export_path)
+        logging.info("[QuantFunc] Export complete (%s): %s", export_format, export_path)
         return {}
 
 
@@ -1893,6 +2684,9 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
+    # QuantFuncBuildPipeline lives in nodes_format_adapters.py (one canonical
+    # implementation; loaded after this map → __init__.py's update() lifts it
+    # under the same registration key).
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncBaseSeriesModelAutoLoader": QuantFuncBaseSeriesModelAutoLoader,
@@ -1904,6 +2698,8 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
     "QuantFuncImageList": QuantFuncImageList,
+    "QuantFuncMaskConfig": QuantFuncMaskConfig,
+    "QuantFuncMaskScaleBy": QuantFuncMaskScaleBy,
     "QuantFuncExport": QuantFuncExport,
 }
 
@@ -1911,6 +2707,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
+    # QuantFuncBuildPipeline display name is set in nodes_format_adapters.py.
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncBaseSeriesModelAutoLoader": "QuantFunc Base Series Model Auto Loader",
@@ -1922,5 +2719,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
     "QuantFuncImageList": "QuantFunc Image List",
+    "QuantFuncMaskConfig": "QuantFunc Mask Config",
+    "QuantFuncMaskScaleBy": "QuantFunc Mask Scale By",
     "QuantFuncExport": "QuantFunc Export",
 }
