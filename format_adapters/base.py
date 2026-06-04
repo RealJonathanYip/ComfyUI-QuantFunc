@@ -85,7 +85,7 @@ class FileRef:
     """
     path: str
     arch: str = ""              # "QwenImage" | "QwenImageEdit" | "Flux2Klein" | "ZImage" | ""
-    kind: str = ""              # "prequant_lighting_separate" | "raw_fp16" | "raw_fp8" | "raw_fp8_mixed" | "nvfp4" | "bundled_checkpoint" | ""
+    kind: str = ""              # fingerprint_kind_from_metadata: "raw_highprec" | "prequant_lighting_separate" | "nvfp4_disk" | "raw_fp4" | "raw_fp8" | "raw_fp8_mixed" | "raw_int8" | "" ; or force_kind "bundled_checkpoint"
     mtime: float = 0.0
 
 
