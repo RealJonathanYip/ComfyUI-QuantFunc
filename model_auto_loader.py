@@ -28,6 +28,8 @@ MODEL_SERIES_LIST = [
     "QuantFunc/Qwen-Image-Edit-Series",
     "QuantFunc/Qwen-Image-Series",
     "QuantFunc/Z-Image-Series",
+    "QuantFunc/Klein-4B-Series",
+    "QuantFunc/Klein-9B-Series",
 ]
 
 # Per-series: base model directory naming pattern in the repo
@@ -36,11 +38,15 @@ _BASE_MODEL_PATTERN = {
     "QuantFunc/Qwen-Image-Edit-Series": "qwen-image-edit-series-{variant}-base-model",
     "QuantFunc/Qwen-Image-Series": "qwen-image-series-{variant}-base-model",
     "QuantFunc/Z-Image-Series": "z-image-series-{variant}-base-model",
+    "QuantFunc/Klein-4B-Series": "klein-4b-series-{variant}-base-model",
+    "QuantFunc/Klein-9B-Series": "klein-9b-series-{variant}-base-model",
 }
 
 _SERIES_WITH_PREQUANT = {
     "QuantFunc/Qwen-Image-Edit-Series",
     "QuantFunc/Qwen-Image-Series",
+    "QuantFunc/Klein-4B-Series",
+    "QuantFunc/Klein-9B-Series",
 }
 
 _SUBDIR_PREQUANT = "prequant"
