@@ -2105,16 +2105,20 @@ def _reinhard_color_match(target_hwc, reference_hwc, strength):
     ref = np.clip(reference_hwc, 0.0, 1.0).astype(np.float32)
     tgt_lab = cv2.cvtColor(tgt, cv2.COLOR_RGB2Lab)
     ref_lab = cv2.cvtColor(ref, cv2.COLOR_RGB2Lab)
-    matched = tgt_lab.copy()
-    for c in range(3):
-        t_mean = float(tgt_lab[..., c].mean()); t_std = float(tgt_lab[..., c].std())
-        r_mean = float(ref_lab[..., c].mean()); r_std = float(ref_lab[..., c].std())
-        scale = (r_std / t_std) if t_std > 1e-6 else 1.0
-        matched[..., c] = (tgt_lab[..., c] - t_mean) * scale + r_mean
-    matched_rgb = cv2.cvtColor(matched, cv2.COLOR_Lab2RGB)
-    if strength < 1.0:
-        matched_rgb = tgt + strength * (matched_rgb - tgt)
-    return np.clip(matched_rgb, 0.0, 1.0).astype(np.float32)
+    # Per-channel mean/std via OpenCV's SIMD meanStdDev (the same call the engine
+    # uses); then the affine match + blend in-place (no large temporaries). ~2x
+    # faster than a per-channel numpy loop and avoids the engine's manual
+    # per-pixel tensor<->cv::Mat scalar copies.
+    t_mean, t_std = cv2.meanStdDev(tgt_lab)
+    r_mean, r_std = cv2.meanStdDev(ref_lab)
+    t_mean = t_mean.reshape(3).astype(np.float32); t_std = t_std.reshape(3).astype(np.float32)
+    r_mean = r_mean.reshape(3).astype(np.float32); r_std = r_std.reshape(3).astype(np.float32)
+    scale = np.where(t_std > 1e-6, r_std / t_std, 1.0).astype(np.float32)
+    tgt_lab -= t_mean; tgt_lab *= scale; tgt_lab += r_mean    # out = (lab - tm)*scale + rm
+    out = cv2.cvtColor(tgt_lab, cv2.COLOR_Lab2RGB)
+    if strength < 1.0:                                         # out = (1-s)*tgt + s*out
+        out = cv2.addWeighted(tgt, 1.0 - strength, out, strength, 0.0)
+    return np.clip(out, 0.0, 1.0, out=out)
 
 
 class QuantFuncGenerate:
