@@ -1056,6 +1056,10 @@ class WorkerManager:
         """Generate text-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
         with self._lock:
             self._ensure_worker()
+            # Print the worker log path on EVERY generation (the worker persists
+            # across generations, so the one-time startup print scrolls away).
+            logging.info("[QuantFunc] Worker log: %s",
+                         getattr(self, "_worker_log_path", None) or "(not set)")
 
             # Before running, make sure only the target pipeline is GPU-resident
             self._unload_others_locked(keep_key=cache_key)
@@ -1091,6 +1095,10 @@ class WorkerManager:
         """
         with self._lock:
             self._ensure_worker()
+            # Print the worker log path on EVERY generation (the worker persists
+            # across generations, so the one-time startup print scrolls away).
+            logging.info("[QuantFunc] Worker log: %s",
+                         getattr(self, "_worker_log_path", None) or "(not set)")
 
             # Before running, make sure only the target pipeline is GPU-resident
             self._unload_others_locked(keep_key=cache_key)

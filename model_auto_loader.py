@@ -521,6 +521,10 @@ def resolve_precision_config_selection(selection, model_series):
 _BASE_MODEL_SEARCH_CONFIGS = [
     ("Qwen", lambda name: "image" in name.lower()),
     ("Tongyi-MAI", lambda name: "z-image" in name.lower() or "zimage" in name.lower()),
+    # Flux.2 Klein 4B/9B — original-precision checkpoints. Both the distilled
+    # (FLUX.2-klein-{4B,9B}) and the non-distilled base (FLUX.2-klein-base-{4B,9B})
+    # variants carry "klein" in the name, so a single filter finds all four.
+    ("black-forest-labs", lambda name: "klein" in name.lower()),
 ]
 
 _BASE_MODEL_CACHE_KEY = "__base_model_repos__"
@@ -533,6 +537,11 @@ _BASE_MODEL_FALLBACK = [
     "Qwen/Qwen-Image-Layered",
     "Tongyi-MAI/Z-Image",
     "Tongyi-MAI/Z-Image-Turbo",
+    # Flux.2 Klein 4B/9B — "base" = non-distilled, no "base" = distilled
+    "black-forest-labs/FLUX.2-klein-4B",
+    "black-forest-labs/FLUX.2-klein-base-4B",
+    "black-forest-labs/FLUX.2-klein-9B",
+    "black-forest-labs/FLUX.2-klein-base-9B",
 ]
 _base_model_repos = []  # list of "org/repo" strings
 _base_model_lock = threading.Lock()
