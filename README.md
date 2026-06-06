@@ -2,6 +2,13 @@
   <img src="https://raw.githubusercontent.com/QuantFunc/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
 </div>
 
+<p align="center">
+  🤗 <a href="https://huggingface.co/QuantFunc">Hugging Face</a> &nbsp;|&nbsp;
+  🤖 <a href="https://www.modelscope.cn/profile/QuantFunc">ModelScope</a> &nbsp;|&nbsp;
+  💬 <a href="#wechat">WeChat (微信)</a> &nbsp;|&nbsp;
+  🎮 <a href="https://discord.gg/jCp9TpFWcn">Discord</a>
+</p>
+
 # ComfyUI-QuantFunc
 
 [中文说明](README_zh.md)
@@ -214,3 +221,20 @@ Import from `workflow_sample/`:
 ## 5. License
 
 See [QuantFunc Plugin License](https://www.modelscope.cn/models/QuantFunc/Plugin).
+
+## Star History
+
+<a href="https://star-history.com/#QuantFunc/ComfyUI-QuantFunc&Date">
+  <img src="https://api.star-history.com/svg?repos=QuantFunc/ComfyUI-QuantFunc&type=Date" alt="Star History Chart" width="600">
+</a>
+
+## Community
+
+Join our community for support, updates, and discussions:
+
+- 🎮 [Discord server](https://discord.gg/jCp9TpFWcn)
+- 💬 Scan the QR code below to join our WeChat group:
+
+<div align="center" id="wechat">
+  <img src="assets/WeChat.jpg" alt="WeChat Group" width="300">
+</div>
