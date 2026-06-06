@@ -719,13 +719,16 @@ class QuantFuncBuildPipeline:
                 f"NVFP4-disk on consumer GPUs, or proprietary INT4 packing).")
 
         # Free ComfyUI's pre-loaded torch tensors — they're dead weight, we
-        # reload from disk through QuantFunc.
+        # reload from disk through QuantFunc. Route through the plugin helper
+        # (which calls the ORIGINAL, un-hooked free_memory) so this self-cleanup
+        # of ComfyUI-native weights does NOT trip our free_memory hook into
+        # tearing down sibling QuantFunc pipelines — that self-inflicted
+        # blanket-destroy made two pipelines rebuild each other every run.
         try:
-            import comfy.model_management as mm
-            mm.unload_all_models()
-            mm.soft_empty_cache()
+            from .nodes import free_comfy_native_models
+            free_comfy_native_models()
         except Exception as e:
-            logger.debug("unload_all_models() failed: %s", e)
+            logger.debug("free_comfy_native_models() failed: %s", e)
 
         # Build the cfg dict consumed by QuantFuncGenerate. The Lighting
         # quality knobs below mirror what the proven base-model path sets

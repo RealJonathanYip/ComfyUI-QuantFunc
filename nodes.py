@@ -521,15 +521,208 @@ class WorkerManager:
         self._loaded_keys = set()          # keys currently alive in worker
         self._api_keys = {}                # cache_key -> api_key last set
         self._node_refs = {}               # generate_node_id -> cache_key (owner tracking)
-        # cache_key -> unload_mode policy. Read by ComfyUI's free_memory hook
-        # to decide how aggressively to respond to VRAM pressure from other
-        # plugins. keep_on_gpu: never release (refuse ComfyUI's free_memory);
-        # follow_comfy: offload GPU on normal requests, destroy on blanket
-        # requests (Free Model and Node Cache); clean_up_every_time is
-        # handled by the generate node itself (destroys right after gen).
-        self._unload_modes = {}            # cache_key -> "keep_on_gpu" | "follow_comfy" | "clean_up_every_time"
+        # cache_key -> unload_mode policy. Read by the ComfyUI free_memory hook
+        # to decide how to respond to VRAM pressure from other plugins. Only
+        # two values are ever stored (see QuantFuncGenerate, activate_unload
+        # bool -> string): "none" = refuse all release (stay pinned in RAM);
+        # "gpu+cpu" (default) = offload GPU on pressure, disk-page the RAM
+        # backup, destroy only as a terminal fallback.
+        self._unload_modes = {}            # cache_key -> "none" | "gpu+cpu"
         self._req_counter = 0
         self._lock = threading.Lock()
+        # LRU bookkeeping for graded eviction: cache_key -> monotonically
+        # increasing use sequence (higher = more recently used). Updated on
+        # every ensure_pipeline call (load or cache-hit). Oldest evicted first.
+        self._last_used = {}
+        self._use_seq = 0
+        # Upper bound on simultaneously-resident pipelines. A blanket
+        # free_memory no longer destroys pipelines (it offloads + disk-pages,
+        # fully reversible), so unbounded growth across many distinct models is
+        # bounded HERE instead: a newly-loaded pipeline that pushes the count
+        # over the cap evicts the least-recently-used UNREFERENCED pipeline.
+        # <=0 means unbounded. Env override QUANTFUNC_MAX_RESIDENT_PIPELINES.
+        try:
+            self._max_resident = int(os.environ.get(
+                "QUANTFUNC_MAX_RESIDENT_PIPELINES", "3"))
+        except (ValueError, TypeError):
+            self._max_resident = 3
+
+    # ── Graded eviction: measured, reversible-first (offload → disk-page →
+    #    destroy). See respond_to_free_memory for the policy. ──
+
+    def _touch_lru(self, cache_key):
+        """Mark cache_key most-recently-used. Plain dict/int ops under the GIL;
+        callers already hold self._lock where ordering matters."""
+        self._use_seq += 1
+        self._last_used[cache_key] = self._use_seq
+
+    def _lru_order(self, keys):
+        """Return `keys` sorted oldest-used first (eviction order). Keys never
+        touched sort oldest."""
+        return sorted(keys, key=lambda k: self._last_used.get(k, -1))
+
+    @staticmethod
+    def _free_vram_bytes(device):
+        """Free VRAM on `device` in bytes, or None if torch/CUDA unavailable.
+        Driver-level free is global per device across processes, so it reflects
+        the worker subprocess's frees too."""
+        try:
+            import torch
+            free_b, _total = torch.cuda.mem_get_info(device)
+            return int(free_b)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _host_ram_available_bytes():
+        """Available host RAM in bytes (Linux), tightened against a cgroup
+        memory cap (v2 memory.max/.current, v1 limit/usage) when present —
+        mirrors the engine's getAvailableMemoryBytes(). None if unknown."""
+        avail = None
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024  # kB -> bytes
+                        break
+        except Exception:
+            avail = None
+        for max_path, cur_path in (
+                ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory.current"),
+                ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                 "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+            try:
+                with open(max_path) as f:
+                    raw = f.read().strip()
+                if raw in ("max", ""):
+                    continue
+                limit = int(raw)
+                if limit <= 0 or limit >= (1 << 62):
+                    continue
+                with open(cur_path) as f:
+                    used = int(f.read().strip())
+                cg_avail = max(0, limit - used)
+                avail = cg_avail if avail is None else min(avail, cg_avail)
+            except Exception:
+                continue
+        return avail
+
+    def respond_to_free_memory(self, memory_required, device, blanket):
+        """Graded, MEASURED response to a GENUINE external free_memory request.
+
+        Two independent resource axes, cheapest-to-restore first:
+            rung 1  offload GPU -> CPU      (ms..s reload)  — the VRAM remedy
+            rung 2  release_backup -> disk  (~2-5s reload)  — the HOST-RAM remedy
+            rung 3  destroy                 (terminal; ~15-25s rebuild)
+        VRAM axis: a free_memory request is a VRAM request; rung 1 offload frees
+        the GPU and is the COMPLETE remedy (a finite request stops the moment
+        measured free VRAM satisfies it; a blanket offloads all). VRAM pressure
+        NEVER triggers destroy — destroying an already-offloaded pipeline frees
+        zero VRAM, so it would be pure friendly-fire that rebuilds coexisting
+        pipelines every run.
+        HOST-RAM axis: rung 2 disk-pages backups when RAM is low (or on a
+        blanket "free everything"). rung 3 destroy is the LAST resort, gated
+        SOLELY on genuine host-RAM exhaustion (still < _HOST_RAM_CRITICAL_BYTES
+        after disk-paging) — independent of whether the call was finite or
+        blanket. On a roomy box it never fires.
+        unload_mode "none" pipelines refuse all release (skipped entirely)."""
+        with self._lock:
+            if not self._loaded_keys:
+                return
+            order = self._lru_order(list(self._loaded_keys))
+            modes = dict(self._unload_modes)
+
+        def _eligible(k):
+            return modes.get(k, "gpu+cpu") != "none"
+
+        def _satisfied():
+            if blanket:
+                return False
+            free_b = self._free_vram_bytes(device)
+            return free_b is not None and free_b >= memory_required
+
+        # rung 1 — offload GPU -> CPU, LRU first. This is the COMPLETE remedy for
+        # a VRAM request: it returns the resident pipelines' GPU memory and is
+        # fully reversible (fast reload). Stop early once a finite VRAM request
+        # is measured-satisfied (a blanket request offloads everything).
+        for k in order:
+            if not _eligible(k):
+                continue
+            if _satisfied():
+                break
+            self.unload_pipeline(k, sync=True)
+
+        # rung 2 — disk-page the CPU backups (madvise) to reclaim PHYSICAL HOST
+        # RAM. This is the RAM-pressure remedy, NOT a VRAM one (it frees no
+        # VRAM). Fire on a blanket "free everything" request, or when host RAM
+        # is running low. release_backup is a no-op unless the pipeline was
+        # built with activate_unload (gpu+cpu).
+        ram_avail = self._host_ram_available_bytes()
+        ram_low = ram_avail is not None and ram_avail < _HOST_RAM_LOW_BYTES
+        if blanket or ram_low:
+            for k in order:
+                if not _eligible(k):
+                    continue
+                self.release_backup_pipeline(k)
+
+        # rung 3 — DESTROY is reserved for genuine HOST-RAM EXHAUSTION only (the
+        # "resources truly insufficient" case): host RAM STILL critically low
+        # AFTER disk-paging. A VRAM shortfall NEVER triggers destroy — offload
+        # (rung 1) already returned the GPU memory, and destroying an already-
+        # offloaded pipeline frees ZERO additional VRAM while forcing a costly
+        # rebuild next use. That VRAM-triggered destroy was the friendly-fire
+        # ("误伤") that rebuilt coexisting pipelines every run. Destroy LRU-first
+        # (most-recently-used = likely the active pipeline = destroyed last),
+        # only while RAM stays critical. Iterates the lock-captured `order`
+        # snapshot (destroy_pipeline guards a key already gone).
+        ram_avail = self._host_ram_available_bytes()
+        if ram_avail is not None and ram_avail < _HOST_RAM_CRITICAL_BYTES:
+            for k in order:
+                ram_now = self._host_ram_available_bytes()
+                if ram_now is None or ram_now >= _HOST_RAM_CRITICAL_BYTES:
+                    break
+                if not _eligible(k):
+                    continue
+                logging.warning(
+                    "[QuantFunc] host RAM critically low (%d MB) after disk-page "
+                    "— destroying LRU pipeline %s to reclaim its backup (genuine "
+                    "resource exhaustion, not a VRAM friendly-fire)",
+                    ram_now // 1024**2, k[:8])
+                self.destroy_pipeline(k)
+
+    def _enforce_resident_cap_locked(self, just_loaded_key):
+        """Destroy least-recently-used UNREFERENCED pipelines while the resident
+        count exceeds self._max_resident. MUST be called holding self._lock.
+        Never evicts the pipeline just loaded, one a live node still references,
+        or an unload_mode="none" (refuse-release) pipeline."""
+        if self._max_resident <= 0:
+            return
+        referenced = set(self._node_refs.values())
+        while len(self._loaded_keys) > self._max_resident:
+            victims = [k for k in self._lru_order(list(self._loaded_keys))
+                       if k != just_loaded_key
+                       and k not in referenced
+                       and self._unload_modes.get(k, "gpu+cpu") != "none"]
+            if not victims:
+                break  # everything resident is referenced/pinned — leave it
+            victim = victims[0]
+            try:
+                self._call({"cmd": "destroy", "req_id": self._next_req_id(),
+                            "cache_key": victim}, timeout=60)
+            except Exception as e:
+                # Worker may still hold it — keep our state truthful (don't drop
+                # the key) and stop spinning; a later load retries the evict.
+                logging.warning("[QuantFunc] cap-evict destroy(%s) failed: %s "
+                                "— leaving resident", victim[:8], e)
+                break
+            self._loaded_keys.discard(victim)
+            self._api_keys.pop(victim, None)
+            self._unload_modes.pop(victim, None)
+            self._last_used.pop(victim, None)
+            logging.info("[QuantFunc] Resident cap %d exceeded — destroyed "
+                         "LRU unreferenced pipeline %s",
+                         self._max_resident, victim[:8])
 
     # ── Worker lifecycle ──
 
@@ -683,6 +876,7 @@ class WorkerManager:
             self._loaded_keys.clear()
             self._api_keys.clear()
             self._unload_modes.clear()
+            self._last_used.clear()
             self._node_refs.clear()
 
         dll_path = _LIB_PATH
@@ -797,6 +991,7 @@ class WorkerManager:
             self._loaded_keys.clear()
             self._api_keys.clear()
             self._unload_modes.clear()
+            self._last_used.clear()
             self._node_refs.clear()
 
     # ── IPC ──
@@ -981,6 +1176,7 @@ class WorkerManager:
                         self._loaded_keys.discard(dropped_key)
                         self._api_keys.pop(dropped_key, None)
                         self._unload_modes.pop(dropped_key, None)
+                        self._last_used.pop(dropped_key, None)
 
             # Update node→key ownership and release orphaned pipelines
             if node_id is not None:
@@ -1000,11 +1196,13 @@ class WorkerManager:
                         self._loaded_keys.discard(old_key)
                         self._api_keys.pop(old_key, None)
                         self._unload_modes.pop(old_key, None)
+                        self._last_used.pop(old_key, None)
 
             if key in self._loaded_keys:
                 # Pipeline already loaded — check if API key changed
                 if new_api_key and new_api_key != self._api_keys.get(key, ""):
                     self._set_api_key_locked(key, new_api_key)
+                self._touch_lru(key)
                 return key
 
             if self._loaded_keys:
@@ -1036,6 +1234,8 @@ class WorkerManager:
             self._call(create_cmd, timeout=1800)
             self._loaded_keys.add(key)
             self._api_keys[key] = new_api_key
+            self._touch_lru(key)
+            self._enforce_resident_cap_locked(just_loaded_key=key)
             logging.info("[QuantFunc] Pipeline ready (%d loaded).", len(self._loaded_keys))
             return key
 
@@ -1142,6 +1342,7 @@ class WorkerManager:
                 self._loaded_keys.clear()
                 self._api_keys.clear()
                 self._unload_modes.clear()
+                self._last_used.clear()
 
             opts = dict(cfg.get("options", {}))
             sched = cfg.get("scheduler", "")
@@ -1211,6 +1412,7 @@ class WorkerManager:
                 self._loaded_keys.clear()
                 self._api_keys.clear()
                 self._unload_modes.clear()
+                self._last_used.clear()
 
     def release_backup_pipeline(self, cache_key):
         """Release physical RAM pages of the mmap-backed CPU offload_backup
@@ -1257,6 +1459,7 @@ class WorkerManager:
                 self._loaded_keys.discard(cache_key)
                 self._api_keys.pop(cache_key, None)
                 self._unload_modes.pop(cache_key, None)
+                self._last_used.pop(cache_key, None)
                 logging.info("[QuantFunc] Pipeline %s destroyed — GPU + RAM released",
                              cache_key[:8] if cache_key else "None")
             except Exception as e:
@@ -1280,6 +1483,7 @@ class WorkerManager:
             self._loaded_keys.clear()
             self._api_keys.clear()
             self._unload_modes.clear()
+            self._last_used.clear()
 
     def _read_image(self, resp):
         """Read image data from worker response.
@@ -1332,6 +1536,40 @@ atexit.register(_manager.shutdown)
 # Hook into ComfyUI model management — auto-unload when other nodes need VRAM
 # ============================================================================
 
+# Below this much available host RAM, proactively disk-page (madvise) idle
+# pipeline backups so QuantFunc doesn't push the box toward the OOM-killer.
+# Env override QUANTFUNC_HOST_RAM_LOW_BYTES.
+try:
+    _HOST_RAM_LOW_BYTES = int(os.environ.get(
+        "QUANTFUNC_HOST_RAM_LOW_BYTES", str(4 * 1024 ** 3)))
+except (ValueError, TypeError):
+    _HOST_RAM_LOW_BYTES = 4 * 1024 ** 3
+
+# Host RAM below this (after disk-paging) is genuine exhaustion: only THEN may a
+# pipeline be destroyed (last resort) — never to satisfy a VRAM request. Env
+# override QUANTFUNC_HOST_RAM_CRITICAL_BYTES.
+try:
+    _HOST_RAM_CRITICAL_BYTES = int(os.environ.get(
+        "QUANTFUNC_HOST_RAM_CRITICAL_BYTES", str(1536 * 1024 ** 2)))
+except (ValueError, TypeError):
+    _HOST_RAM_CRITICAL_BYTES = 1536 * 1024 ** 2
+
+# Ladder invariant: the reversible disk-page rung (LOW) must trigger BEFORE the
+# destructive rung (CRITICAL). A misconfigured CRITICAL > LOW would let destroy
+# fire at a RAM level where disk-paging hasn't even run yet — clamp to preserve
+# reversible-first ordering.
+if _HOST_RAM_CRITICAL_BYTES > _HOST_RAM_LOW_BYTES:
+    logging.warning("[QuantFunc] QUANTFUNC_HOST_RAM_CRITICAL_BYTES (%d) > "
+                    "_HOST_RAM_LOW_BYTES (%d); clamping CRITICAL to LOW to keep "
+                    "disk-page-before-destroy ordering",
+                    _HOST_RAM_CRITICAL_BYTES, _HOST_RAM_LOW_BYTES)
+    _HOST_RAM_CRITICAL_BYTES = _HOST_RAM_LOW_BYTES
+
+# Captured original (pre-patch) comfy.model_management.free_memory; set inside
+# the try below, stays None if comfy is unavailable. free_comfy_native_models()
+# calls THIS so the plugin's own VRAM cleanup never trips the QF hook.
+_original_free_memory = None
+
 try:
     import comfy.model_management as _mm
 
@@ -1343,73 +1581,56 @@ try:
     _UNREALISTIC_VRAM_REQUEST = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB
 
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
-        # Per-pipeline dispatch based on its configured unload_mode:
-        #   none                — refuse to release under any request
-        #   gpu                 — per-gen already offloaded; on blanket →
-        #                         destroy; on normal → unload (no-op if done)
-        #   gpu+cpu             — stay loaded after gen; on normal pressure →
-        #                         offload GPU + madvise disk backup (return
-        #                         ~10 GB RAM to OS); on blanket → destroy
-        #   clean_up_every_time — per-gen already released; blanket → destroy
+        # A QuantFunc pipeline is torn down only as much as the MEASURED
+        # resource situation demands, cheapest-to-restore rung first
+        # (offload GPU->CPU -> disk-page RAM -> destroy), and ONLY for a genuine
+        # EXTERNAL request. The plugin's own pre-load cleanup of ComfyUI-native
+        # torch weights goes through free_comfy_native_models() (the un-hooked
+        # original free_memory), so it never reaches here -- that self-inflicted
+        # blanket-destroy was why two pipelines rebuilt each other every run.
         if _manager._loaded_keys and memory_required > 0:
             blanket = memory_required >= _UNREALISTIC_VRAM_REQUEST
-
-            if not blanket:
-                # Check if we actually need to do anything (enough free VRAM?)
-                try:
-                    import torch
-                    free_vram, _ = torch.cuda.mem_get_info(device)
-                except Exception:
-                    free_vram = 0
-                need_release = free_vram < memory_required
-            else:
-                need_release = True
-
-            if need_release:
-                # Snapshot under lock so we iterate a stable set
-                with _manager._lock:
-                    keys = list(_manager._loaded_keys)
-                    modes = dict(_manager._unload_modes)
-                for k in keys:
-                    mode = modes.get(k, "gpu+cpu")  # safe default
-                    if mode == "none":
-                        logging.debug(
-                            "[QuantFunc] Pipeline %s is unload_mode=none — refusing free_memory request",
-                            k[:8])
-                        continue
-                    # Third-party caller is about to allocate VRAM (or
-                    # clicked Free Model) — every branch below uses sync
-                    # paths so the caller doesn't race with our offload.
-                    if blanket:
-                        logging.info(
-                            "[QuantFunc] Blanket free_memory — destroying pipeline %s (mode=%s)",
-                            k[:8], mode)
-                        _manager.destroy_pipeline(k)
-                    elif mode == "gpu+cpu":
-                        # Full disk-backed release: sync unload (VRAM truly
-                        # freed before returning) + async release_backup
-                        # (madvise on disk file — doesn't block caller).
-                        logging.info(
-                            "[QuantFunc] VRAM pressure (gpu+cpu) — sync offload + async release "
-                            "for pipeline %s (need %d MB, free %d MB)",
-                            k[:8], memory_required // 1024**2, free_vram // 1024**2)
-                        _manager.unload_pipeline(k, sync=True)
-                        _manager.release_backup_pipeline(k)
-                    else:
-                        # gpu / clean_up_every_time: sync offload so VRAM is
-                        # actually freed for the caller. clean_up_every_time
-                        # may already have released, but sync unload is
-                        # idempotent (no-op if nothing on GPU).
-                        logging.info(
-                            "[QuantFunc] VRAM pressure (mode=%s) — sync offload pipeline %s "
-                            "(need %d MB, free %d MB)",
-                            mode, k[:8], memory_required // 1024**2, free_vram // 1024**2)
-                        _manager.unload_pipeline(k, sync=True)
+            try:
+                _manager.respond_to_free_memory(memory_required, device, blanket)
+            except Exception as e:
+                logging.warning(
+                    "[QuantFunc] respond_to_free_memory failed: %s", e)
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
+    logging.info("[QuantFunc] free_memory hook installed — graded eviction "
+                 "(offload->disk-page->destroy), self-cleanup bypasses hook "
+                 "[pipeline-coexist build]")
 except Exception:
     pass
+
+
+def free_comfy_native_models():
+    """Free ONLY ComfyUI's own native torch models (dead weight before a QF
+    worker load) WITHOUT tripping the QuantFunc free_memory hook.
+
+    The plugin used to call comfy's unload_all_models() directly, but that
+    routes through our patched free_memory as a "blanket" (1e30) request, which
+    the hook interpreted as "destroy every QuantFunc pipeline" -- so running a
+    second pipeline destroyed the first (and vice-versa), forcing a full
+    rebuild every run even with activate_unload on. We instead call the
+    captured ORIGINAL free_memory, which clears comfy-native torch weights only;
+    sibling QuantFunc pipelines are left to ensure_pipeline's offload-and-
+    coexist (and the hook acts only on GENUINE external VRAM pressure).
+    """
+    try:
+        import comfy.model_management as mm
+        # Call the captured ORIGINAL (pre-patch) free_memory so this clears
+        # comfy-native torch weights WITHOUT routing through our hook (which
+        # would offload QuantFunc pipelines). _original_free_memory is assigned
+        # immediately after `import comfy.model_management` succeeds at module
+        # load, so it is None only when comfy was un-importable — in which case
+        # the `import` just above also raises and the except swallows it. The
+        # `or mm.free_memory` fallback is therefore unreachable belt-and-braces.
+        (_original_free_memory or mm.free_memory)(1e30, mm.get_torch_device())
+        mm.soft_empty_cache()
+    except Exception as e:
+        logging.debug("[QuantFunc] free_comfy_native_models failed: %s", e)
 
 
 # ============================================================================
