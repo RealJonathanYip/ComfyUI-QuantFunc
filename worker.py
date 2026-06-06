@@ -477,7 +477,7 @@ def handle_image_to_image(msg):
     i2i.height = msg.get("height", 1024)
     i2i.width = msg.get("width", 1024)
     i2i.num_steps = msg.get("num_steps", 4)
-    i2i.true_cfg_scale = msg.get("true_cfg_scale", 4.0)
+    i2i.true_cfg_scale = msg.get("true_cfg_scale", 1.0)
     neg = msg.get("negative_prompt")
     i2i.negative_prompt = neg.encode() if neg else None
     i2i.seed = msg.get("seed", 0)

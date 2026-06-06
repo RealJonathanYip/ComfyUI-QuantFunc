@@ -1,7 +1,8 @@
 """Model auto-download and resource cache for QuantFuncModelAutoLoader node.
 
 Handles:
-- GPU variant detection (50x-below / 50x-above based on SM version)
+- GPU variant detection per series: Z-Image/Qwen → 50x-below / 50x-above;
+  Klein-4B/9B → 30x-below / 50x base-model (3-tier 50x/40x/30x-below transformers)
 - Base model download from HuggingFace or ModelScope
 - Resource listing (transformer, prequant, precision-config) cached from ModelScope
 - Data source selection controls download only; listing always from ModelScope
@@ -45,8 +46,8 @@ _BASE_MODEL_PATTERN = {
 _SERIES_WITH_PREQUANT = {
     "QuantFunc/Qwen-Image-Edit-Series",
     "QuantFunc/Qwen-Image-Series",
-    "QuantFunc/Klein-4B-Series",
-    "QuantFunc/Klein-9B-Series",
+    # Klein-4B/9B ship no separate prequant/ dir (the transformer weights are
+    # already prequantized in transformer/), so they are intentionally absent.
 }
 
 _SUBDIR_PREQUANT = "prequant"
@@ -74,16 +75,29 @@ def get_models_dir():
     return os.path.join(comfyui_dir, "models", "QuantFunc")
 
 
-def detect_gpu_variant():
-    """Return '50x-above' for SM120+ GPUs (RTX 50 series), '50x-below' otherwise."""
+_KLEIN_SERIES = {"QuantFunc/Klein-4B-Series", "QuantFunc/Klein-9B-Series"}
+
+
+def detect_gpu_variant(series=None):
+    """Return the base-model variant for the detected GPU.
+
+    Klein-4B/9B-Series use a 3-tier scheme but only TWO base-models (the 40x
+    transformer shares the 30x-below INT4 base-model):
+      - '50x'        : Blackwell (SM120+) — FP4 text-encoder base-model
+      - '30x-below'  : everything else (SM<120, incl. RTX 40 / Ada) — INT4 text-encoder base-model
+    Z-Image / Qwen series keep the original 2-variant naming:
+      - '50x-above'  : SM120+
+      - '50x-below'  : otherwise
+    """
+    sm = 0
     try:
         from .lib_setup import _detect_gpu_sm
         sm = _detect_gpu_sm()
-        if sm >= 120:
-            return "50x-above"
     except Exception:
-        pass
-    return "50x-below"
+        sm = 0
+    if series in _KLEIN_SERIES:
+        return "50x" if sm >= 120 else "30x-below"
+    return "50x-above" if sm >= 120 else "50x-below"
 
 
 # ============================================================================

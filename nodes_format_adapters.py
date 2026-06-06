@@ -350,10 +350,11 @@ class QuantFuncPickCheckpoint:
 # Build Pipeline
 # ============================================================================
 
-# Map an arch fingerprint to its ModelScope precision-config series. Each
-# series ships precision-config/{50x-above-fp4,50x-below-int4}-sample.json whose
-# keys match THAT arch's real (engine-internal) layer structure, so downloading
-# the matching series' config is correct regardless of the source weight layout.
+# Map an arch fingerprint to its ModelScope precision-config series. Each series
+# ships per-layer precision configs (Z-Image/Qwen: 50x-above-fp4 / 50x-below-int4;
+# Klein: 50x-fp4-f8 / 40x-int4-f8 / 30x-below-int4-i8) whose keys match THAT arch's
+# real (engine-internal) layer structure, so downloading the matching series' config
+# is correct regardless of the source weight layout.
 _ARCH_TO_SERIES = {
     "QwenImage":     "QuantFunc/Qwen-Image-Series",
     "QwenImageEdit": "QuantFunc/Qwen-Image-Edit-Series",
@@ -454,8 +455,17 @@ def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
     try:
         from .model_auto_loader import download_precision_config
         sm = _device_sm(device_idx)
-        fname = ("50x-above-fp4-sample.json" if sm >= 120      # native NVFP4
-                 else "50x-below-int4-sample.json")             # INT4 (RTX 20/30/40)
+        if series in ("QuantFunc/Klein-4B-Series", "QuantFunc/Klein-9B-Series"):
+            # Klein 3-tier (FP4 needs Blackwell SM120; FP8 needs SM89+; else INT8):
+            if sm >= 120:
+                fname = "50x-fp4-f8-sample.json"        # Blackwell: FP4 + FP8 islands
+            elif sm >= 89:
+                fname = "40x-int4-f8-sample.json"       # Ada/Hopper FP8: INT4 + FP8 islands
+            else:
+                fname = "30x-below-int4-i8-sample.json"  # no FP8: INT4 + INT8 islands
+        else:
+            fname = ("50x-above-fp4-sample.json" if sm >= 120  # native NVFP4
+                     else "50x-below-int4-sample.json")         # INT4 (RTX 20/30/40)
         local = download_precision_config(series, fname, data_source)
         logger.info("[BuildPipeline] full-precision %s (kind=%s) + [auto-derive]: "
                      "device %d (SM%d) -> %s / %s",

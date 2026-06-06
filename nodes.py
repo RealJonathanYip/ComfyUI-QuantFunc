@@ -1081,7 +1081,7 @@ class WorkerManager:
             return self._read_image(resp)
 
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
-                       true_cfg_scale=4.0, negative_prompt="",
+                       true_cfg_scale=1.0, negative_prompt="",
                        options_json=None, pbar=None,
                        mask_path=None, mask_strength=1.0, mask_grow=6,
                        mask_blur=0.0, mask_no_snap=False):
@@ -1654,7 +1654,7 @@ class QuantFuncModelAutoLoader:
         )
 
         # ── GPU variant & base model ──
-        gpu_variant = detect_gpu_variant()
+        gpu_variant = detect_gpu_variant(model_series)
         model_dir = download_base_model(model_series, gpu_variant, data_source)
 
         # ── Transformer (download if selected, otherwise use base model's) ──
@@ -1780,7 +1780,7 @@ class QuantFuncBaseSeriesModelAutoLoader:
 
     def load_base_model(self, model_series, data_source):
         from .model_auto_loader import detect_gpu_variant, download_base_model
-        gpu_variant = detect_gpu_variant()
+        gpu_variant = detect_gpu_variant(model_series)
         model_dir = download_base_model(model_series, gpu_variant, data_source)
         return (model_dir,)
 
@@ -2108,7 +2108,7 @@ class QuantFuncGenerate:
             "optional": {
                 "ref_images": ("QUANTFUNC_IMAGE_LIST", {"tooltip": "Reference images for edit mode (from ImageList node)"}),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "true_cfg_scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 30.0, "step": 0.1}),
+                "true_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0, "step": 0.1, "tooltip": "Classical CFG (needs a negative prompt). 1.0 = OFF (default) — correct for distilled / few-step models. Raise (e.g. 4.0) only for base / non-distilled models."}),
                 "sampler_name": (["euler", "heun", "dpm++2m", "dpm++2m_sde", "euler_a", "ddim"], {
                     "default": "euler",
                     "tooltip": "Sampling algorithm:\n"
@@ -2154,7 +2154,7 @@ class QuantFuncGenerate:
 
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
-                 negative_prompt="", true_cfg_scale=4.0,
+                 negative_prompt="", true_cfg_scale=1.0,
                  sampler_name="euler", sampler_eta=0.0,
                  activate_unload=False, unload_mode=None, unload_every_time=None,
                  unique_id=None, workflow_prompt=None):
