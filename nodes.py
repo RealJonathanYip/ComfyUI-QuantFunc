@@ -2088,6 +2088,35 @@ class QuantFuncLoRAConfig:
 # Node: QuantFunc Generate
 # ============================================================================
 
+def _reinhard_color_match(target_hwc, reference_hwc, strength):
+    """Plugin-side Reinhard color transfer in Lab space — mirrors the engine's
+    apply_reinhard_color_match (src/ImageUtils.cpp). Matches `target`'s per-channel
+    Lab mean/std to `reference`, then blends by `strength`. Done in Python (no C++
+    change): the engine has the same algorithm but no i2i-options wiring for it.
+    target_hwc / reference_hwc: float32 H×W×C RGB in [0,1]. Returns float32 HWC."""
+    if strength <= 0.0:
+        return target_hwc
+    try:
+        import cv2
+    except Exception:
+        logging.warning("[QuantFunc] color_match needs opencv-python; skipping")
+        return target_hwc
+    tgt = np.clip(target_hwc, 0.0, 1.0).astype(np.float32)
+    ref = np.clip(reference_hwc, 0.0, 1.0).astype(np.float32)
+    tgt_lab = cv2.cvtColor(tgt, cv2.COLOR_RGB2Lab)
+    ref_lab = cv2.cvtColor(ref, cv2.COLOR_RGB2Lab)
+    matched = tgt_lab.copy()
+    for c in range(3):
+        t_mean = float(tgt_lab[..., c].mean()); t_std = float(tgt_lab[..., c].std())
+        r_mean = float(ref_lab[..., c].mean()); r_std = float(ref_lab[..., c].std())
+        scale = (r_std / t_std) if t_std > 1e-6 else 1.0
+        matched[..., c] = (tgt_lab[..., c] - t_mean) * scale + r_mean
+    matched_rgb = cv2.cvtColor(matched, cv2.COLOR_Lab2RGB)
+    if strength < 1.0:
+        matched_rgb = tgt + strength * (matched_rgb - tgt)
+    return np.clip(matched_rgb, 0.0, 1.0).astype(np.float32)
+
+
 class QuantFuncGenerate:
     """Generate an image. Creates/reuses a cached pipeline from the config.
     Edit mode is auto-detected when ref_image is connected.
@@ -2191,6 +2220,8 @@ class QuantFuncGenerate:
         inpaint_grow = 6
         inpaint_blur = 0.0
         inpaint_no_snap = False
+        edit_strength = 0.0
+        color_match = 0.0
         if ref_images is not None and isinstance(ref_images, dict):
             # New: ref_img_resize ("720" / "1024" / "origin")
             # Backwards compat: old workflows may still send keep_ref_img_size (bool)
@@ -2205,6 +2236,8 @@ class QuantFuncGenerate:
             inpaint_grow = ref_images.get("mask_grow", 6)
             inpaint_blur = ref_images.get("mask_blur", 0.0)
             inpaint_no_snap = ref_images.get("mask_no_snap", False)
+            edit_strength = float(ref_images.get("edit_strength", 0.0))
+            color_match = float(ref_images.get("color_match", 0.0))
             ref_images = ref_images["images"]
         # edit_mode controls which Pipeline class the C++ engine instantiates:
         #   - QwenImage / QwenImageEdit are SEPARATE classes; QwenImageEditPipeline
@@ -2298,6 +2331,9 @@ class QuantFuncGenerate:
                     i2i_opts["ref_img_resize"] = resize_arr
                 else:
                     i2i_opts["ref_img_resize"] = ref_img_resize
+                # edit_strength → engine img2img strength (natively wired).
+                if edit_strength > 0.0:
+                    i2i_opts["edit_strength"] = edit_strength
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
 
                 # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
@@ -2330,6 +2366,16 @@ class QuantFuncGenerate:
                     mask_grow=inpaint_grow,
                     mask_blur=inpaint_blur,
                     mask_no_snap=inpaint_no_snap)
+                # color_match (潜在色彩匹配): plugin-side Reinhard post-decode against
+                # the main reference image. Engine has the same algorithm but no
+                # i2i-options wiring, so we do it here — no C++ change. Edit-mode only.
+                if color_match > 0.0 and ref_images:
+                    try:
+                        ref0 = ref_images[0]
+                        ref_np = (ref0[0] if ref0.dim() == 4 else ref0).detach().cpu().numpy()
+                        arr = _reinhard_color_match(arr, ref_np, color_match)
+                    except Exception as _cm_e:
+                        logging.warning("[QuantFunc] color_match skipped: %s", _cm_e)
             else:
                 t2i_opts = {}
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
@@ -2427,6 +2473,23 @@ class QuantFuncImageList:
             "tooltip": "可选:用 QuantFunc Mask Config 节点配置遮罩高级参数"
                        "(strength / grow / blur / no_snap)。不连接 = 全用默认值。",
         })
+        # edit_strength = edit 模式 img2img 强度(引擎原生支持)
+        optional["edit_strength"] = ("FLOAT", {
+            "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "edit 模式 img2img 强度 (0~1,默认 0):\n"
+                       "  0   — 标准 edit(纯按参考图重绘)\n"
+                       "  >0  — 把主图当 img2img 起点,保留更多原图结构、降低色偏\n"
+                       "        (值越大越接近原图)",
+        })
+        # color_match = 潜在色彩匹配(插件侧 Reinhard 后处理,镜像引擎算法)
+        optional["color_match"] = ("FLOAT", {
+            "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "潜在色彩匹配强度 (0~1,默认 0):解码后把输出色彩分布匹配到"
+                       "主参考图(Reinhard,Lab 空间):\n"
+                       "  0.0     — 不校正(最锐利,可能色偏)\n"
+                       "  0.3~0.5 — 平衡(推荐)\n"
+                       "  1.0     — 完全匹配(色彩最忠实,细节略软)",
+        })
         return {
             "required": {
                 # main_image = 主图
@@ -2454,6 +2517,8 @@ class QuantFuncImageList:
             "images": images,
             "ref_img_resize": main_image_resize,
             "ref_img_resize_others": ref_image_resize_others,
+            "edit_strength": float(kwargs.get("edit_strength", 0.0)),
+            "color_match": float(kwargs.get("color_match", 0.0)),
         }
         if main_image_mask is not None:
             # Auto-align mask to main_image's pixel dims. Lets users wire any
