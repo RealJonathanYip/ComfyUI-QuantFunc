@@ -222,12 +222,6 @@ Import from `workflow_sample/`:
 
 See [QuantFunc Plugin License](https://www.modelscope.cn/models/QuantFunc/Plugin).
 
-## Star History
-
-<a href="https://star-history.com/#QuantFunc/ComfyUI-QuantFunc&Date">
-  <img src="https://api.star-history.com/svg?repos=QuantFunc/ComfyUI-QuantFunc&type=Date" alt="Star History Chart" width="600">
-</a>
-
 ## Community
 
 Join our community for support, updates, and discussions:
@@ -238,3 +232,9 @@ Join our community for support, updates, and discussions:
 <div align="center" id="wechat">
   <img src="assets/WeChat.jpg" alt="WeChat Group" width="300">
 </div>
+
+## Star History
+
+<a href="https://star-history.com/#QuantFunc/ComfyUI-QuantFunc&Date">
+  <img src="https://api.star-history.com/svg?repos=QuantFunc/ComfyUI-QuantFunc&type=Date" alt="Star History Chart" width="600">
+</a>
