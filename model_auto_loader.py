@@ -1,8 +1,10 @@
 """Model auto-download and resource cache for QuantFuncModelAutoLoader node.
 
 Handles:
-- GPU variant detection per series: Z-Image/Qwen → 50x-below / 50x-above;
-  Klein-4B/9B → 30x-below / 50x base-model (3-tier 50x/40x/30x-below transformers)
+- GPU variant detection: all series → 50x-below (SM<120, INT4 text-encoder) /
+  50x-above (SM120+, FP4 text-encoder) base-model. Klein-4B/9B additionally
+  ship 3-tier transformers + precision-configs (50x/40x/30x-below) that are
+  selected per-file, independently of which base-model is downloaded.
 - Base model download from HuggingFace or ModelScope
 - Resource listing (transformer, prequant, precision-config) cached from ModelScope
 - Data source selection controls download only; listing always from ModelScope
@@ -75,19 +77,18 @@ def get_models_dir():
     return os.path.join(comfyui_dir, "models", "QuantFunc")
 
 
-_KLEIN_SERIES = {"QuantFunc/Klein-4B-Series", "QuantFunc/Klein-9B-Series"}
-
-
 def detect_gpu_variant(series=None):
     """Return the base-model variant for the detected GPU.
 
-    Klein-4B/9B-Series use a 3-tier scheme but only TWO base-models (the 40x
-    transformer shares the 30x-below INT4 base-model):
-      - '50x'        : Blackwell (SM120+) — FP4 text-encoder base-model
-      - '30x-below'  : everything else (SM<120, incl. RTX 40 / Ada) — INT4 text-encoder base-model
-    Z-Image / Qwen series keep the original 2-variant naming:
-      - '50x-above'  : SM120+
-      - '50x-below'  : otherwise
+    Every series publishes exactly two base-models, picked by GPU tier:
+      - '50x-above' : Blackwell (SM120+, e.g. RTX 50xx) — FP4 text-encoder base
+      - '50x-below' : everything else (SM<120, incl. RTX 40 / Ada) — INT4 base
+
+    `series` is accepted for call-site compatibility but no longer changes the
+    name. The published Klein-4B/9B repos use the same 50x-above/50x-below
+    layout as Qwen / Z-Image — there is NO 30x-below/50x base directory. The
+    transformer tiers (30x/40x/50x) are a separate per-file choice and do not
+    affect which base-model directory is downloaded.
     """
     sm = 0
     try:
@@ -95,8 +96,6 @@ def detect_gpu_variant(series=None):
         sm = _detect_gpu_sm()
     except Exception:
         sm = 0
-    if series in _KLEIN_SERIES:
-        return "50x" if sm >= 120 else "30x-below"
     return "50x-above" if sm >= 120 else "50x-below"
 
 
