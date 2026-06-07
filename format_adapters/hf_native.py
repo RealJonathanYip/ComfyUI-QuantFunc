@@ -102,6 +102,16 @@ class HFLayoutAdapter(FormatAdapter):
         if existing is not None:
             arch = fingerprint_arch_from_keys(ref.path) or ref.arch
             logger.info("[%s] using existing model_dir %s", method_hint, existing)
+            # The model_dir is used as-is. A well-formed HF / QuantFunc export
+            # ships its own tokenizer/, but some exports omit it — then the
+            # engine fails at load with "Failed to open vocab.json". Backfill
+            # from the plugin bundle (idempotent: skipped when one is present)
+            # so an existing model_dir is always loadable.
+            from .tools.hf_layout import copy_tokenizer as _copy_tokenizer
+            _ex_tok = Path(existing) / "tokenizer"
+            if not ((_ex_tok / "tokenizer.json").is_file()
+                    or (_ex_tok / "vocab.json").is_file()):
+                _copy_tokenizer(arch, _ex_tok, [])
             return StagingResult(
                 model_dir=str(existing),
                 arch=arch,
@@ -113,7 +123,7 @@ class HFLayoutAdapter(FormatAdapter):
         # (e.g. user dropped it into ComfyUI's models/diffusion_models).
         # Build a minimal staging dir referencing it.
         from .tools.hf_layout import (
-            HFLayout, copy_tokenizer_bundle, bundled_transformer_config,
+            HFLayout, copy_tokenizer, bundled_transformer_config,
             bundled_te_config, bundled_vae_config,
         )
         arch = fingerprint_arch_from_keys(ref.path) or ref.arch or "QwenImage"
@@ -243,7 +253,20 @@ class HFLayoutAdapter(FormatAdapter):
             for k, v in ve_extra_cfg.items():
                 ve_h.setdefault(k, v)
             layout._hints["vision_encoder"] = ve_h
-        copy_tokenizer_bundle(arch, layout.tokenizer_dir())
+        # Tokenizer: prefer the one shipped inside the source model_dir (HF
+        # base-model downloads — incl. the QuantFunc auto-loader's base model —
+        # include a full tokenizer/), so we don't depend on a per-arch tokenizer
+        # being bundled in the plugin. Fall back to the bundle otherwise.
+        _tok_dirs: list[str] = []
+        for _p in (getattr(sources.text_encoder, "path", None),
+                    getattr(sources.transformer, "path", None),
+                    getattr(sources.vae, "path", None),
+                    getattr(sources.checkpoint, "path", None)):
+            if _p:
+                _ap = _os.path.abspath(_p)
+                _tok_dirs.append(_os.path.dirname(_os.path.dirname(_ap)))
+                _tok_dirs.append(_os.path.dirname(_ap))
+        copy_tokenizer(arch, layout.tokenizer_dir(), _tok_dirs)
         layout.add_scheduler(sources.scheduler_config, arch=arch)
         layout.set_method(method_hint)
         # Plain HF model dirs have no per-component precision metadata —

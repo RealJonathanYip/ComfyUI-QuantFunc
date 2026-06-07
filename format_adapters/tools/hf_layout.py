@@ -315,6 +315,35 @@ def copy_tokenizer_bundle(arch: str, dst: Path) -> None:
                   arch, sum(1 for _ in src.iterdir()))
 
 
+def copy_tokenizer(arch: str, dst: Path, candidate_model_dirs=()) -> None:
+    """Populate the staging tokenizer/ dir.
+
+    Prefer a real ``tokenizer/`` already present in a source model_dir: HF base
+    model downloads (e.g. the QuantFunc auto-loader's base model) ship a full
+    tokenizer, so we should use that instead of depending on a per-arch
+    tokenizer being bundled inside the plugin. Only when no source model_dir
+    carries one do we fall back to <plugin>/bin/tokenizers/<arch>/.
+
+    `candidate_model_dirs` is tried in order; the first dir with a
+    `tokenizer/tokenizer.json` or `tokenizer/vocab.json` wins.
+    """
+    for md in candidate_model_dirs:
+        if not md:
+            continue
+        cand = Path(md) / "tokenizer"
+        if (cand / "tokenizer.json").is_file() or (cand / "vocab.json").is_file():
+            dst.mkdir(parents=True, exist_ok=True)
+            n = 0
+            for f in cand.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, dst / f.name)
+                    n += 1
+            logger.info("[staging] tokenizer from model_dir %s (%d files)",
+                         cand, n)
+            return
+    copy_tokenizer_bundle(arch, dst)
+
+
 def bundled_transformer_config(arch: str) -> Optional[dict]:
     """Return bundled transformer config (architecture dims) for `arch`, or None.
 

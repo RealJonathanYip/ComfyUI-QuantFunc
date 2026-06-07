@@ -75,6 +75,13 @@ def adapter(priority: int = 50):
     return deco
 
 
+# Bump when the staging LAYOUT/contents change in a way that makes previously
+# cached staging dirs (those carrying a `.staging_complete` marker) wrong, so
+# they are NOT reused. v2: tokenizer is now sourced from the model_dir rather
+# than only the plugin bundle — older staging dirs may have an empty tokenizer/.
+_STAGING_FORMAT_VERSION = 2
+
+
 def _stable_staging_id(sources: SourceBundle, context: BuildContext) -> str:
     """Hash (source files + relevant context) into a stable dir suffix.
 
@@ -107,6 +114,7 @@ def _stable_staging_id(sources: SourceBundle, context: BuildContext) -> str:
             return {"path": ref.path, "size": 0, "mtime": 0}
 
     payload = {
+        "v": _STAGING_FORMAT_VERSION,
         "transformer":  _stamp(getattr(sources, "transformer", None)),
         "text_encoder": _stamp(getattr(sources, "text_encoder", None)),
         "vae":          _stamp(getattr(sources, "vae", None)),
