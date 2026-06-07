@@ -28,6 +28,8 @@ import struct
 from pathlib import Path
 from typing import Optional
 
+from .tools.fs_util import link_or_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -288,7 +290,7 @@ def stage_bfl_zimage(src_path: str, staging_transformer_dir: Path,
         dst.unlink()
     if not (dst.exists() or dst.is_symlink()):
         staging_transformer_dir.mkdir(parents=True, exist_ok=True)
-        os.symlink(str(src), str(dst))
+        link_or_copy(src, dst)
 
     if manifest_path.exists() and not force:
         return dst
@@ -334,7 +336,7 @@ def stage_bfl_vae(src_path: str, staging_vae_dir: Path,
         dst.unlink()
     if not (dst.exists() or dst.is_symlink()):
         staging_vae_dir.mkdir(parents=True, exist_ok=True)
-        os.symlink(str(src), str(dst))
+        link_or_copy(src, dst)
 
     if manifest_path.exists() and not force:
         return dst

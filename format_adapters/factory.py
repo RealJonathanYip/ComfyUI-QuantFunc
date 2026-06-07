@@ -131,6 +131,41 @@ def _stable_staging_id(sources: SourceBundle, context: BuildContext) -> str:
     return h.hexdigest()[:16]
 
 
+def _choose_staging_root(sources: SourceBundle) -> str:
+    """Pick where to build the staging tree.
+
+    Priority:
+      1. $QUANTFUNC_CACHE_DIR — explicit user override.
+      2. On Windows, a folder on the SAME volume as the primary weight file, so
+         the staging tree can be HARDLINKED into place. Windows hardlinks need
+         no privilege (unlike symlinks, which raise WinError 1314 without
+         Developer Mode / admin) and cost zero extra disk. Staging onto a
+         different volume than the model (e.g. model on D:, system temp on C:)
+         is exactly what forced symlinks and broke non-privileged users.
+      3. System temp dir — the Linux default, where symlinks are unprivileged
+         and work across filesystems.
+    """
+    env = os.environ.get("QUANTFUNC_CACHE_DIR")
+    if env:
+        return env
+    ref = (sources.transformer or sources.checkpoint
+           or sources.text_encoder or sources.vae)
+    if ref is not None:
+        try:
+            drive = os.path.splitdrive(os.path.abspath(ref.path))[0]
+        except Exception:
+            drive = ""
+        if drive:  # Windows-style drive letter (e.g. "D:") — stay on it.
+            cand = os.path.join(drive + os.sep, "quantfunc_staging")
+            try:
+                os.makedirs(cand, exist_ok=True)
+                return cand
+            except OSError as e:
+                logger.warning("[staging] cannot use %s (%s); falling back to "
+                               "system temp", cand, e)
+    return tempfile.gettempdir()
+
+
 def build_pipeline_inputs(
     sources: SourceBundle,
     context: BuildContext,
@@ -141,8 +176,10 @@ def build_pipeline_inputs(
     Args:
         sources:        Inputs from BuildPipeline node (transformer/te/vae/lora).
         context:        Pipeline-wide config (precision maps, device, etc.).
-        staging_root:   Where to create the temp staging dir. Defaults to
-                        $QUANTFUNC_CACHE_DIR or system tmpdir.
+        staging_root:   Where to create the staging dir. Defaults to
+                        _choose_staging_root(sources): $QUANTFUNC_CACHE_DIR, else
+                        (Windows) the model's drive so weights can be hardlinked
+                        with no symlink privilege, else system tmpdir.
 
     Returns:
         StagingResult whose `model_dir` is suitable for quantfunc_create().
@@ -157,7 +194,7 @@ def build_pipeline_inputs(
     adapter_inst = AdapterRegistry.select(sources)
 
     if staging_root is None:
-        staging_root = os.environ.get("QUANTFUNC_CACHE_DIR") or tempfile.gettempdir()
+        staging_root = _choose_staging_root(sources)
     Path(staging_root).mkdir(parents=True, exist_ok=True)
 
     stable_id = _stable_staging_id(sources, context)

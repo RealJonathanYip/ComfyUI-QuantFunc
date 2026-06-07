@@ -29,6 +29,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from .fs_util import link_or_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,8 @@ class HFLayout:
     """Builder for the HF-style staging directory.
 
     Adapters call methods on this object; nothing touches the filesystem until
-    a method is invoked. All weight references are *symlinks*; only configs
+    a method is invoked. Weight references use link_or_copy (hardlink → symlink
+    → copy fallback, see tools/fs_util.py); only configs
     and tokenizer files are actually written.
     """
 
@@ -77,12 +80,10 @@ class HFLayout:
         sub = self._add_component(
             "transformer", source_path,
             "diffusion_pytorch_model.safetensors", config)
-        # Add the alias as a sibling symlink (target the same source so
-        # both names resolve to the same file).
+        # Add the alias as a sibling link (target the same source so both
+        # names resolve to the same file).
         alias = sub / "model.safetensors"
-        if alias.exists() or alias.is_symlink():
-            alias.unlink()
-        alias.symlink_to(os.path.abspath(str(source_path)))
+        link_or_copy(source_path, alias)
         return sub
 
     def add_transformer_remapped(self, source_path: str | Path,
@@ -138,9 +139,7 @@ class HFLayout:
         sub = self.root / subdir
         sub.mkdir(parents=True, exist_ok=True)
         weight_link = sub / weight_filename
-        if weight_link.exists() or weight_link.is_symlink():
-            weight_link.unlink()
-        weight_link.symlink_to(os.path.abspath(str(source_path)))
+        link_or_copy(source_path, weight_link)
         # Sharded model fan-out: when source is one shard of a multi-shard
         # safetensors, symlink ALL siblings + the index.json. Without this
         # the C engine's ShardedSafeTensors only sees one shard and silently
@@ -169,10 +168,7 @@ class HFLayout:
             # ShardedSafeTensors reads them via the index.json which
             # references original names, not the alias).
             for f in shards:
-                link = sub / f
-                if link.exists() or link.is_symlink():
-                    link.unlink()
-                link.symlink_to(os.path.join(src_dir, f))
+                link_or_copy(os.path.join(src_dir, f), sub / f)
             # Also link index.json under BOTH the source's natural name
             # and the alias the C side expects (it scans for any
             # `*.safetensors.index.json`).
@@ -180,18 +176,13 @@ class HFLayout:
             if os.path.isfile(idx_src):
                 # Source-named index (what the inner shards reference)
                 idx_link_src = sub / f"{prefix}.safetensors.index.json"
-                if idx_link_src.exists() or idx_link_src.is_symlink():
-                    idx_link_src.unlink()
-                idx_link_src.symlink_to(idx_src)
+                link_or_copy(idx_src, idx_link_src)
                 # Engine-side filename based on `weight_filename`
                 wf_stem = weight_filename[:-len(".safetensors")] \
                     if weight_filename.endswith(".safetensors") else weight_filename
                 idx_link_dst = sub / f"{wf_stem}.safetensors.index.json"
-                if (idx_link_dst != idx_link_src and
-                        (idx_link_dst.exists() or idx_link_dst.is_symlink())):
-                    idx_link_dst.unlink()
                 if idx_link_dst != idx_link_src:
-                    idx_link_dst.symlink_to(idx_src)
+                    link_or_copy(idx_src, idx_link_dst)
         if config:
             (sub / "config.json").write_text(json.dumps(config, indent=2))
         return sub
