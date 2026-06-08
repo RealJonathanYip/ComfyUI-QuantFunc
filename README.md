@@ -232,4 +232,3 @@ Join our community for support, updates, and discussions:
 <div align="center" id="wechat">
   <img src="assets/WeChat.jpg" alt="WeChat Group" width="300">
 </div>
->
