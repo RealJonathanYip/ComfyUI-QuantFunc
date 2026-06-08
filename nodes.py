@@ -504,9 +504,13 @@ def _kill_stale_workers(dll_path):
         except OSError:
             continue
         try:
-            os.kill(pid, signal.SIGKILL)
+            # signal.SIGKILL is absent on Windows (raises AttributeError, which
+            # would escape an `except OSError`); fall back to SIGTERM, which on
+            # Windows os.kill maps to TerminateProcess anyway. Mirrors the
+            # broad `except Exception` guard used by _kill_worker below.
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             logging.warning("[QuantFunc] SIGKILL'd stale worker pid %d", pid)
-        except OSError:
+        except Exception:
             pass
 
 
@@ -981,7 +985,11 @@ class WorkerManager:
             if self._process.poll() is None:
                 try:
                     import signal
-                    os.kill(pid, signal.SIGKILL)
+                    # SIGKILL is absent on Windows — without the getattr fallback
+                    # this raises AttributeError that the `except` below would
+                    # swallow, turning the last-resort kill into a silent no-op.
+                    # SIGTERM via os.kill maps to TerminateProcess on Windows.
+                    os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
                     self._process.wait(timeout=3)
                 except Exception:
                     logging.error("[QuantFunc] Failed to kill worker pid %d — "
@@ -2509,6 +2517,12 @@ class QuantFuncGenerate:
         # /dev/shm QFRAW staging files — RAM-backed (tmpfs); MUST be unlinked
         # once the engine has consumed them (see the `finally` below) or every
         # edit/inpaint generation leaks a raw RGB blob (+ mask) into RAM.
+        #
+        # Staging dir: /dev/shm (tmpfs/RAM) on Linux; falls back to the platform
+        # temp dir on Windows / when shm is unavailable. Mirrors worker.py's
+        # output-path guard — without this, mkstemp(dir="/dev/shm") resolves to
+        # D:\dev\shm on Windows and raises FileNotFoundError.
+        _staging_dir = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) else tempfile.gettempdir()
         tmp_paths = []
         mask_path = None
         try:
@@ -2528,8 +2542,13 @@ class QuantFuncGenerate:
                 from PIL import Image  # used only for output preview path
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
-                        fd, tmp_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
+                        fd, tmp_path = tempfile.mkstemp(suffix=".qfraw", dir=_staging_dir)
                         os.close(fd)
+                        # Track the path BEFORE the write so a mid-write failure
+                        # (e.g. %TEMP% disk-full on Windows — now real disk, not
+                        # tmpfs) is still unlinked by the `finally` below. The
+                        # mask path (further down) already orders it this way.
+                        tmp_paths.append(tmp_path)
                         t = img_tensor[i]
                         # ComfyUI IMAGE is [B, H, W, C] FP32 in [0,1]. Convert
                         # to HWC uint8 [0,255]. cv2.convertScaleAbs is the
@@ -2546,7 +2565,6 @@ class QuantFuncGenerate:
                             # tobytes() is C-contiguous HWC uint8 — RGB order
                             # matches ComfyUI's IMAGE convention, so no swap.
                             f.write(img_np.tobytes())
-                        tmp_paths.append(tmp_path)
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
                 if sampler_name != "euler":
@@ -2570,7 +2588,7 @@ class QuantFuncGenerate:
                 # Format: 8-byte magic + uint32 H + uint32 W + H*W uint8.
                 mask_path = None
                 if inpaint_mask is not None and inpaint_strength > 0.0:
-                    fd, mask_path = tempfile.mkstemp(suffix=".qfraw", dir="/dev/shm")
+                    fd, mask_path = tempfile.mkstemp(suffix=".qfraw", dir=_staging_dir)
                     os.close(fd)
                     m = inpaint_mask
                     # Accept [B,H,W] / [B,1,H,W] / [H,W]
