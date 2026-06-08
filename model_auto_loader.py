@@ -77,6 +77,20 @@ def get_models_dir():
     return os.path.join(comfyui_dir, "models", "QuantFunc")
 
 
+def _assert_within(base, target):
+    """Guard against path traversal: `target` must resolve inside `base`.
+
+    Catalog combo values (transformer / prequant / precision_config /
+    base_model_repo) skip ComfyUI's combo validation, so a hand-edited or
+    API-submitted value could contain '..' segments. Refuse any path that
+    escapes the intended models directory before creating or downloading it.
+    """
+    real_base = os.path.realpath(base)
+    real_target = os.path.realpath(target)
+    if real_target != real_base and not real_target.startswith(real_base + os.sep):
+        raise ValueError("Refusing path outside {}: {!r}".format(base, target))
+
+
 def detect_gpu_variant(series=None):
     """Return the base-model variant for the detected GPU.
 
@@ -146,14 +160,50 @@ def _save_cache():
         logger.debug("Failed to save resource cache: %s", e)
 
 
+def _list_local_resource_names(short, resource_type):
+    """Filenames already downloaded under models/QuantFunc/<short>/<resource_type>/.
+
+    Mirrors _download_single_file's local layout. Lets the dropdown offer a
+    model the user already has on disk even when the remote catalog cache is
+    empty/stale or the background refresh has not finished — which is what
+    otherwise makes ComfyUI flag a perfectly-present model as "missing".
+    """
+    subdir = os.path.join(get_models_dir(), short, resource_type)
+    if not os.path.isdir(subdir):
+        return []
+    ext = ".json" if resource_type == _SUBDIR_PRECISION_CONFIG else ".safetensors"
+    try:
+        return [n for n in os.listdir(subdir)
+                if n.endswith(ext) and os.path.isfile(os.path.join(subdir, n))]
+    except OSError:
+        return []
+
+
 def _build_dropdown(resource_type, include_none=True):
-    """Build dropdown options: ['None', 'SeriesShort/name', ...]."""
+    """Build dropdown options: ['None', 'SeriesShort/name', ...].
+
+    Merges the remote catalog cache with files already present on disk, so a
+    usable value is ALWAYS in the list regardless of network reachability or
+    background-refresh timing. Without the local merge, a downloaded model
+    races the catalog refresh and ComfyUI rejects the saved value as a
+    "missing model" until a refresh wins (or forever, if offline).
+    """
     options = ["None"] if include_none else []
+    seen = set()
     with _cache_lock:
-        for series in MODEL_SERIES_LIST:
-            short = series.split("/")[-1]
-            for name in _resource_cache.get(series, {}).get(resource_type, []):
-                options.append("{}/{}".format(short, name))
+        cached = {s: list(_resource_cache.get(s, {}).get(resource_type, []))
+                  for s in MODEL_SERIES_LIST}
+    for series in MODEL_SERIES_LIST:
+        short = series.split("/")[-1]
+        names = cached[series]
+        for name in _list_local_resource_names(short, resource_type):
+            if name not in names:
+                names.append(name)
+        for name in sorted(names):
+            opt = "{}/{}".format(short, name)
+            if opt not in seen:
+                seen.add(opt)
+                options.append(opt)
     return options if options else (["None"] if include_none else [""])
 
 
@@ -405,6 +455,10 @@ def _download_single_file(series, remote_path, data_source):
     short_name = series.split("/")[-1]
     local_base = os.path.join(get_models_dir(), short_name)
     local_file = os.path.join(local_base, remote_path)
+    # Guard against the per-series base, not just models/QuantFunc/: a crafted
+    # '..' in the resolved filename must not redirect the write into another
+    # series' subdirectory.
+    _assert_within(local_base, local_file)
 
     if os.path.exists(local_file):
         return local_file
@@ -622,6 +676,7 @@ def download_base_model_repo(repo_id, data_source):
     """
     # Use org/repo structure: models/QuantFunc/Qwen/Qwen-Image-2512/
     local_dir = os.path.join(get_models_dir(), *repo_id.split("/"))
+    _assert_within(get_models_dir(), local_dir)
     marker = os.path.join(local_dir, _DOWNLOAD_MARKER)
 
     if os.path.exists(marker):
@@ -668,6 +723,7 @@ def download_base_model_to_diffusers(repo_id, data_source):
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     comfyui_dir = os.path.dirname(os.path.dirname(pkg_dir))
     local_dir = os.path.join(comfyui_dir, "models", "diffusers", *repo_id.split("/"))
+    _assert_within(os.path.join(comfyui_dir, "models", "diffusers"), local_dir)
     marker = os.path.join(local_dir, _DOWNLOAD_MARKER)
 
     if os.path.exists(marker):

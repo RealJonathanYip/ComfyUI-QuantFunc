@@ -1853,6 +1853,17 @@ def _get_precision_config_dropdowns():
         return ["None"]
 
 
+# Catalog-driven combos (transformer / prequant / precision_config /
+# base_model_repo) are resolved and downloaded by the node at run time, so a
+# saved-workflow value that isn't currently in the network-dependent, lazily
+# refreshed dropdown must not hard-fail ComfyUI's "Value not in list" check.
+# Each node below names ONLY its catalog input in VALIDATE_INPUTS, which makes
+# ComfyUI skip the combo check for that one input (execution.py validate_inputs:
+# `x not in validate_function_inputs`) while STILL validating the static combos
+# (model_series / data_source) and any future numeric ranges. The value is
+# resolved at execution time, surfacing a clear error only if truly unresolvable.
+
+
 class QuantFuncModelAutoLoader:
     """Auto-download and load QuantFunc models.
 
@@ -1882,6 +1893,10 @@ class QuantFuncModelAutoLoader:
     RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_model"
     CATEGORY = "QuantFunc"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, transformer=None):
+        return True  # catalog combo resolved at run time; see note above
 
     def load_model(self, model_series, data_source,
                    transformer="None", **kwargs):
@@ -1932,6 +1947,10 @@ class QuantFuncPrequantAutoLoader:
     FUNCTION = "load_prequant"
     CATEGORY = "QuantFunc"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, prequant=None):
+        return True  # catalog combo resolved at run time; see note above
+
     def load_prequant(self, prequant, data_source):
         if not prequant or prequant == "None":
             return ("",)
@@ -1973,6 +1992,10 @@ class QuantFuncPrecisionConfigAutoLoader:
     RETURN_NAMES = ("precision_config",)
     FUNCTION = "load_precision_config"
     CATEGORY = "QuantFunc"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, precision_config=None):
+        return True  # catalog combo resolved at run time; see note above
 
     def load_precision_config(self, precision_config, data_source):
         if not precision_config or precision_config == "None":
@@ -2110,6 +2133,10 @@ class QuantFuncBaseModelAutoLoaderWithDownload:
     RETURN_NAMES = ("model_dir",)
     FUNCTION = "load_base_model"
     CATEGORY = "QuantFunc"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, base_model_repo=None):
+        return True  # catalog combo resolved at run time; see note above
 
     def load_base_model(self, base_model_repo, data_source):
         if not base_model_repo or base_model_repo == "None":
