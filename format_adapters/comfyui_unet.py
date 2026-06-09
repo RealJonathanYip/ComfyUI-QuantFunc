@@ -1,11 +1,23 @@
 """Adapter for ComfyUI single-file UNETLoader / Load Diffusion Model output.
 
-These files store transformer weights with prefix `model.diffusion_model.X`
-(or sometimes `diffusion_model.X`). They contain ONLY transformer weights —
-TE and VAE come from separate files (LoadCLIP / LoadVAE nodes).
+Two sub-cases, one adapter:
+
+1. **ComfyUI-prefixed** (original path): the file carries
+   ``model.diffusion_model.X`` or ``diffusion_model.X`` prefix keys.
+   These are the standard UNETLoader / Load Diffusion Model outputs.
+
+2. **Bare BFL / diffusers layout** (new, general fix): the file has NO
+   ComfyUI prefix but the arch can be identified by
+   ``fingerprint_arch_from_keys()`` (e.g. raw BFL Klein files with bare
+   ``double_blocks.``/``single_blocks.`` keys, or bare diffusers QwenImage
+   files). This covers any precision — BF16, FP8, INT4, FP4 — as long as
+   the arch fingerprint recognises the key pattern.
+
+In both sub-cases the file contains ONLY transformer weights; TE and VAE
+come from separate files (LoadCLIP / LoadVAE nodes).
 
 Detection priority is below PrequantOurs and NVFP4Disk: this is the
-"generic" single-file ComfyUI format that we apply when no more-specific
+"generic" single-file transformer format applied when no more-specific
 adapter matched.
 
 Adaptation:
@@ -13,7 +25,7 @@ Adaptation:
   staging/transformer/config.json                           (synthesized)
   staging/quantfunc_config.json:
     {"method": "online_quant",
-     "transformer_key_strip": "model.diffusion_model."}
+     "transformer_key_strip": "<prefix>"}   # empty string for bare layout
   + symlink whatever TE / VAE was provided (handled by their own adapters
     via cooperative co-adaptation — see factory.build_pipeline_inputs).
 """
@@ -34,6 +46,7 @@ from .tools.hf_layout import (
     ARCH_TO_TRANSFORMER_CLASS,
     copy_tokenizer_bundle,
     bundled_te_config,
+    bundled_vae_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,11 +74,23 @@ def _detect_transformer_prefix(file_path: str) -> str:
 
 @adapter(priority=50)
 class ComfyUIDiffusionModelAdapter(FormatAdapter):
-    """Single-file ComfyUI UNETLoader-format transformer.
+    """Single-file transformer: ComfyUI UNETLoader prefix OR bare BFL/diffusers.
 
-    Fires on `sources.transformer` with `model.diffusion_model.` (or similar)
-    prefix. Co-uses sources.text_encoder / sources.vae if present (typical
-    setup: LoadDiffusionModel + LoadCLIP + LoadVAE wired in parallel).
+    Two acceptance paths (mutually exclusive, both land in this adapter):
+
+    Path A — ComfyUI-prefixed: file has ``model.diffusion_model.`` or
+      ``diffusion_model.`` prefix → ``_detect_transformer_prefix`` returns
+      non-empty. Classic UNETLoader / Load Diffusion Model output.
+
+    Path B — Bare arch: file has NO ComfyUI prefix but
+      ``fingerprint_arch_from_keys()`` identifies a known architecture
+      (Flux2Klein, QwenImage, ZImage, …) from the bare key patterns.
+      Handles raw BFL-layout single-file models at any precision (BF16,
+      FP8, FP4, INT4) that the user loaded via "QuantFunc Pick Diffusion
+      Model (zero-load)".
+
+    In both paths the file contains ONLY transformer weights; TE and VAE
+    come from separate Load nodes (co-adapted by this adapter).
     """
 
     @classmethod
@@ -75,7 +100,15 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
         if sources.transformer is None:
             return False
         try:
-            return bool(_detect_transformer_prefix(sources.transformer.path))
+            path = sources.transformer.path
+            # Path A: standard ComfyUI prefix
+            if _detect_transformer_prefix(path):
+                return True
+            # Path B: no prefix, but arch is identifiable from key patterns.
+            # Use the pre-scanned arch from FileRef when available (avoids an
+            # extra header read on the hot path); fall back to a fresh scan.
+            arch = sources.transformer.arch or fingerprint_arch_from_keys(path)
+            return bool(arch)
         except Exception:
             return False
 
@@ -83,7 +116,12 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
               context: BuildContext) -> StagingResult:
         assert sources.transformer is not None
         xfm_path = sources.transformer.path
-        prefix = _detect_transformer_prefix(xfm_path) or "model.diffusion_model."
+        prefix = _detect_transformer_prefix(xfm_path)
+        # NOTE: for bare BFL/diffusers layout (Path B) prefix is "".
+        # Do NOT fall back to "model.diffusion_model." — the engine's
+        # Flux2Klein / QwenImage / ZImage load paths already understand the
+        # bare key layout; adding a bogus prefix-strip would corrupt loading.
+        # For Path A (ComfyUI-prefixed), prefix is the detected string.
         arch = (fingerprint_arch_from_keys(xfm_path)
                 or sources.transformer.arch
                 or "")
@@ -126,7 +164,13 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
             layout.add_transformer(
                 xfm_path,
                 config={"_class_name": ARCH_TO_TRANSFORMER_CLASS.get(arch, "")})
-            layout.set_key_strip("transformer", prefix)
+            # Only write a key_strip when there is actually a prefix to strip.
+            # For bare BFL / diffusers layout (prefix == "") we skip this —
+            # a key_strip of "" in quantfunc_config.json would cause the engine
+            # to match every key with an empty prefix (= every key) and remove
+            # nothing, which is a no-op but may trigger unexpected code paths.
+            if prefix:
+                layout.set_key_strip("transformer", prefix)
 
         # Text encoder (if provided)
         if sources.text_encoder is not None:
@@ -168,9 +212,17 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
                     remap_fn=lambda s, d: stage_bfl_vae(str(s), d.parent, force=False),
                     config={"_class_name": "AutoencoderKL"})
             else:
+                # A standalone "Pick VAE" file carries NO config.json. Hardcoding
+                # AutoencoderKL here built the wrong 2D decoder against a 3D
+                # AutoencoderKLQwenImage VAE → engine copy_ overflow / "conv_in.bias
+                # not found" (#257, customer production crash). Use the bundled
+                # per-arch VAE config (with _class_name + latents_mean/std) so a
+                # standalone qwen_image_vae paired with a QwenImage(Edit) transformer
+                # is staged correctly — same pattern the bundled/SVDQ adapters use.
+                # Falls back to AutoencoderKL only for archs with no bundled config.
                 layout.add_vae(
                     vae_path,
-                    config={"_class_name": "AutoencoderKL"})
+                    config=bundled_vae_config(arch) or {"_class_name": "AutoencoderKL"})
                 if vae_prefix:
                     layout.set_key_strip("vae", vae_prefix)
 
@@ -190,8 +242,9 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
         layout.write_quantfunc_config()
         layout.write_model_index(arch)
 
-        logger.info("[comfyui_unet] arch=%s prefix=%r staging=%s",
-                     arch, prefix, staging_dir)
+        path_label = "comfyui-prefix" if prefix else "bare-bfl/diffusers"
+        logger.info("[comfyui_unet] arch=%s prefix=%r path=%s staging=%s",
+                     arch, prefix, path_label, staging_dir)
         return StagingResult(
             model_dir=str(staging_dir),
             arch=arch,

@@ -68,7 +68,8 @@ class HFLayout:
     # ── Component placement ───────────────────────────────────────────────
 
     def add_transformer(self, source_path: str | Path,
-                         config: Optional[dict] = None) -> Path:
+                         config: Optional[dict] = None,
+                         arch: Optional[str] = None) -> Path:
         """Symlink the transformer weights under BOTH canonical filenames:
         - `diffusion_pytorch_model.safetensors` — diffusers convention used
           by ComfyUI's standard loader probes and runtime-quantize / SVDQ
@@ -76,15 +77,49 @@ class HFLayout:
         - `model.safetensors` — hard-coded filename the Lighting prequant
           loader (ComponentImpl.cpp) uses; without this alias prequant
           reload errors with "Pre-quantized Lighting model directory
-          missing model.safetensors". One symlink solves both lookups."""
+          missing model.safetensors". One symlink solves both lookups.
+
+        `config` is augmented with weight-derived architecture dims so a
+        size-variant single-file model (e.g. Klein 4B vs 9B) gets the CORRECT
+        `num_layers` / `num_attention_heads` / … instead of inheriting the
+        engine's hard-coded family-canonical default → no shape-mismatch crash.
+        `arch` (internal arch tag) may be passed to skip a re-fingerprint."""
+        cfg = self._with_weight_derived_transformer(source_path, config, arch)
         sub = self._add_component(
             "transformer", source_path,
-            "diffusion_pytorch_model.safetensors", config)
+            "diffusion_pytorch_model.safetensors", cfg)
         # Add the alias as a sibling link (target the same source so both
         # names resolve to the same file).
         alias = sub / "model.safetensors"
         link_or_copy(source_path, alias)
         return sub
+
+    def _with_weight_derived_transformer(
+            self, source_path: str | Path,
+            config: Optional[dict], arch: Optional[str] = None) -> dict:
+        """Return `config` with weight-derived transformer dims merged IN.
+
+        The weight tensors are the ground truth for architecture dims, so the
+        derived values OVERRIDE the incoming config: a correct diffusers /
+        prequant config already EQUALS the derived dims (same weights), while a
+        minimal `{_class_name}` (single-file UNETLoader path) or a
+        variant-mismatched bundled config gets corrected. Only high-confidence
+        fields are produced by the probe; the rest are left to the caller's
+        config / the engine default. Best-effort — any failure leaves the
+        config untouched (existing behaviour)."""
+        cfg = dict(config or {})
+        try:
+            from .weight_derived_config import derive_transformer_config
+            from .arch_fingerprint import fingerprint_arch_from_keys
+            a = arch or fingerprint_arch_from_keys(str(source_path))
+            derived = derive_transformer_config(str(source_path), a) if a else None
+            if derived:
+                cfg.update(derived)
+                logger.info("[staging] transformer dims derived from weights "
+                             "(arch=%s): %s", a, derived)
+        except Exception as e:
+            logger.debug("[staging] transformer dim derive skipped: %s", e)
+        return cfg
 
     def add_transformer_remapped(self, source_path: str | Path,
                                   remap_fn,
@@ -102,19 +137,106 @@ class HFLayout:
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         remap_fn(Path(source_path), dst)
-        if config:
-            (sub / "config.json").write_text(json.dumps(config, indent=2))
+        # Derive dims from the staged file so a size variant is sized correctly
+        # here too, consistent with add_transformer. Only WRITE when the merged
+        # config carries a `_class_name` (the engine needs it to dispatch the
+        # transformer); a dims-only config — config=None + derive succeeded —
+        # is an untested semantic, so skip it rather than emit a class-less file.
+        cfg = self._with_weight_derived_transformer(dst, config)
+        if cfg.get("_class_name"):
+            (sub / "config.json").write_text(json.dumps(cfg, indent=2))
+        elif cfg:
+            # Defensive: a future caller passing config without `_class_name`
+            # (current callers always pass one) would otherwise SILENTLY get no
+            # config.json → engine mis-dispatch. Make the skip LOUD, not silent.
+            logger.warning("[staging] remapped transformer: derived dims but NO "
+                           "_class_name (config=%r) — skipping config.json to avoid "
+                           "a class-less file; pass a config with _class_name.", config)
         return sub
 
     def add_text_encoder(self, source_path: str | Path,
                           config: Optional[dict] = None) -> Path:
+        cfg = self._with_weight_derived_te(source_path, config)
         return self._add_component(
-            "text_encoder", source_path, "model.safetensors", config)
+            "text_encoder", source_path, "model.safetensors", cfg)
+
+    def _with_weight_derived_te(self, source_path: str | Path,
+                                config: Optional[dict]) -> dict:
+        """Override the TE config's SIZE dims (hidden_size / num_hidden_layers /
+        heads / intermediate_size / vocab_size) with values DERIVED from the
+        actual TE weights, so a same-family size variant loaded via a bare
+        "Load CLIP" (no model_dir config) is allocated correctly. The plugin's
+        bundled per-arch TE config is a single size — e.g. Klein bundles
+        Qwen3-2560 (4B), but the 9B TE is 4096 → the engine allocated TE buffers
+        at 2560 and loaded the 4096 weights → copy_ shape mismatch → noise
+        (#267). The weights are ground truth; for an already-correct config the
+        derived values EQUAL it (no-op). Best-effort — failure leaves config
+        untouched."""
+        cfg = dict(config or {})
+        try:
+            from .weight_derived_config import derive_te_config
+            derived = derive_te_config(str(source_path))
+            if derived:
+                cfg.update(derived)
+                logger.info("[staging] TE dims derived from weights: %s", derived)
+        except Exception as e:
+            logger.debug("[staging] TE dim derive skipped: %s", e)
+        return cfg
+
+    def add_vision_encoder(self, source_path: str | Path,
+                           config: Optional[dict] = None) -> Path:
+        """Place an edit-pipeline vision encoder (Qwen2.5-VL `visual.*`),
+        deriving its size dims from the weights so a bare standalone vision
+        encoder (no sibling config) is allocated correctly — the same
+        derive-from-weights routing as add_text_encoder (#267 class). For a
+        QuantFunc export with a sibling config the derived dims equal it
+        (no-op)."""
+        cfg = self._with_weight_derived_ve(source_path, config)
+        return self._add_component(
+            "vision_encoder", source_path, "model.safetensors", cfg)
+
+    def _with_weight_derived_ve(self, source_path: str | Path,
+                                config: Optional[dict]) -> dict:
+        """Override the vision-encoder config's SIZE dims (hidden_size/depth)
+        with values derived from the `visual.*` weights. Best-effort; leaves
+        config untouched on failure or no-match."""
+        cfg = dict(config or {})
+        try:
+            from .weight_derived_config import derive_vision_encoder_config
+            derived = derive_vision_encoder_config(str(source_path))
+            if derived:
+                cfg.update(derived)
+                logger.info("[staging] vision-encoder dims derived from weights: %s",
+                             derived)
+        except Exception as e:
+            logger.debug("[staging] vision-encoder dim derive skipped: %s", e)
+        return cfg
 
     def add_vae(self, source_path: str | Path,
                 config: Optional[dict] = None) -> Path:
+        cfg = self._with_weight_derived_vae(source_path, config)
         return self._add_component(
-            "vae", source_path, "diffusion_pytorch_model.safetensors", config)
+            "vae", source_path, "diffusion_pytorch_model.safetensors", cfg)
+
+    def _with_weight_derived_vae(self, source_path: str | Path,
+                                 config: Optional[dict]) -> dict:
+        """Correct the VAE `_class_name` from the weight keys when they carry a
+        recognised family signature (generalizes the engine #257 detection into
+        the plugin). A standalone "Load VAE" file ships no config.json, so the
+        declared class is empty / a generic AutoencoderKL guess — the wrong 2-D
+        decoder against a 3-D AutoencoderKLQwenImage / Flux2 VAE crashes at load.
+        Best-effort; leaves config untouched on any failure or no-match."""
+        cfg = dict(config or {})
+        try:
+            from .weight_derived_config import derive_vae_class
+            detected = derive_vae_class(str(source_path))
+            if detected and cfg.get("_class_name", "") != detected:
+                logger.info("[staging] VAE _class_name from weights: %r (was %r)",
+                             detected, cfg.get("_class_name") or None)
+                cfg["_class_name"] = detected
+        except Exception as e:
+            logger.debug("[staging] VAE class derive skipped: %s", e)
+        return cfg
 
     def add_vae_remapped(self, source_path: str | Path,
                           remap_fn,
@@ -130,8 +252,19 @@ class HFLayout:
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         remap_fn(Path(source_path), dst)
-        if config:
-            (sub / "config.json").write_text(json.dumps(config, indent=2))
+        # Correct the VAE `_class_name` from the remapped output's weight keys
+        # (zero-copy remap → `dst` is a symlink to the original, keys intact),
+        # so the #257 family detection also covers this BFL-remap VAE path.
+        # Previously this path hardcoded `{"_class_name":"AutoencoderKL"}` →
+        # #257 was BYPASSED here (a native QwenImage/Flux2 VAE wired through the
+        # BFL-remap path would still build the wrong 2-D decoder → load crash).
+        cfg = self._with_weight_derived_vae(dst, config)
+        if cfg.get("_class_name"):
+            (sub / "config.json").write_text(json.dumps(cfg, indent=2))
+        elif cfg:
+            logger.warning("[staging] remapped VAE: config without _class_name "
+                           "(config=%r) — skipping config.json; pass a config with "
+                           "_class_name.", config)
         return sub
 
     def _add_component(self, subdir: str, source_path: str | Path,
@@ -164,16 +297,31 @@ class HFLayout:
                 )
             except OSError:
                 shards = []
+            # Containment guard: a shard `f` from os.listdir could be a symlink
+            # that escapes src_dir (and `prefix` derives from an untrusted source
+            # filename). `basename` already strips `../` from prefix, but resolve
+            # every staged source through realpath and skip anything outside
+            # src_dir — defense-in-depth, mirroring _all_related_safetensors. The
+            # destination `sub / f` is inherently safe (f is a regex-filtered
+            # bare filename, no separators).
+            real_src_dir = os.path.realpath(src_dir)
+
+            def _within_src(p: str) -> bool:
+                return os.path.realpath(p).startswith(real_src_dir + os.sep)
+
             # Always link every shard under its ORIGINAL name (engine /
             # ShardedSafeTensors reads them via the index.json which
             # references original names, not the alias).
             for f in shards:
-                link_or_copy(os.path.join(src_dir, f), sub / f)
+                s = os.path.join(src_dir, f)
+                if not _within_src(s):
+                    continue  # shard escapes the model dir → skip (untrusted)
+                link_or_copy(s, sub / f)
             # Also link index.json under BOTH the source's natural name
             # and the alias the C side expects (it scans for any
             # `*.safetensors.index.json`).
             idx_src = os.path.join(src_dir, f"{prefix}.safetensors.index.json")
-            if os.path.isfile(idx_src):
+            if os.path.isfile(idx_src) and _within_src(idx_src):
                 # Source-named index (what the inner shards reference)
                 idx_link_src = sub / f"{prefix}.safetensors.index.json"
                 link_or_copy(idx_src, idx_link_src)

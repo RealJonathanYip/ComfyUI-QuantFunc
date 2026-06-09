@@ -145,16 +145,11 @@ class HFLayoutAdapter(FormatAdapter):
                 "ZImage": "ZImageTransformer2DModel",
             }.get(arch, ""),
         }
-        try:
-            from .tools.transformer_dims import probe_transformer_dims
-            probed = probe_transformer_dims(ref.path, arch)
-            if probed:
-                xfm_config = dict(xfm_config)
-                xfm_config.update(probed)
-                logger.info("[%s] probed dims: %s", arch, probed)
-        except Exception as e:
-            logger.debug("[%s] dim probe failed (%s) — using bundled defaults", arch, e)
-        layout.add_transformer(ref.path, config=xfm_config)
+        # add_transformer derives the architecture dims from the weights and
+        # overrides the bundled base (single header read inside the layout) — no
+        # separate dim-probe pass is needed here. Pass arch so add_transformer
+        # skips re-fingerprinting.
+        layout.add_transformer(ref.path, config=xfm_config, arch=arch)
         # Surface sibling config.json files from the source dirs to the
         # staging dir. Without text_encoder/config.json the C engine
         # falls back to defaults (hidden_size=2560, num_heads=32) and
@@ -203,12 +198,14 @@ class HFLayoutAdapter(FormatAdapter):
             if _os.path.isfile(ve_weights):
                 logger.info("[%s] auto-detected sibling vision_encoder/: %s",
                              method_hint, ve_weights)
-                # `add_vae` semantics: creates `<staging>/vision_encoder/` +
-                # symlinks weight under the canonical name. We use the
-                # internal `_add_component` to avoid VAE-specific aliasing.
-                layout._add_component(
-                    "vision_encoder", ve_weights, "model.safetensors",
-                    _sibling_config(ve_weights))
+                # Route through add_vision_encoder so the vision tower's size
+                # dims (hidden_size/depth) are DERIVED from the weights — a bare
+                # standalone vision encoder with no sibling config would
+                # otherwise inherit a wrong hidden_size → the same #267-class
+                # shape mismatch the TE fix addresses. For a QuantFunc export
+                # the sibling config already carries the dims (derive == no-op).
+                layout.add_vision_encoder(
+                    ve_weights, _sibling_config(ve_weights))
                 ve_extra_cfg["prequantized"] = True
         # Forward the source quantfunc_config.json's per-component metadata
         # if present — prequant exports carry the prequant precision flags

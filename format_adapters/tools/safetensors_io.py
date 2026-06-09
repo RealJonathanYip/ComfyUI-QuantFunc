@@ -12,6 +12,15 @@ import struct
 from pathlib import Path
 from typing import Iterator
 
+# Upper bound on the safetensors JSON-header length. The on-disk 8-byte length
+# prefix is UNTRUSTED — a crafted/corrupt file could declare an exabyte header,
+# and a naive `f.read(n)` would attempt a multi-GB/exabyte allocation → OOM /
+# hang (a DoS, even though the caller best-effort-skips parse errors). Real
+# safetensors headers are at most a few MB even for thousands of tensors; 128 MB
+# is generously above any legitimate model. This single guard protects ALL
+# callers (transformer / VAE / TE / vision derive all funnel through here).
+_MAX_HEADER_BYTES = 128 * 1024 * 1024
+
 
 def read_safetensors_header(path: str | Path) -> dict:
     """Return the full header dict including __metadata__ and tensor entries.
@@ -23,6 +32,10 @@ def read_safetensors_header(path: str | Path) -> dict:
     """
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
+        if n > _MAX_HEADER_BYTES:
+            raise ValueError(
+                f"safetensors header length {n} exceeds cap {_MAX_HEADER_BYTES} "
+                f"(untrusted/corrupt file): {path}")
         return json.loads(f.read(n).decode("utf-8"))
 
 
