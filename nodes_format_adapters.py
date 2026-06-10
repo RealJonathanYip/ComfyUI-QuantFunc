@@ -844,7 +844,15 @@ class QuantFuncBuildPipeline:
         # split_mod<6> in one kernel. QwenImage / QwenImageEdit only — Klein /
         # ZImage transformers ignore this flag (no fused-mod kernel path).
         # Always on for Qwen; not user-configurable.
-        if staging.arch in ("QwenImage", "QwenImageEdit"):
+        # #270-residual: prefix-match the Qwen-Image family instead of an
+        # enumerated tuple — the 2511 edit pipeline's class is
+        # QwenImageEditPlusPipeline (arch "QwenImageEditPlus"), which the old
+        # tuple missed -> fused_mod silently not injected on export -> bundle
+        # carried tiled (non-GEMV) mod weights while the reimport (arch from
+        # bundle metadata, gate hit) requested fused -> noise. The engine now
+        # ALSO defaults fused_mod on for QwenImage Lighting (belt+braces);
+        # this keeps the plugin's intent general for future Qwen variants.
+        if staging.arch.startswith("QwenImage"):
             options["fused_mod"] = True
 
 

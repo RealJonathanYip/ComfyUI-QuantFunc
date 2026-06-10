@@ -101,6 +101,35 @@ class HFLayoutAdapter(FormatAdapter):
         existing = _walk_to_model_dir(src.parent)
         if existing is not None:
             arch = fingerprint_arch_from_keys(ref.path) or ref.arch
+            if not arch:
+                # #270-residual: the key-fingerprint can fail on a SHARD of a
+                # sharded transformer (e.g. qwen diffusion_pytorch_model-00001-
+                # of-00005.safetensors) -> arch stayed "" -> the downstream
+                # arch-gated knobs (fused_mod for QwenImage/QwenImageEdit) were
+                # silently skipped -> the export produced TILED (non-GEMV) mod
+                # weights while a later fused reimport expected GEMV -> noise.
+                # For an existing HF model_dir the model_index.json _class_name
+                # is AUTHORITATIVE (the same signal the engine itself dispatches
+                # on) -- derive arch from it generically (strip "Pipeline").
+                try:
+                    import json as _json
+                    with open(Path(existing) / "model_index.json") as _f:
+                        _cls = _json.load(_f).get("_class_name", "") or ""
+                    arch = _cls[:-len("Pipeline")] if _cls.endswith("Pipeline") else _cls
+                    # SAFETY (vuln-CR): arch flows into path components
+                    # (bin/tokenizers/<arch>/, transformer_configs/<arch>.json)
+                    # — accept only a plain identifier (all real archs are
+                    # CamelCase alnum: QwenImageEditPlus, Flux2Klein, ZImage).
+                    # A crafted _class_name (e.g. "../../x") is rejected.
+                    if arch and not arch.isalnum():
+                        logger.warning("[%s] ignoring non-identifier _class_name "
+                                       "%r from model_index.json", method_hint, _cls)
+                        arch = ""
+                    if arch:
+                        logger.info("[%s] arch from model_index.json _class_name: %s",
+                                    method_hint, arch)
+                except Exception:
+                    pass
             logger.info("[%s] using existing model_dir %s", method_hint, existing)
             # The model_dir is used as-is. A well-formed HF / QuantFunc export
             # ships its own tokenizer/, but some exports omit it — then the
