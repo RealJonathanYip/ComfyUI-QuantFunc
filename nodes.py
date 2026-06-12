@@ -2489,6 +2489,9 @@ class QuantFuncGenerate:
         inpaint_blur = 0.0
         inpaint_no_snap = False
         color_match = 0.0
+        # #293 t2i img2img (SDEdit): set when the ImageList carries an init_img.
+        img2img_mode = False
+        img2img_strength = 0.6
         if ref_images is not None and isinstance(ref_images, dict):
             # New: ref_img_resize ("720" / "1024" / "origin")
             # Backwards compat: old workflows may still send keep_ref_img_size (bool)
@@ -2504,6 +2507,8 @@ class QuantFuncGenerate:
             inpaint_blur = ref_images.get("mask_blur", 0.0)
             inpaint_no_snap = ref_images.get("mask_no_snap", False)
             color_match = float(ref_images.get("color_match", 0.0))
+            img2img_mode = bool(ref_images.get("img2img", False))
+            img2img_strength = float(ref_images.get("img2img_strength", 0.6))
             ref_images = ref_images["images"]
         # edit_mode controls which Pipeline class the C++ engine instantiates:
         #   - QwenImage / QwenImageEdit are SEPARATE classes; QwenImageEditPipeline
@@ -2513,7 +2518,13 @@ class QuantFuncGenerate:
         #     pre-loads VAE encoder); toggling triggers recreate but t2i still
         #     works since the pipeline serves both.
         # Set conditionally — accept the recreate cost when toggling ref_images.
-        cfg["options"]["edit_mode"] = ref_images is not None
+        # #293 t2i img2img: an init_img is NOT a vision/Kontext edit — it must
+        # build the T2I pipeline (edit_mode=False) so the C-API image_to_image
+        # takes the SDEdit img2img route through generate(). enable_img2img opts
+        # the t2i pipeline into loading its VAE encoder (Klein already has one).
+        cfg["options"]["edit_mode"] = (ref_images is not None) and not img2img_mode
+        if img2img_mode:
+            cfg["options"]["enable_img2img"] = True
 
         # Collect live QuantFuncGenerate node ids from the current workflow.
         # Exclude nodes whose required `pipeline` input isn't connected — those
@@ -2594,6 +2605,10 @@ class QuantFuncGenerate:
                             f.write(img_np.tobytes())
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
+                # #293 t2i img2img: strength → C-API options_json edit_strength →
+                # setEditImg2ImgStrength → flow-match SDEdit init in t2i generate().
+                if img2img_mode:
+                    i2i_opts["edit_strength"] = img2img_strength
                 if sampler_name != "euler":
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
@@ -2713,11 +2728,41 @@ class QuantFuncImageList:
     @classmethod
     def INPUT_TYPES(cls):
         optional = {}
-        # main_image_mask = 主图遮罩(可选,触发 inpaint)
+        # ── 参考图 2-10 ──
+        for i in range(2, 11):
+            optional[f"ref_image_{i}"] = ("IMAGE", {
+                "tooltip": f"第 {i} 张参考图(可选)。最多 10 张。",
+            })
+        # ── mask 组:main_image_mask 放在 mask_config 下,两个一起 ──
+        # mask_config = MASK 高级配置(可选,不连接走默认)。
+        # 默认 = QuantFuncMaskConfig 的默认 = strength=1.0, grow=6, blur=0.0, no_snap=False。
+        optional["mask_config"] = ("QUANTFUNC_MASK_CONFIG", {
+            "tooltip": "可选:用 QuantFunc Mask Config 节点配置遮罩高级参数"
+                       "(strength / grow / blur / no_snap)。不连接 = 全用默认值。",
+        })
+        # main_image_mask = 主图遮罩(可选,触发 inpaint),放在 mask_config 下成组
         optional["main_image_mask"] = ("MASK", {
             "tooltip": "主图的 inpaint 遮罩(白=重绘,黑=保留,等价 ComfyUI "
                        "SetLatentNoiseMask)。只有白色区域被模型重绘;"
                        "黑色区域通过后处理 snap 完整保留原图。",
+        })
+        # ── img2img 源图:init_img 放在最下,与下方 strength(强度)成组 ──
+        # 连接它即让 t2i 走 img2img:VAE 编码源图 → 按 strength 起始 sigma → denoise
+        # (保留源图结构按 prompt 改)。与 edit 主图/参考图互斥(t2i pipeline,非 vision-edit)。
+        optional["init_img"] = ("IMAGE", {
+            "tooltip": "t2i img2img (以图生图) 源图。连接 → 文生图从这张图出发"
+                       "(保留构图/结构,按 prompt 改);留空 = 纯文生图 / 用主图走 edit。"
+                       "强度见下方 init_img_strength。与 edit 的 main_image 互斥。",
+        })
+        # ── 数值参数(widget)──
+        # init_img_strength = 图生图强度(原 init_denoise),紧挨上方 init_img 成组
+        optional["init_img_strength"] = ("FLOAT", {
+            "default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "图生图强度 (0~1,默认 0.6,仅 init_img 连接时生效):\n"
+                       "  低 (0.2~0.4) — 强保留源图,仅微调\n"
+                       "  0.6        — 平衡(推荐)\n"
+                       "  1.0        — 完全重画(== 纯文生图,忽略源图)\n"
+                       "对齐 diffusers img2img strength。",
         })
         # main_image_resize = 主图缩放
         optional["main_image_resize"] = (["720", "1024", "origin"], {
@@ -2727,11 +2772,6 @@ class QuantFuncImageList:
                        "  1024 — 长边裁到 1024 px(更高质量,稍慢)\n"
                        "  origin — 保留原尺寸,只把每边对齐到 16 的倍数",
         })
-        # ref_image_2..ref_image_10 = 参考图 2-10
-        for i in range(2, 11):
-            optional[f"ref_image_{i}"] = ("IMAGE", {
-                "tooltip": f"第 {i} 张参考图(可选)。最多 10 张。",
-            })
         # ref_image_resize_others = 参考图 2~10 缩放
         optional["ref_image_resize_others"] = (["720", "1024", "origin"], {
             "default": "720",
@@ -2739,12 +2779,6 @@ class QuantFuncImageList:
                        "  720  — 长边裁到 720 px(默认,省 VRAM)\n"
                        "  1024 — 长边裁到 1024 px\n"
                        "  origin — 保留原尺寸(图大可能 OOM)",
-        })
-        # mask_config = MASK 高级配置(可选,不连接走默认)。
-        # 默认 = QuantFuncMaskConfig 的默认 = strength=1.0, grow=6, blur=0.0, no_snap=False。
-        optional["mask_config"] = ("QUANTFUNC_MASK_CONFIG", {
-            "tooltip": "可选:用 QuantFunc Mask Config 节点配置遮罩高级参数"
-                       "(strength / grow / blur / no_snap)。不连接 = 全用默认值。",
         })
         # color_match = 潜在色彩匹配(插件侧 Reinhard 后处理,镜像引擎算法)
         optional["color_match"] = ("FLOAT", {
@@ -2756,11 +2790,15 @@ class QuantFuncImageList:
                        "  1.0     — 完全匹配(色彩最忠实,细节略软)",
         })
         return {
-            "required": {
-                # main_image = 主图
-                "main_image": ("IMAGE", {"tooltip": "edit 模式的主图(被遮罩区域将被重绘)"}),
+            # main_image is OPTIONAL now: an img2img-only workflow connects
+            # init_img instead. combine() requires exactly one of the two.
+            "required": {},
+            "optional": {
+                # main_image = edit 模式的主图(被遮罩区域将被重绘)
+                "main_image": ("IMAGE", {"tooltip": "edit 模式的主图(被遮罩区域将被重绘)。"
+                                                    "纯 img2img 用 init_img 代替。"}),
+                **optional,
             },
-            "optional": optional,
         }
 
     RETURN_TYPES = ("QUANTFUNC_IMAGE_LIST",)
@@ -2768,9 +2806,26 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, main_image, main_image_resize="720",
+    def combine(self, main_image=None, main_image_resize="720",
                 ref_image_resize_others="720",
-                main_image_mask=None, mask_config=None, **kwargs):
+                main_image_mask=None, mask_config=None,
+                init_img=None, init_img_strength=0.6, **kwargs):
+        # #293 t2i img2img (SDEdit): init_img connected → t2i pipeline starts
+        # from the VAE-encoded source (NOT vision/Kontext edit). Mutually
+        # exclusive with the edit main_image; init_img wins if both are set.
+        if init_img is not None:
+            return ({
+                "images": [init_img],          # the single source image
+                "img2img": True,               # → QuantFuncGenerate: t2i img2img route
+                "img2img_strength": float(init_img_strength),
+                "ref_img_resize": "origin",    # encode source at the output resolution
+                "ref_img_resize_others": "origin",
+                "color_match": 0.0,
+            },)
+        if main_image is None:
+            raise ValueError(
+                "QuantFuncImageList: connect either main_image (edit) or "
+                "init_img (t2i img2img).")
         images = [main_image]
         for i in range(2, 11):
             img = kwargs.get(f"ref_image_{i}")
