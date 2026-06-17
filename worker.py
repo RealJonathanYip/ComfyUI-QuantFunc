@@ -77,10 +77,19 @@ class _Pipeline(ctypes.Structure):
     pass
 class _Image(ctypes.Structure):
     pass
+class _Video(ctypes.Structure):   # #344 LTX-2 t2v handle (frames + audio)
+    pass
 
 PIPE_PTR = ctypes.POINTER(_Pipeline)
 IMG_PTR = ctypes.POINTER(_Image)
+VID_PTR = ctypes.POINTER(_Video)
 PROGRESS_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+# Latent-preview callback (mirrors quantfunc.h latent_preview_callback):
+#   int (*)(int step, int total, int width, int height,
+#           const unsigned char *rgb, void *user_data)
+LATENT_PREVIEW_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_ubyte), ctypes.c_void_p)
 
 class InitParams(ctypes.Structure):
     _fields_ = [
@@ -106,6 +115,9 @@ class T2IParams(ctypes.Structure):
         ("options_json",      ctypes.c_char_p),
         ("progress_callback", PROGRESS_CB),
         ("callback_user_data",ctypes.c_void_p),
+        # Per-step latent preview (mirrors quantfunc_t2i_params_t). NULL = off.
+        ("latent_preview_callback", LATENT_PREVIEW_CB),
+        ("latent_preview_user_data", ctypes.c_void_p),
     ]
 
 class I2IParams(ctypes.Structure):
@@ -129,6 +141,9 @@ class I2IParams(ctypes.Structure):
         ("mask_grow",         ctypes.c_int),
         ("mask_blur",         ctypes.c_float),
         ("mask_no_snap",      ctypes.c_int),
+        # Per-step latent preview (mirrors quantfunc_i2i_params_t). NULL = off.
+        ("latent_preview_callback", LATENT_PREVIEW_CB),
+        ("latent_preview_user_data", ctypes.c_void_p),
     ]
 
 class ExportParams(ctypes.Structure):
@@ -252,6 +267,33 @@ def _load_dll(dll_path):
     _lib.quantfunc_image_destroy.restype = None
     _lib.quantfunc_image_destroy.argtypes = [IMG_PTR]
 
+    # #344 — LTX-2 text-to-video (+ audio). Optional: only present in engines that
+    # ship the video API (wrapped in try so older DLLs still load for t2i).
+    global _HAS_VIDEO
+    _HAS_VIDEO = False
+    try:
+        _lib.quantfunc_text_to_video.restype = ctypes.c_int
+        _lib.quantfunc_text_to_video.argtypes = [PIPE_PTR, ctypes.POINTER(T2IParams), ctypes.POINTER(VID_PTR)]
+        _lib.quantfunc_video_num_frames.restype = ctypes.c_int
+        _lib.quantfunc_video_num_frames.argtypes = [VID_PTR]
+        _lib.quantfunc_video_fps.restype = ctypes.c_float
+        _lib.quantfunc_video_fps.argtypes = [VID_PTR]
+        _lib.quantfunc_video_frame.restype = IMG_PTR    # borrowed (owned by the video)
+        _lib.quantfunc_video_frame.argtypes = [VID_PTR, ctypes.c_int]
+        _lib.quantfunc_video_audio_data.restype = ctypes.POINTER(ctypes.c_float)
+        _lib.quantfunc_video_audio_data.argtypes = [VID_PTR]
+        _lib.quantfunc_video_audio_num_samples.restype = ctypes.c_int
+        _lib.quantfunc_video_audio_num_samples.argtypes = [VID_PTR]
+        _lib.quantfunc_video_audio_channels.restype = ctypes.c_int
+        _lib.quantfunc_video_audio_channels.argtypes = [VID_PTR]
+        _lib.quantfunc_video_sample_rate.restype = ctypes.c_int
+        _lib.quantfunc_video_sample_rate.argtypes = [VID_PTR]
+        _lib.quantfunc_video_destroy.restype = None
+        _lib.quantfunc_video_destroy.argtypes = [VID_PTR]
+        _HAS_VIDEO = True
+    except AttributeError:
+        log("video API not present in this DLL (t2i-only engine)")
+
     # Optional: quantfunc_set_api_key (may not exist in older DLLs)
     try:
         _lib.quantfunc_set_api_key.restype = ctypes.c_int
@@ -336,6 +378,36 @@ def _make_progress_cb(req_id):
         return 0
 
     _current_cb = cb  # prevent GC
+    return cb
+
+
+_current_preview_cb = None
+
+
+def _make_latent_preview_cb(req_id):
+    """Create a latent-preview callback that ships each step's small RGB preview
+    (engine-decoded latent2rgb) to the parent as base64 JSON. The parent feeds
+    it to ComfyUI's live-preview channel. Never aborts generation on failure."""
+    global _current_preview_cb
+    import base64
+
+    @LATENT_PREVIEW_CB
+    def cb(step, total, width, height, rgb_ptr, user_data):
+        try:
+            n = int(width) * int(height) * 3
+            if n > 0 and rgb_ptr:
+                buf = ctypes.string_at(rgb_ptr, n)
+                send_json({"type": "preview", "req_id": req_id,
+                           "step": int(step), "total": int(total),
+                           "width": int(width), "height": int(height),
+                           "rgb_b64": base64.b64encode(buf).decode("ascii")})
+        except Exception:
+            pass  # a preview failure must never affect generation
+        if _cancel_flag.is_set():
+            return 1  # cancel
+        return 0
+
+    _current_preview_cb = cb  # prevent GC
     return cb
 
 
@@ -441,6 +513,10 @@ def handle_text_to_image(msg):
     t2i.options_json = msg["options_json"].encode() if msg.get("options_json") else None
     t2i.progress_callback = cb
     t2i.callback_user_data = None
+    if msg.get("latent_preview"):
+        pcb = _make_latent_preview_cb(req_id)
+        t2i.latent_preview_callback = pcb
+        t2i.latent_preview_user_data = None
 
     img = IMG_PTR()
     status = _lib.quantfunc_text_to_image(pipe, ctypes.byref(t2i), ctypes.byref(img))
@@ -484,6 +560,10 @@ def handle_image_to_image(msg):
     i2i.options_json = msg["options_json"].encode() if msg.get("options_json") else None
     i2i.progress_callback = cb
     i2i.callback_user_data = None
+    if msg.get("latent_preview"):
+        pcb = _make_latent_preview_cb(req_id)
+        i2i.latent_preview_callback = pcb
+        i2i.latent_preview_user_data = None
     # Inpaint plumbing — node serializes the MASK to a temp PNG, passes path.
     mp = msg.get("mask_path")
     i2i.mask_path = mp.encode() if mp else None
@@ -504,6 +584,107 @@ def handle_image_to_image(msg):
         return
 
     _extract_and_send_image(img, req_id)
+
+
+def _extract_and_send_video(vid, req_id):
+    """#344 — extract the LTX-2 video (frames + audio) and hand to the parent.
+
+    Frames: concatenated raw uint8 RGB (N*H*W*3) written to /dev/shm; the parent
+    reshapes to [N,H,W,3]. Audio (if any): host FP32 PLANAR/channel-major
+    (channels*num_samples) written to /dev/shm; the parent reshapes to [C,N]. Both
+    use the same shm round-trip as the image path. The video handle (and its frames'
+    GPU/CPU buffers) are destroyed here."""
+    import os
+    n = _lib.quantfunc_video_num_frames(vid)
+    fps = float(_lib.quantfunc_video_fps(vid))
+    use_shm = os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+    base = ("/dev/shm/" if use_shm else "/tmp/") + f"qf_vid_{os.getpid()}_{req_id}"
+
+    # Frames → one contiguous uint8 RGB blob [N,H,W,3].
+    w = h = 0
+    frame_path = base + "_frames.raw"
+    # O_NOFOLLOW defeats a symlink planted at the predictable /dev/shm path (refuses
+    # to follow a symlink final component); O_TRUNC tolerates a stale regular file.
+    _ffd = os.open(frame_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(_ffd, "wb") as f:
+        for i in range(n):
+            img = _lib.quantfunc_video_frame(vid, i)   # borrowed
+            if not img:
+                continue
+            fw = _lib.quantfunc_image_width(img)
+            fh = _lib.quantfunc_image_height(img)
+            w, h = fw, fh
+            nb = fh * fw * 3
+            u8 = _lib.quantfunc_image_data(img)
+            view = ctypes.cast(u8, ctypes.POINTER(ctypes.c_uint8 * nb))[0]
+            f.write(bytes(memoryview(view)))
+
+    result = {"type": "result", "req_id": req_id, "status": "ok",
+              "num_frames": n, "width": w, "height": h, "fps": fps,
+              "frame_format": "rgb_uint8", "frame_shm_path": frame_path,
+              "audio": None}
+
+    # Audio (LTX-2 AV checkpoints only; NULL for video-only).
+    if _HAS_VIDEO:
+        a_ptr = _lib.quantfunc_video_audio_data(vid)
+        ns = _lib.quantfunc_video_audio_num_samples(vid)
+        ch = _lib.quantfunc_video_audio_channels(vid)
+        sr = _lib.quantfunc_video_sample_rate(vid)
+        if a_ptr and ns > 0 and ch > 0:
+            nfloat = ch * ns
+            a_path = base + "_audio.raw"
+            view = ctypes.cast(a_ptr, ctypes.POINTER(ctypes.c_float * nfloat))[0]
+            _afd = os.open(a_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(_afd, "wb") as f:
+                f.write(bytes(memoryview(view)))
+            result["audio"] = {"num_samples": ns, "channels": ch,
+                               "sample_rate": sr, "shm_path": a_path}
+
+    _lib.quantfunc_video_destroy(vid)
+    send_json(result)
+
+
+def handle_text_to_video(msg):
+    """#344 — LTX-2 text-to-video (+ audio). Mirrors handle_text_to_image: same
+    T2IParams (num_frames/fps come through options_json), but dispatches the video
+    C-API and returns frames + audio."""
+    req_id = msg["req_id"]
+    if not _HAS_VIDEO:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1,
+                   "error_message": "This QuantFunc engine build has no video API "
+                                    "(needs the LTX-2 t2v + audio C-API, #344+)."})
+        return
+    pipe = _get_pipeline(msg, req_id)
+    if pipe is None:
+        return
+    _cancel_flag.clear()
+    cb = _make_progress_cb(req_id)
+
+    t2i = T2IParams()
+    t2i.prompt = msg["prompt"].encode()
+    t2i.height = msg.get("height", 512)
+    t2i.width = msg.get("width", 512)
+    t2i.num_steps = msg.get("num_steps", 30)
+    t2i.guidance_scale = float(msg.get("guidance_scale", 4.0))
+    t2i.seed = msg.get("seed", 0)
+    t2i.options_json = msg["options_json"].encode() if msg.get("options_json") else None
+    t2i.progress_callback = cb
+    t2i.callback_user_data = None
+    t2i.latent_preview_callback = LATENT_PREVIEW_CB()  # NULL
+    t2i.latent_preview_user_data = None
+
+    vid = VID_PTR()
+    status = _lib.quantfunc_text_to_video(pipe, ctypes.byref(t2i), ctypes.byref(vid))
+    if status == QUANTFUNC_ERROR_CANCELLED:
+        send_json({"type": "result", "req_id": req_id, "status": "cancelled"})
+        return
+    if status != QUANTFUNC_OK:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": status, "error_message": _get_error()})
+        return
+
+    _extract_and_send_video(vid, req_id)
 
 
 def handle_export(msg):
@@ -677,6 +858,7 @@ HANDLERS = {
     "create":         handle_create,
     "text_to_image":  handle_text_to_image,
     "image_to_image": handle_image_to_image,
+    "text_to_video":  handle_text_to_video,   # #344 LTX-2 t2v + audio
     "export":         handle_export,
     "set_api_key":    handle_set_api_key,
     "unload":         handle_unload,

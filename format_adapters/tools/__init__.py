@@ -10,7 +10,7 @@ from .arch_fingerprint import (
     fingerprint_kind_from_metadata,
 )
 from .hf_layout import (
-    HFLayout, copy_tokenizer_bundle, copy_tokenizer,
+    HFLayout, copy_tokenizer_bundle, copy_tokenizer, ensure_engine_tokenizer,
     bundled_te_config, bundled_vae_config, bundled_transformer_config,
 )
 from .fs_util import link_or_copy
@@ -25,6 +25,7 @@ __all__ = [
     "HFLayout",
     "copy_tokenizer_bundle",
     "copy_tokenizer",
+    "ensure_engine_tokenizer",
     "bundled_te_config",
     "bundled_vae_config",
     "bundled_transformer_config",

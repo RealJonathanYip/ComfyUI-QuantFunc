@@ -579,15 +579,15 @@ class QuantFuncBuildPipeline:
                 "text_precision": "int4",
                 "vision_quant": "int8",
                 "vae_precision": "auto",
-                "act_quant_mode": "auto",
+                "act_quant_mode": "absmax",
             }
         cfg_dict = dict(pipeline_config)
-        # Defaults match the previous in-node widget defaults exactly so
-        # workflows that don't configure these in PipelineConfig keep prior
-        # behaviour.
+        # Defaults match the in-node PipelineConfig widget defaults exactly so
+        # workflows that don't wire PipelineConfig get the same behaviour
+        # (act_quant_mode default is absmax — fast single-pass, user choice).
         vae_precision  = cfg_dict.pop("vae_precision",  "auto")
         text_precision = cfg_dict.pop("text_precision", "int4")
-        act_quant_mode = cfg_dict.pop("act_quant_mode", "auto")
+        act_quant_mode = cfg_dict.pop("act_quant_mode", "absmax")
         from .nodes_pipeline_builder import (
             extract_qf_source_path, resolve_precision_preset,
             detect_scheduler_config,

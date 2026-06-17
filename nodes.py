@@ -514,6 +514,71 @@ def _kill_stale_workers(dll_path):
             pass
 
 
+def _make_progress_preview_cbs(pbar, latent_preview):
+    """Return (on_progress, on_preview) callbacks for a worker generation.
+
+    When latent preview is active, BOTH paths use ProgressBar.update_absolute
+    (idempotent on the step counter, so a preview's update doesn't double-count
+    the progress that the "progress" message already advanced). When inactive,
+    the legacy update(1) increment is preserved unchanged. on_preview pushes the
+    PIL image through ComfyUI's live-preview channel via update_absolute's third
+    arg, exactly like ComfyUI's own samplers (latent_preview.py)."""
+    preview_active = bool(latent_preview)
+    max_size = 256
+    if preview_active:
+        try:
+            max_size = int(latent_preview.get("max_size", 256))
+        except Exception:
+            max_size = 256
+
+    def on_progress(step, total):
+        if pbar is None:
+            return
+        if preview_active:
+            try:
+                pbar.update_absolute(int(step), int(total))
+            except Exception:
+                pbar.update(1)
+        else:
+            pbar.update(1)
+
+    on_preview = None
+    if preview_active:
+        def on_preview(step, total, img):   # noqa: F811
+            if pbar is None:
+                return
+            try:
+                pbar.update_absolute(int(step), int(total), ("JPEG", img, max_size))
+            except Exception:
+                pass
+
+    return on_progress, on_preview
+
+
+def _find_downstream_latent_preview(workflow_prompt, my_node_id):
+    """Return the node id of a 'QuantFunc Latent Preview' viewer wired to THIS
+    generate node's `latent_preview` output, or None.
+
+    The viewer carries no config — its mere presence enables the live preview,
+    which is routed to its node id so the per-step latent2rgb frames render on
+    it instead of on the generate node.
+    """
+    if not isinstance(workflow_prompt, dict) or my_node_id is None:
+        return None
+    me = str(my_node_id)
+    for nid, node in workflow_prompt.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "QuantFuncLatentPreview":
+            continue
+        # A connected input is [source_node_id, source_output_slot]; match any
+        # input fed by THIS node (only our latent_preview output reaches it).
+        for v in node.get("inputs", {}).values():
+            if isinstance(v, list) and len(v) == 2 and str(v[0]) == me:
+                return str(nid)
+    return None
+
+
 class WorkerManager:
     """Manages a QuantFunc worker subprocess with isolated CUDA libraries."""
 
@@ -1046,7 +1111,7 @@ class WorkerManager:
             data += chunk
         return data
 
-    def _call(self, cmd, progress_cb=None, timeout=1800):
+    def _call(self, cmd, progress_cb=None, preview_cb=None, timeout=1800):
         """Send command and collect response, relaying progress."""
         self._send_command(cmd)
 
@@ -1081,6 +1146,24 @@ class WorkerManager:
             if msg_type == "progress":
                 if progress_cb:
                     progress_cb(resp.get("step", 0), resp.get("total", 0))
+                continue
+
+            if msg_type == "preview":
+                # Per-step latent preview (engine-decoded latent2rgb). Decode the
+                # base64 RGB and hand it to the preview callback. Never let a
+                # preview failure interrupt the generation.
+                if preview_cb:
+                    try:
+                        import base64
+                        from PIL import Image
+                        w = int(resp.get("width", 0)); h = int(resp.get("height", 0))
+                        b64 = resp.get("rgb_b64")
+                        if w > 0 and h > 0 and b64:
+                            raw = base64.b64decode(b64)
+                            img = Image.frombytes("RGB", (w, h), raw)
+                            preview_cb(resp.get("step", 0), resp.get("total", 0), img)
+                    except Exception as e:
+                        logging.debug("[QuantFunc] latent preview decode failed: %s", e)
                 continue
 
             if msg_type == "result":
@@ -1219,6 +1302,15 @@ class WorkerManager:
                 # Free VRAM before creating new pipeline
                 self._unload_others_locked(keep_key=key)
 
+            # The C engine's tokenizer loader reads tokenizer/vocab.json +
+            # merges.txt and cannot parse the fused HF tokenizer.json. Models
+            # that ship only tokenizer.json (e.g. ideogram-4-fp8) would fail at
+            # load with "Failed to open vocab.json"; derive the split files from
+            # the model's own tokenizer.json here. Path-independent: this is the
+            # single create chokepoint, so it covers raw model dirs that bypass
+            # the format-adapter staging. Idempotent (no-op once split present).
+            self._ensure_engine_tokenizer(cfg.get("model_dir", ""))
+
             # Build create command
             create_cmd = {
                 "cmd": "create",
@@ -1247,6 +1339,21 @@ class WorkerManager:
             logging.info("[QuantFunc] Pipeline ready (%d loaded).", len(self._loaded_keys))
             return key
 
+    @staticmethod
+    def _ensure_engine_tokenizer(model_dir):
+        """Backfill engine-native vocab.json/merges.txt from a fused
+        tokenizer.json when a model dir ships only the latter. Best-effort +
+        idempotent; never raises (model load proceeds and the engine reports if
+        the tokenizer is genuinely absent)."""
+        if not model_dir:
+            return
+        try:
+            from .format_adapters.tools.hf_layout import ensure_engine_tokenizer
+            ensure_engine_tokenizer(os.path.join(model_dir, "tokenizer"))
+        except Exception as e:
+            logging.getLogger("QuantFunc").debug(
+                "tokenizer split-file ensure skipped for %s: %s", model_dir, e)
+
     def _set_api_key_locked(self, cache_key, api_key):
         """Internal: set API key while already holding self._lock."""
         cmd = {
@@ -1260,8 +1367,11 @@ class WorkerManager:
         logging.info("[QuantFunc] API key updated (hot-swap).")
 
     def text_to_image(self, cache_key, prompt, height, width, steps, seed,
-                      guidance_scale, options_json=None, pbar=None):
-        """Generate text-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
+                      guidance_scale, options_json=None, pbar=None,
+                      latent_preview=None):
+        """Generate text-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
+        `latent_preview` (dict with max_size/every_n_steps, already injected into
+        options_json by the caller) enables per-step live preview."""
         with self._lock:
             self._ensure_worker()
             # Print the worker log path on EVERY generation (the worker persists
@@ -1272,9 +1382,7 @@ class WorkerManager:
             # Before running, make sure only the target pipeline is GPU-resident
             self._unload_others_locked(keep_key=cache_key)
 
-            def on_progress(step, total):
-                if pbar is not None:
-                    pbar.update(1)
+            on_progress, on_preview = _make_progress_preview_cbs(pbar, latent_preview)
 
             cmd = {
                 "cmd": "text_to_image",
@@ -1288,18 +1396,98 @@ class WorkerManager:
                 "seed": seed,
                 "options_json": options_json,
             }
+            if latent_preview:
+                cmd["latent_preview"] = True
 
-            resp = self._call(cmd, progress_cb=on_progress, timeout=600)
+            resp = self._call(cmd, progress_cb=on_progress,
+                              preview_cb=on_preview, timeout=600)
             return self._read_image(resp)
+
+    def text_to_video(self, cache_key, prompt, height, width, steps, seed,
+                      guidance_scale, num_frames, options_json=None, pbar=None):
+        """#344 — LTX-2 text-to-video (+ audio). Returns (frames, audio) where
+        frames is a [N, H, W, 3] float32 numpy array and audio is None or
+        {"waveform": np[C, N], "sample_rate": int}."""
+        with self._lock:
+            self._ensure_worker()
+            self._unload_others_locked(keep_key=cache_key)
+            on_progress, _ = _make_progress_preview_cbs(pbar, None)
+            # num_frames/fps ride in options_json (mirrors the C-API t2v contract).
+            opts = json.loads(options_json) if options_json else {}
+            opts["num_frames"] = int(num_frames)
+            cmd = {
+                "cmd": "text_to_video",
+                "req_id": self._next_req_id(),
+                "cache_key": cache_key,
+                "prompt": prompt,
+                "height": height,
+                "width": width,
+                "num_steps": steps,
+                "guidance_scale": guidance_scale,
+                "seed": seed,
+                "options_json": json.dumps(opts),
+            }
+            resp = self._call(cmd, progress_cb=on_progress, timeout=1800)
+            return self._read_video(resp)
+
+    def _read_video(self, resp):
+        """Read frames (+ optional audio) from a text_to_video response."""
+        n = int(resp.get("num_frames", 0))
+        w = int(resp.get("width", 0)); h = int(resp.get("height", 0))
+        if n == 0 or w == 0 or h == 0:
+            raise RuntimeError("No video frames in response")
+        _MAX = 16384
+        if w > _MAX or h > _MAX or n > 100000:
+            raise RuntimeError(f"Worker reported implausible video {n}x{w}x{h}")
+        nbytes = n * h * w * 3
+        fpath = resp.get("frame_shm_path")
+        if not fpath:
+            raise RuntimeError("No frame_shm_path in video response")
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read(nbytes)
+        finally:
+            try: os.unlink(fpath)
+            except OSError: pass
+        if len(raw) != nbytes:
+            raise RuntimeError(f"Video frame bytes {len(raw)} != expected {nbytes}")
+        frames = (np.frombuffer(raw, dtype=np.uint8).reshape(n, h, w, 3).astype(np.float32) / 255.0)
+        # Audio (None for video-only). Worker buffer is PLANAR/channel-major [C, N].
+        audio = None
+        a = resp.get("audio")
+        if a:
+            ch = int(a["channels"]); ns = int(a["num_samples"]); sr = int(a["sample_rate"])
+            ap = a.get("shm_path")
+            # Sanity-bound the engine-reported sizes before allocating (mirror the
+            # frame guard) — a corrupt response must not drive a huge np/file alloc.
+            if ap and 0 < ch <= 64 and 0 < ns <= 100_000_000:
+                want = ch * ns * 4  # float32
+                try:
+                    with open(ap, "rb") as f:
+                        araw = f.read(want)
+                finally:
+                    try: os.unlink(ap)
+                    except OSError: pass
+                if len(araw) == want:
+                    wav = np.frombuffer(araw, dtype=np.float32).reshape(ch, ns)
+                    audio = {"waveform": wav, "sample_rate": sr}
+                else:
+                    print(f"[QuantFunc] video audio partial read "
+                          f"({len(araw)}/{want} bytes) — dropping audio", file=sys.stderr)
+            elif ap:
+                print(f"[QuantFunc] implausible audio dims ch={ch} ns={ns} "
+                      f"— dropping audio", file=sys.stderr)
+        return frames, audio
 
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=1.0, negative_prompt="",
                        options_json=None, pbar=None,
                        mask_path=None, mask_strength=1.0, mask_grow=6,
-                       mask_blur=0.0, mask_no_snap=False):
+                       mask_blur=0.0, mask_no_snap=False, latent_preview=None):
         """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
         Optional inpaint: pass `mask_path` to a pixel-space mask PNG (white=inpaint, black=preserve).
         Mirrors ComfyUI SetLatentNoiseMask + GrowMask + MaskBlur + VAEEncodeForInpaint.grow_mask_by.
+        `latent_preview` enables per-step live preview (config already in options_json).
         """
         with self._lock:
             self._ensure_worker()
@@ -1311,9 +1499,7 @@ class WorkerManager:
             # Before running, make sure only the target pipeline is GPU-resident
             self._unload_others_locked(keep_key=cache_key)
 
-            def on_progress(step, total):
-                if pbar is not None:
-                    pbar.update(1)
+            on_progress, on_preview = _make_progress_preview_cbs(pbar, latent_preview)
 
             cmd = {
                 "cmd": "image_to_image",
@@ -1335,8 +1521,11 @@ class WorkerManager:
                 cmd["mask_grow"] = int(mask_grow)
                 cmd["mask_blur"] = float(mask_blur)
                 cmd["mask_no_snap"] = bool(mask_no_snap)
+            if latent_preview:
+                cmd["latent_preview"] = True
 
-            resp = self._call(cmd, progress_cb=on_progress, timeout=600)
+            resp = self._call(cmd, progress_cb=on_progress,
+                              preview_cb=on_preview, timeout=600)
             return self._read_image(resp)
 
     def export_model(self, cfg, export_path):
@@ -1356,6 +1545,10 @@ class WorkerManager:
             sched = cfg.get("scheduler", "")
             if sched:
                 opts["scheduler_config"] = sched
+
+            # Same tokenizer split-file backfill as the create path: export also
+            # loads the model and needs vocab.json/merges.txt for the engine.
+            self._ensure_engine_tokenizer(cfg.get("model_dir", ""))
 
             cmd = {
                 "cmd": "export",
@@ -1670,11 +1863,11 @@ class QuantFuncPipelineConfig:
                                   "tooltip": "Vision encoder quantization (int8 = INT8 weights + FP16 compute, best quality/size tradeoff)"}),
                 "vae_precision": (["auto", "fp16", "fp8", "int8"], {"default": "auto",
                                   "tooltip": "VAE precision (auto picks fp8/int8 on SM120+ via cuDNN, falls back to fp16 elsewhere)"}),
-                "act_quant_mode": (["auto", "absmax", "mse"], {"default": "auto",
+                "act_quant_mode": (["absmax", "auto", "mse"], {"default": "absmax",
                                   "tooltip": "Activation quantization scale algorithm (Lighting backend, INT4 only):\n"
-                                             "• auto — engine picks: MSE-search when rotation>0 (best quality), else absmax\n"
-                                             "• absmax — fast, scale = absmax/7\n"
-                                             "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)\n"
+                                             "• absmax (default) — fast single-pass, scale = absmax/7\n"
+                                             "• auto — engine picks: MSE-search when rotation>0, else absmax\n"
+                                             "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower load)\n"
                                              "FP4 / INT8 / FP8 ignore this setting (kernel uses its own scaling)."}),
             },
             "optional": {
@@ -2229,6 +2422,203 @@ def _get_lora_file_options():
     return ["None"]
 
 
+def _get_controlnet_options():
+    """Scan ComfyUI/models/controlnet/ for ControlNet weights (#324), mirroring
+    ComfyUI's single-file convention (and the LoRA scanner).
+
+    A ControlNet is a standalone `.safetensors` checkpoint — the engine loads a
+    single file directly. We therefore list every `.safetensors` (recursive),
+    PLUS any subdir that ships a `config.json` (e.g. InstantX Qwen-ControlNet-
+    Union, whose config.json carries the exact injection topology) — for those
+    we list the DIRECTORY so the engine reads config.json (its nested weight is
+    not double-listed). Selecting either works: the engine's loader accepts a
+    file OR a directory.
+    """
+    entries = []
+    try:
+        import folder_paths
+        # ComfyUI-registered single-file checkpoints — honors EVERY registered
+        # controlnet location (models/controlnet AND models/t2i_adapter) and a
+        # custom --base-directory, exactly like ComfyUI's own ControlNetLoader.
+        entries.extend(folder_paths.get_filename_list("controlnet"))
+        # Plus InstantX-style model DIRECTORIES (ship config.json), which
+        # get_filename_list doesn't enumerate — scan each registered base.
+        for base in folder_paths.get_folder_paths("controlnet"):
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base)):
+                full = os.path.join(base, name)
+                if os.path.isdir(full) and os.path.exists(os.path.join(full, "config.json")):
+                    entries.append(name)
+    except Exception:
+        # Fallback: folder_paths unavailable → manual scan of the default dir.
+        try:
+            cn_dir = os.path.join(_get_comfyui_dir(), "models", "controlnet")
+            for root, _, files in os.walk(cn_dir):
+                for f in files:
+                    if f.endswith(".safetensors"):
+                        entries.append(os.path.relpath(
+                            os.path.join(root, f), cn_dir).replace("\\", "/"))
+        except Exception:
+            pass
+    return (["None"] + sorted(dict.fromkeys(entries))) if entries else ["None"]
+
+
+def _resolve_controlnet_selection(name):
+    """Resolve a ControlNet dropdown selection to an absolute path via ComfyUI's
+    folder_paths (traversal-safe, base-dir + t2i_adapter aware). Handles both
+    single-file entries and InstantX-style config DIRECTORIES. Returns "" if not
+    found (so a tampered/`../` workflow value can't escape the registered bases)."""
+    try:
+        import folder_paths
+        p = folder_paths.get_full_path("controlnet", name)  # validates containment
+        if p and os.path.exists(p):
+            return p
+        for base in folder_paths.get_folder_paths("controlnet"):
+            rbase = os.path.realpath(base)
+            cand = os.path.realpath(os.path.join(base, name))
+            if (cand == rbase or cand.startswith(rbase + os.sep)) and os.path.isdir(cand):
+                return cand
+    except Exception:
+        pass
+    rbase = os.path.realpath(os.path.join(_get_comfyui_dir(), "models", "controlnet"))
+    cand = os.path.realpath(os.path.join(rbase, name))
+    if (cand == rbase or cand.startswith(rbase + os.sep)) and os.path.exists(cand):
+        return cand
+    return ""
+
+
+def _write_qfraw_image(img_tensor, staging_dir):
+    """Write a ComfyUI IMAGE tensor ([B,H,W,3] or [H,W,3], float [0,1]) as a
+    'QFRAW01' raw-RGB blob that the engine's ImageUtils::load_image reads
+    directly, skipping cv::imread. The binary layout is identical to the
+    ref-image staging loop; this helper intentionally uses a pure-numpy
+    conversion (a single control image doesn't need that loop's cv2 SIMD
+    fast-path). Returns the temp file path; the caller MUST unlink it. None on
+    failure.
+    """
+    try:
+        t = img_tensor
+        if hasattr(t, "dim") and t.dim() == 4:
+            t = t[0]
+        arr_f32 = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+        img_np = (np.clip(arr_f32, 0.0, 1.0) * 255.0).astype(np.uint8)
+        h, w = int(img_np.shape[0]), int(img_np.shape[1])
+        fd, path = tempfile.mkstemp(suffix=".qfraw", dir=staging_dir)
+        os.close(fd)
+        header = b"QFRAW01\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+        with open(path, "wb") as f:
+            f.write(header)
+            f.write(img_np.tobytes())
+        return path
+    except Exception as e:
+        logging.warning("[QuantFunc] control image staging failed: %s", e)
+        return None
+
+
+# ControlNet family → (_class_name for the engine's backend matcher, controlnet_arch).
+# Keep this in sync with `_detect_controlnet_class` (the auto-sniff path): both
+# express the same family→class mapping (one keyed by the arch dropdown, the
+# other by safetensors keys).
+_CONTROLNET_ARCH_TO_CLASS = {
+    "instantx_qwen": ("QwenImageControlNetModel", None),
+    "pai-fun": ("QwenImageControlTransformer2DModel", "pai-fun"),
+    "zimage-fun": (None, "zimage-fun"),
+}
+
+
+def _detect_controlnet_class(safetensors_path):
+    """Sniff a ControlNet checkpoint's safetensors header keys to identify its
+    family → (_class_name, controlnet_arch). Cheap: reads only the JSON header.
+    Returns (None, None) if unknown."""
+    try:
+        import struct
+        with open(safetensors_path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            # safetensors key-headers are a few KB; cap the read so a crafted /
+            # corrupt length can't trigger a multi-GB allocation (DoS).
+            if n <= 0 or n > 100 * 1024 * 1024:
+                return (None, None)
+            hdr = json.loads(f.read(n))
+        joined = "\n".join(k for k in hdr if k != "__metadata__")
+        # Order matters — most-specific marker first. ZImage is keyed on its
+        # distinctive two-stream `control_noise_refiner` (NOT the ambiguous
+        # `control_layers`, which can also appear in PAI Fun checkpoints).
+        if "controlnet_x_embedder" in joined or "controlnet_blocks" in joined:
+            return ("QwenImageControlNetModel", None)               # InstantX
+        if "control_noise_refiner" in joined:
+            return (None, "zimage-fun")                             # ZImage Fun (two-stream)
+        if "control_" in joined:
+            return ("QwenImageControlTransformer2DModel", "pai-fun")  # PAI Fun-Control
+    except Exception as e:
+        logging.warning("[QuantFunc] ControlNet family sniff failed: %s", e)
+    return (None, None)
+
+
+def _resolve_controlnet_model(model_path, arch):
+    """Return a ControlNet model path the engine can load.
+
+    The engine reads `<model>/config.json` ONLY when `model` is a DIRECTORY; a
+    bare single-file ControlNet has no readable config.json, so the engine leaves
+    its `cn_config` JSON-null and crashes in the backend matcher (json value() on
+    null), AND InstantX can't be matched without `_class_name`. So for a single
+    FILE we STAGE a tiny directory: a symlink to the weight (named
+    diffusion_pytorch_model.safetensors) + a synthesized config.json carrying the
+    family's `_class_name`/`controlnet_arch` (the InstantX topology already
+    matches the engine defaults). A sibling config.json, if present, is copied
+    verbatim. Directories pass through unchanged. (Note: for ZImage Fun the
+    pipeline forces its arch from the BASE transformer config, so the staged
+    config.json is harmlessly unused there — the symlinked weight is what loads.)"""
+    try:
+        if not model_path or not os.path.isfile(model_path):
+            return model_path  # dir (or missing) → engine handles it
+        # Prefer a real sibling config.json; else synthesize from arch / sniff.
+        sibling = os.path.join(os.path.dirname(model_path), "config.json")
+        cfg_out = None
+        if os.path.exists(sibling):
+            try:
+                with open(sibling) as _f:
+                    cfg_out = json.load(_f)
+            except Exception:
+                cfg_out = None
+        if cfg_out is None:
+            if arch and arch != "auto":
+                cls_name, cn_arch = _CONTROLNET_ARCH_TO_CLASS.get(arch, (None, None))
+            else:
+                cls_name, cn_arch = _detect_controlnet_class(model_path)
+            cfg_out = {}
+            if cls_name:
+                cfg_out["_class_name"] = cls_name
+            if cn_arch:
+                cfg_out["controlnet_arch"] = cn_arch
+        # Stable staging dir keyed by (abspath, mtime, arch) — idempotent reuse.
+        st = os.stat(model_path)
+        key = hashlib.sha256(
+            "{}|{}|{}".format(os.path.abspath(model_path), int(st.st_mtime), arch).encode()
+        ).hexdigest()[:16]
+        stage_root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "cache", "controlnet_staging")
+        stage_dir = os.path.join(stage_root, key)
+        os.makedirs(stage_dir, exist_ok=True)
+        link = os.path.join(stage_dir, "diffusion_pytorch_model.safetensors")
+        try:
+            if not os.path.lexists(link):
+                os.symlink(os.path.abspath(model_path), link)
+        except FileExistsError:
+            pass  # concurrent stage created it; same key → same target, harmless
+        # Always write SOME config.json so cn_config is a non-null object even for
+        # an unknown family (turns the engine's value()-on-null crash into a clean
+        # "no backend matched" at worst).
+        with open(os.path.join(stage_dir, "config.json"), "w") as _f:
+            json.dump(cfg_out, _f, indent=2)
+        logging.info("[QuantFunc] ControlNet staged %s → %s (config=%s)",
+                     os.path.basename(model_path), stage_dir, cfg_out)
+        return stage_dir
+    except Exception as e:
+        logging.warning("[QuantFunc] ControlNet staging failed (%s); using raw path", e)
+        return model_path
+
+
 class QuantFuncLoRAAutoLoader:
     """Auto-load LoRA weights from models/QuantFunc/lora/ directory.
 
@@ -2307,6 +2697,171 @@ class QuantFuncLoRALoader:
             cfg["options"]["lora"] = loras
 
         return (cfg,)
+
+
+_CONTROLNET_ARCHS = ["auto", "instantx_qwen", "pai-fun", "zimage-fun"]
+# Engine ControlNet is implemented ONLY for these main-pipeline families
+# (instantx_qwen/pai-fun → QwenImage; zimage-fun → ZImage). On any other pipeline
+# (Flux2Klein / Ideogram4) the `controlnet` option is a silent no-op, so we warn.
+_CONTROLNET_SUPPORTED_ARCH_PREFIXES = ("QwenImage", "ZImage")
+_CONTROLNET_ARCH_TOOLTIP = (
+    "ControlNet architecture. 'auto' = the engine detects it from the model's\n"
+    "config / _class_name (recommended). Force one only if auto mis-detects:\n"
+    "  instantx_qwen — InstantX Qwen-Image ControlNet (Union: canny/depth/pose/…)\n"
+    "  pai-fun — PAI Qwen-Image Fun-Control\n"
+    "  zimage-fun — Z-Image Fun-Control"
+)
+
+
+def _apply_controlnet_cfg(pipeline, model_path, arch):
+    """Inject a single ControlNet model into the pipeline config (load-time),
+    mirroring the LoRA loader's pipeline→pipeline pass-through. The engine reads
+    component_opts['controlnet'] = {model, arch?} at create and AUTOMATICALLY
+    uses the pipeline's own transformer as the ControlNet's base (no separate
+    base_transformer needed — it's the same model you loaded in the model loader)."""
+    cfg = dict(pipeline)
+    cfg["options"] = dict(cfg.get("options", {}))
+    if model_path:
+        # Guard: warn loudly when the running pipeline can't use ControlNet so a
+        # wired ControlNet doesn't silently do nothing. The engine implements it
+        # only for QwenImage + ZImage; on Klein / Ideogram it is a no-op. We only
+        # warn when the pipeline arch is KNOWN and unsupported (never false-warn).
+        pl_arch = str(cfg.get("_arch", ""))
+        if pl_arch and not any(pl_arch.startswith(p) for p in _CONTROLNET_SUPPORTED_ARCH_PREFIXES):
+            logging.warning(
+                "[QuantFunc] ControlNet is NOT supported for '%s' pipelines — the "
+                "engine implements ControlNet only for QwenImage and ZImage, so this "
+                "ControlNet will be IGNORED. (controlnet=%s)", pl_arch, model_path)
+        # A single-file ControlNet has no engine-readable config.json → stage a
+        # dir (symlink + synthesized config.json with _class_name) so the engine
+        # can match + load it. Directories pass through unchanged.
+        model_path = _resolve_controlnet_model(model_path, arch)
+        cn = {"model": model_path}
+        if arch and arch != "auto":
+            cn["arch"] = arch
+        cfg["options"]["controlnet"] = cn
+    else:
+        # Empty path == detach any ControlNet previously chained in.
+        cfg["options"].pop("controlnet", None)
+    return (cfg,)
+
+
+class QuantFuncControlNetLoader:
+    """Attach a ControlNet to the pipeline (#324). Flow mirrors the LoRA loader:
+    wire a QUANTFUNC_PIPELINE in, give the ControlNet weights path, get a
+    QUANTFUNC_PIPELINE out. The engine loads ONE ControlNet; the control IMAGE +
+    type + scale are per-generate on the Generate node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("QUANTFUNC_PIPELINE",),
+                "controlnet_path": ("STRING", {"default": "",
+                    "tooltip": "Path to a ControlNet .safetensors checkpoint (standalone "
+                               "weight, like ComfyUI), or an InstantX model directory "
+                               "(ships config.json for the exact topology)."}),
+                "arch": (_CONTROLNET_ARCHS, {"default": "auto", "tooltip": _CONTROLNET_ARCH_TOOLTIP}),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "add_controlnet"
+    CATEGORY = "QuantFunc"
+
+    def add_controlnet(self, pipeline, controlnet_path, arch="auto"):
+        return _apply_controlnet_cfg(pipeline, controlnet_path, arch)
+
+
+class QuantFuncControlNetAutoLoader:
+    """Auto-load a ControlNet from ComfyUI/models/controlnet/ (#324). Scans that
+    folder for .safetensors checkpoints (and InstantX config-dirs) and offers a
+    dropdown. Flow mirrors the LoRA Auto Loader (pipeline in → pipeline out).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        cn_opts = _get_controlnet_options()
+        return {
+            "required": {
+                "pipeline": ("QUANTFUNC_PIPELINE",),
+                "controlnet": (cn_opts, {"tooltip": "ControlNet weights from models/controlnet/"}),
+                "arch": (_CONTROLNET_ARCHS, {"default": "auto", "tooltip": _CONTROLNET_ARCH_TOOLTIP}),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "add_controlnet"
+    CATEGORY = "QuantFunc"
+
+    def add_controlnet(self, pipeline, controlnet, arch="auto"):
+        model_path = ""
+        if controlnet and controlnet != "None":
+            model_path = _resolve_controlnet_selection(controlnet)
+            if not model_path:
+                raise RuntimeError("ControlNet model not found: {}".format(controlnet))
+        return _apply_controlnet_cfg(pipeline, model_path, arch)
+
+
+class QuantFuncControlImage:
+    """ControlNet control input (#324). This node LOADS the control map image and
+    CONFIGURES how the ControlNet uses it (type / strength / guidance window),
+    then bundles them into one `control_image` output. Wire that output into the
+    QuantFunc Generate node's `control_image` input. The ControlNet MODEL itself
+    is loaded separately via 'QuantFunc ControlNet Loader' into the pipeline.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {
+                    "tooltip": "The control map — e.g. a canny / depth / pose image "
+                               "(from a preprocessor or Load Image)."}),
+                "control_type": (["canny", "depth", "pose", "soft_edge"], {
+                    "default": "canny",
+                    "tooltip": "What kind of control map `image` is (union ControlNets accept "
+                               "any of these). Must match the map you feed in."}),
+                "control_scale": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "ControlNet conditioning strength (0 = off). ⚠ Too HIGH washes "
+                               "out / noises the image: the engine applies the control residual "
+                               "strongly, and few-step LIGHTING models amplify it further.\n"
+                               "Recommended START values (raise gradually for stronger control):\n"
+                               "  PAI Fun-Control  ~0.2-0.4 (1.0 → pure noise on a lighting model)\n"
+                               "  InstantX / ZImage ~0.5-0.9\n"
+                               "If the output is washed-out/noisy, LOWER this first."}),
+            },
+            "optional": {
+                "control_guidance_start": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Inject control only from this fraction of the schedule "
+                               "onward (diffusers control_guidance_start). 0 = first step."}),
+                "control_guidance_end": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Stop injecting control after this fraction (diffusers "
+                               "control_guidance_end). 1 = last step. Lower (e.g. 0.7) to "
+                               "cut late-step control grain on long runs."}),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_CONTROL",)
+    RETURN_NAMES = ("control_image",)
+    FUNCTION = "build"
+    CATEGORY = "QuantFunc"
+
+    def build(self, image, control_type, control_scale,
+              control_guidance_start=0.0, control_guidance_end=1.0):
+        return ({
+            "image": image,
+            "control_type": str(control_type),
+            "control_scale": float(control_scale),
+            "control_guidance_start": float(control_guidance_start),
+            "control_guidance_end": float(control_guidance_end),
+        },)
 
 
 # ============================================================================
@@ -2406,21 +2961,153 @@ class QuantFuncGenerate:
                 "ref_images": ("QUANTFUNC_IMAGE_LIST", {"tooltip": "Reference images for edit mode (from ImageList node)"}),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True}),
                 "true_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0, "step": 0.1, "tooltip": "Classical CFG (needs a negative prompt). 1.0 = OFF (default) — correct for distilled / few-step models. Raise (e.g. 4.0) only for base / non-distilled models."}),
-                "sampler_name": (["euler", "heun", "dpm++2m", "dpm++2m_sde", "euler_a", "ddim"], {
+                "sampler_name": ([
+                    # --- deterministic (names match ComfyUI KSAMPLER_NAMES) ---
+                    "euler", "heun", "heunpp2", "dpmpp_2m", "lms",
+                    # --- stochastic / ancestral ---
+                    "dpmpp_2m_sde", "euler_ancestral", "ddim",
+                    # --- 2nd-pass: new deterministic ---
+                    "dpm_2", "ipndm", "ipndm_v", "res_multistep", "gradient_estimation",
+                    # --- 2nd-pass: new stochastic / ancestral ---
+                    "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_sde",
+                    "dpmpp_3m_sde", "dpmpp_2m_sde_heun",
+                    # --- distilled / consistency ---
+                    "lcm", "res_multistep_ancestral",
+                    # --- SA-Solver (stochastic Adams predictor-corrector) ---
+                    "sa_solver", "sa_solver_pece",
+                ], {
                     "default": "euler",
-                    "tooltip": "Sampling algorithm:\n"
-                               "• euler — 1st order, fast, deterministic\n"
-                               "• heun — 2nd order, higher quality, 2x slower\n"
-                               "• dpm++2m — 2nd order multistep, deterministic\n"
-                               "• dpm++2m_sde — dpm++2m + noise (use sampler_eta)\n"
-                               "• euler_a — euler + noise (use sampler_eta)\n"
-                               "• ddim — classic DDIM, deterministic (eta=0) or stochastic (eta>0)",
+                    "tooltip": (
+                        "Sampling algorithm (#326 — 23 samplers).\n"
+                        "\n"
+                        "DETERMINISTIC (no eta/s_noise effect):\n"
+                        "  euler — 1st order, fast\n"
+                        "  heun — 2nd order, 2x slower\n"
+                        "  heunpp2 — Heun++ (up to 3rd order)\n"
+                        "  dpmpp_2m — 2nd-order multistep (recommended for quality)\n"
+                        "  dpm_2 — DPM-Solver 2nd order (2 NFE/step)\n"
+                        "  lms — linear multistep (use sampler_solver_order 1-4)\n"
+                        "  ipndm / ipndm_v — Adams implicit multistep\n"
+                        "  res_multistep — RES 2nd-order multistep\n"
+                        "  gradient_estimation — Euler + gradient momentum\n"
+                        "  ddim — DDIM (eta=0: deterministic)\n"
+                        "\n"
+                        "STOCHASTIC / ANCESTRAL (use sampler_eta + sampler_s_noise):\n"
+                        "  euler_ancestral — Euler ancestral\n"
+                        "  dpm_2_ancestral — DPM-2 ancestral\n"
+                        "  dpmpp_2s_ancestral — DPM++(2S) ancestral\n"
+                        "  dpmpp_sde — DPM++(SDE) stochastic\n"
+                        "  dpmpp_2m_sde — DPM++(2M) SDE\n"
+                        "  dpmpp_2m_sde_heun — dpmpp_2m_sde + Heun corrector\n"
+                        "  dpmpp_3m_sde — DPM++(3M) SDE\n"
+                        "  res_multistep_ancestral — RES 2nd-order + noise\n"
+                        "  lcm — LCM (distilled / lightning models)\n"
+                        "\n"
+                        "SA-SOLVER (use sampler_eta, sampler_s_noise,\n"
+                        "           sampler_predictor_order, sampler_corrector_order):\n"
+                        "  sa_solver — stochastic Adams predictor\n"
+                        "  sa_solver_pece — sa_solver + corrector eval\n"
+                    ),
                 }),
                 "sampler_eta": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Noise scale for stochastic samplers (dpm++2m_sde, euler_a, ddim).\n"
-                               "0 = deterministic (no effect). Only used by stochastic samplers.\n"
-                               "Recommended 0.2~0.5 for ≤20 steps. Higher eta needs more steps.",
+                    "tooltip": (
+                        "Noise scale (eta) for stochastic samplers.\n"
+                        "0 = deterministic (no effect on deterministic samplers).\n"
+                        "Applies to: euler_ancestral, dpm_2_ancestral, dpmpp_2s_ancestral,\n"
+                        "  dpmpp_sde, dpmpp_2m_sde*, dpmpp_3m_sde, ddim, sa_solver*.\n"
+                        "Recommended: 0.3~0.7 for 20+ steps; higher eta needs more steps."
+                    ),
+                }),
+                "sampler_s_noise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": (
+                        "SDE noise multiplier (s_noise). Default 1.0 = ComfyUI default.\n"
+                        "Only used by SDE / ancestral samplers (same list as eta).\n"
+                        "0 = no noise injection. >1 = more stochastic (grainier).\n"
+                        "Mirrors ComfyUI SamplerDPMPP_SDE / SamplerDPMPP_2M_SDE s_noise."
+                    ),
+                }),
+                "sampler_solver_order": ("INT", {
+                    "default": 4, "min": 1, "max": 4, "step": 1,
+                    "tooltip": (
+                        "Multistep order for lms (Adams-Bashforth order 1-4).\n"
+                        "Only used by: lms (caps the linear-multistep history).\n"
+                        "Default 4 = ComfyUI default. Lower order = faster, less accurate."
+                    ),
+                }),
+                "sampler_predictor_order": ("INT", {
+                    "default": 3, "min": 1, "max": 4, "step": 1,
+                    "tooltip": (
+                        "SA-Solver predictor Adams order (1-4). Default 3 = ComfyUI default.\n"
+                        "Only used by: sa_solver, sa_solver_pece.\n"
+                        "Higher order = more accurate but needs more history steps."
+                    ),
+                }),
+                "sampler_corrector_order": ("INT", {
+                    "default": 4, "min": 1, "max": 4, "step": 1,
+                    "tooltip": (
+                        "SA-Solver corrector Adams order (1-4). Default 4 = ComfyUI default.\n"
+                        "Only used by: sa_solver, sa_solver_pece.\n"
+                        "Higher order = more accurate correction step."
+                    ),
+                }),
+                "scheduler": ([
+                    # ComfyUI SCHEDULER_HANDLERS — 9 types (#334). `normal` is the
+                    # shipped anchor (native FlowMatchEuler flow curve, byte-identical
+                    # to legacy → zero regression). The other 8 reshape the sigma CURVE
+                    # from the same flow sigma(t) + the model's sigma table.
+                    "normal", "karras", "exponential", "sgm_uniform", "simple",
+                    "ddim_uniform", "beta", "linear_quadratic", "kl_optimal",
+                ], {
+                    "default": "normal",
+                    "tooltip": (
+                        "Noise SCHEDULE — the sigma CURVE shape (#334). Orthogonal to\n"
+                        "the sampler (sampler = how to integrate each step; scheduler =\n"
+                        "what the sigma curve looks like). Names match ComfyUI's\n"
+                        "scheduler dropdown exactly.\n"
+                        "\n"
+                        "  normal — native FlowMatchEuler flow curve (default, unchanged)\n"
+                        "  karras — Karras et al. 2022 (rho=7)\n"
+                        "  exponential — geometric (exp-linspace) spacing in sigma\n"
+                        "  sgm_uniform — ComfyUI normal(sgm=True)\n"
+                        "  simple — stride the model's own sigma table\n"
+                        "  ddim_uniform — uniform index stride (DDIM)\n"
+                        "  beta — beta.ppf(a=b=0.6) over the sigma table\n"
+                        "  linear_quadratic — ComfyUI linear-quadratic (Mochi)\n"
+                        "  kl_optimal — KL-optimal schedule (sd-webui #15608)\n"
+                        "\n"
+                        "NOTE: distilled / few-step models on explicit-sigma schedules\n"
+                        "(e.g. Klein) IGNORE the scheduler TYPE; it shapes the curve for\n"
+                        "base models on the set_timesteps(mu) path (QwenImage / ZImage)."
+                    ),
+                }),
+                "control_image": ("QUANTFUNC_CONTROL", {
+                    "tooltip": "ControlNet control input (#324) from a 'QuantFunc Control "
+                               "Image' node (it carries the control map + type + strength + "
+                               "guidance). Requires a ControlNet loaded via 'QuantFunc "
+                               "ControlNet Loader'. t2i ONLY (ignored on edit / img2img)."}),
+                "fbcache": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 0.3, "step": 0.01,
+                    "tooltip": (
+                        "FBCache — First-Block Cache (TeaCache-style step skipping). "
+                        "Speeds up generation by reusing the transformer's cached "
+                        "block-1..N residual on steps where the model is changing "
+                        "little.\n\n"
+                        "Value = the ACCUMULATED relative-L1 change budget of block-0's "
+                        "output. While the running sum stays BELOW this, the remaining "
+                        "transformer blocks are SKIPPED for that step (cheap reuse); "
+                        "once it crosses, a full step runs and the budget resets.\n\n"
+                        "0.0 = OFF (default, bit-exact).  Higher = more steps skipped = "
+                        "faster but progressively LOSSY (softer / less prompt-faithful). "
+                        "Typical 0.03-0.12; tune per model + step count (few-step "
+                        "distilled models need a smaller value).\n\n"
+                        "Create-time knob: the engine reads it PER MODEL FAMILY "
+                        "(QwenImage / ZImage / Ideogram4 / Wan lighting). The active "
+                        "model auto-consumes the matching key; families with no FBCache "
+                        "path (e.g. Klein) ignore it. Changing this value recreates the "
+                        "pipeline."
+                    ),
                 }),
                 "activate_unload": ("BOOLEAN", {
                     "default": False,
@@ -2439,21 +3126,65 @@ class QuantFuncGenerate:
                                "$QUANTFUNC_BACKUP_DIR / $TMPDIR / /var/tmp / /tmp while "
                                "the pipeline is alive (unlinked on clean exit).",
                 }),
+                "ideogram4_sampler": ("STRING", {
+                    "default": "",
+                    "tooltip": (
+                        "Ideogram-4 ADVANCED sampler override (optional; leave EMPTY "
+                        "for the default — you normally only set 'steps').\n\n"
+                        "By DEFAULT Ideogram-4 auto-selects the official sampler preset "
+                        "from your step count: steps<=12 -> TURBO, <=20 -> DEFAULT, "
+                        "<=48 -> QUALITY (sets mu/std/cleanup_steps/cleanup_gw for you; "
+                        ">48 clamps to QUALITY).\n\n"
+                        "Power users: paste a JSON object to OVERRIDE individual preset "
+                        "params, e.g. {\"ideogram4_mu\": 0.2, \"ideogram4_std\": 1.6, "
+                        "\"ideogram4_cleanup_steps\": 2, \"ideogram4_cleanup_gw\": 3.0}. "
+                        "Only the keys you supply override the auto-selected tier; the "
+                        "rest stay on-tier. Ignored by non-Ideogram models. Empty = "
+                        "pure auto (byte-identical default path)."
+                    ),
+                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "QF_LATENT_PREVIEW")
+    RETURN_NAMES = ("image", "latent_preview")
     OUTPUT_NODE = True
     FUNCTION = "generate"
     CATEGORY = "QuantFunc"
+
+    # Legacy sampler names the engine still accepts (the dropdown was renamed to
+    # ComfyUI's canonical spelling). VALIDATE_INPUTS tolerates them so a workflow
+    # saved before the rename still queues instead of failing the COMBO check.
+    _LEGACY_SAMPLER_ALIASES = {"euler_a", "dpm++2m", "dpm++2m_sde"}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, sampler_name=None, **kwargs):
+        if sampler_name is None:
+            return True
+        # Resolve the dropdown list from whichever section holds sampler_name
+        # (it's "optional"), defensively — never KeyError if it's ever moved.
+        it = cls.INPUT_TYPES()
+        valid = set()
+        for section in ("optional", "required"):
+            spec = it.get(section, {}).get("sampler_name")
+            if spec:
+                valid = set(spec[0])
+                break
+        if sampler_name not in valid and sampler_name not in cls._LEGACY_SAMPLER_ALIASES:
+            return "Unknown sampler_name: {}".format(sampler_name)
+        return True
 
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=1.0,
                  sampler_name="euler", sampler_eta=0.0,
+                 sampler_s_noise=1.0, sampler_solver_order=4,
+                 sampler_predictor_order=3, sampler_corrector_order=4,
+                 scheduler="normal",
+                 control_image=None,
                  activate_unload=False, unload_mode=None, unload_every_time=None,
+                 fbcache=0.0, ideogram4_sampler="",
                  unique_id=None, workflow_prompt=None):
         # Backwards-compat with older saved workflows that used the
         # unload_mode dropdown or the unload_every_time bool: both are
@@ -2479,6 +3210,46 @@ class QuantFuncGenerate:
         # medium is baked in during warmup and can't be switched later
         # without a 13 GB re-pack.
         cfg["options"]["activate_unload"] = bool(activate_unload)
+        # FBCache (First-Block Cache, TeaCache-style step skipping) — a
+        # CREATE-TIME comp_opt the engine reads PER MODEL FAMILY
+        # (qwenimage_fbcache / zimage_fbcache / ideogram4_fbcache[/_cond] /
+        # wan_fbcache_thresh; all default 0.0 = OFF). Each key is consumed
+        # ONLY by its own model's factory, so a QwenImage pipeline reads
+        # qwenimage_fbcache and ignores the rest — setting every family key to
+        # the same value is model-agnostic and never enables FBCache on a model
+        # that isn't loaded. Only inject when ENABLED (>0): the default-off path
+        # leaves cfg["options"] byte-identical so it does NOT perturb the
+        # pipeline cache key / force a spurious recreate.
+        fbc = float(fbcache or 0.0)
+        if fbc > 0.0:
+            cfg["options"]["qwenimage_fbcache"] = fbc
+            cfg["options"]["zimage_fbcache"] = fbc
+            cfg["options"]["ideogram4_fbcache"] = fbc
+            cfg["options"]["ideogram4_fbcache_cond"] = fbc
+            cfg["options"]["wan_fbcache_thresh"] = fbc
+        # #347 Ideogram-4 advanced sampler override (optional). By default the
+        # engine auto-selects the official preset from `steps` (TURBO_12 /
+        # DEFAULT_20 / QUALITY_48) — the user sets ONLY steps. A power user may
+        # OVERRIDE individual preset params via this JSON; each supplied key is
+        # injected as a create-time comp_opt, which the engine treats as EXPLICIT
+        # (kept over the tier value) while absent keys stay on the auto-selected
+        # tier. Empty (default) leaves cfg["options"] untouched → pure auto, so
+        # the default path does NOT perturb the pipeline cache key.
+        _ideo_override = (ideogram4_sampler or "").strip()
+        if _ideo_override:
+            try:
+                _ov = json.loads(_ideo_override)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    "ideogram4_sampler must be a JSON object like "
+                    '{"ideogram4_mu": 0.0, "ideogram4_std": 1.5}; got: %s' % e)
+            if not isinstance(_ov, dict):
+                raise ValueError(
+                    "ideogram4_sampler must be a JSON OBJECT, got %s" % type(_ov).__name__)
+            for _k in ("ideogram4_mu", "ideogram4_std",
+                       "ideogram4_cleanup_steps", "ideogram4_cleanup_gw"):
+                if _k in _ov:
+                    cfg["options"][_k] = _ov[_k]
         # Unpack ImageList dict format
         ref_img_resize = "720"
         ref_img_resize_others = "720"
@@ -2544,11 +3315,25 @@ class QuantFuncGenerate:
         cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id,
                                              alive_node_ids=alive_ids)
 
-        # Create ComfyUI progress bar
+        # Latent preview is now a DOWNSTREAM viewer node wired to THIS node's
+        # `latent_preview` OUTPUT. Connecting one == enabling preview (it has no
+        # widgets). We (a) route the engine's per-step latent2rgb frames to ITS
+        # node id so the live preview renders THERE (not on this node) and
+        # (b) turn on the cheap engine-side preview decode with fixed defaults.
+        lp_node_id = _find_downstream_latent_preview(workflow_prompt, unique_id)
+        lp_cfg = ({"every_n_steps": 1, "max_size": 256, "method": "latent2rgb"}
+                  if lp_node_id is not None else None)
+
+        # Create ComfyUI progress bar. Route progress + preview frames to the
+        # connected viewer node when present; else default to this node.
         pbar = None
         try:
             from comfy.utils import ProgressBar
-            pbar = ProgressBar(steps)
+            try:
+                pbar = (ProgressBar(steps, node_id=lp_node_id)
+                        if lp_node_id else ProgressBar(steps))
+            except TypeError:
+                pbar = ProgressBar(steps)  # older ComfyUI: no node_id kwarg
         except Exception:
             pass
 
@@ -2563,6 +3348,7 @@ class QuantFuncGenerate:
         _staging_dir = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) else tempfile.gettempdir()
         tmp_paths = []
         mask_path = None
+        control_path = None  # #324 ControlNet staging blob (t2i); unlinked in finally
         try:
             if ref_images is not None:
                 # Write each ref image as a "QFRAW01" raw uint8 RGB blob to
@@ -2613,6 +3399,21 @@ class QuantFuncGenerate:
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
+                # Sampler modifier params (#326 node param surface). Emit
+                # each only when non-default so the engine log stays clean.
+                if sampler_s_noise != 1.0:
+                    i2i_opts["s_noise"] = sampler_s_noise
+                if sampler_solver_order != 4:
+                    i2i_opts["solver_order"] = sampler_solver_order
+                if sampler_predictor_order != 3:
+                    i2i_opts["predictor_order"] = sampler_predictor_order
+                if sampler_corrector_order != 4:
+                    i2i_opts["corrector_order"] = sampler_corrector_order
+                # Scheduler TYPE (#334). Emit only when != "normal" so the
+                # default path stays byte-identical to legacy (no key → engine
+                # uses the native FlowMatchEuler flow curve = the `normal` anchor).
+                if scheduler and scheduler != "normal":
+                    i2i_opts["scheduler"] = scheduler
                 # Per-image resize: 主图 (refs[0]) uses main_image_resize,
                 # 参考图 2~10 (refs[1..]) use ref_image_resize_others.
                 # Build per-image array for C++ backend.
@@ -2622,6 +3423,8 @@ class QuantFuncGenerate:
                     i2i_opts["ref_img_resize"] = resize_arr
                 else:
                     i2i_opts["ref_img_resize"] = ref_img_resize
+                if lp_cfg:
+                    i2i_opts["latent_preview"] = lp_cfg
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
 
                 # Inpaint mask: ComfyUI MASK is [B, H, W] float32 in [0,1]
@@ -2653,7 +3456,8 @@ class QuantFuncGenerate:
                     mask_strength=inpaint_strength,
                     mask_grow=inpaint_grow,
                     mask_blur=inpaint_blur,
-                    mask_no_snap=inpaint_no_snap)
+                    mask_no_snap=inpaint_no_snap,
+                    latent_preview=lp_cfg)
                 # color_match (潜在色彩匹配): plugin-side Reinhard post-decode against
                 # the main reference image. Engine has the same algorithm but no
                 # i2i-options wiring, so we do it here — no C++ change. Edit-mode only.
@@ -2673,15 +3477,52 @@ class QuantFuncGenerate:
                 t2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     t2i_opts["eta"] = sampler_eta
+                # Sampler modifier params (#326 node param surface). Emit
+                # each only when non-default so the engine log stays clean.
+                if sampler_s_noise != 1.0:
+                    t2i_opts["s_noise"] = sampler_s_noise
+                if sampler_solver_order != 4:
+                    t2i_opts["solver_order"] = sampler_solver_order
+                if sampler_predictor_order != 3:
+                    t2i_opts["predictor_order"] = sampler_predictor_order
+                if sampler_corrector_order != 4:
+                    t2i_opts["corrector_order"] = sampler_corrector_order
+                # Scheduler TYPE (#334). Emit only when != "normal" so the
+                # default path stays byte-identical to legacy (no key → engine
+                # uses the native FlowMatchEuler flow curve = the `normal` anchor).
+                if scheduler and scheduler != "normal":
+                    t2i_opts["scheduler"] = scheduler
+                # #324 ControlNet (t2i only — the engine clears control on the
+                # edit/i2i path). control_image is a QUANTFUNC_CONTROL bundle
+                # from the 'QuantFunc Control Image' node: {image, control_type,
+                # control_scale, control_guidance_start/end}. Stage its image as
+                # a QFRAW01 blob and pass path + type + scale + guidance via
+                # options_json. No-op in the engine if no ControlNet was loaded.
+                if isinstance(control_image, dict) and control_image.get("image") is not None:
+                    control_path = _write_qfraw_image(control_image["image"], _staging_dir)
+                    if control_path:
+                        t2i_opts["control_image"] = control_path
+                        t2i_opts["control_type"] = control_image.get("control_type", "canny")
+                        t2i_opts["control_scale"] = float(control_image.get("control_scale", 1.0))
+                        t2i_opts["control_guidance_start"] = float(
+                            control_image.get("control_guidance_start", 0.0))
+                        t2i_opts["control_guidance_end"] = float(
+                            control_image.get("control_guidance_end", 1.0))
+                if lp_cfg:
+                    t2i_opts["latent_preview"] = lp_cfg
                 opts_json = json.dumps(t2i_opts) if t2i_opts else None
-                logging.info("[QuantFunc] t2i sampler_name=%s, sampler_eta=%s, opts_json=%s",
-                             sampler_name, sampler_eta, opts_json)
+                logging.info(
+                    "[QuantFunc] t2i sampler=%s scheduler=%s eta=%.2f s_noise=%.2f "
+                    "solver_order=%d pred_ord=%d corr_ord=%d opts=%s",
+                    sampler_name, scheduler, sampler_eta, sampler_s_noise,
+                    sampler_solver_order, sampler_predictor_order,
+                    sampler_corrector_order, opts_json)
 
                 arr = _manager.text_to_image(
                     cache_key=cache_key,
                     prompt=prompt, height=height, width=width,
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
-                    options_json=opts_json, pbar=pbar)
+                    options_json=opts_json, pbar=pbar, latent_preview=lp_cfg)
 
             # Persist the mode so the ComfyUI free_memory hook can look it up
             # for this pipeline. The hook inspects _unload_modes[k]:
@@ -2692,12 +3533,19 @@ class QuantFuncGenerate:
                 _manager._unload_modes[cache_key] = unload_mode_internal
 
             out = torch.from_numpy(arr).unsqueeze(0)
-            return (out,)  # [1, H, W, 3]
+            # 2nd output = wire to the Latent Preview viewer node. It only
+            # anchors the connection (so we can locate the viewer + route the
+            # live per-step frames to its node id) and triggers the viewer's
+            # execution; the viewer shows ONLY those live frames, so the payload
+            # is a lightweight sentinel (NOT the full image tensor — that would
+            # be serialized over the wire for nothing). None when no viewer wired.
+            lp_out = True if lp_node_id is not None else None
+            return (out, lp_out)  # [1, H, W, 3]
 
         except InterruptedError:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
             blank = torch.zeros(1, height, width, 3, dtype=torch.float32)
-            return (blank,)
+            return (blank, None)
         finally:
             # Unlink the /dev/shm QFRAW staging files. By image_to_image's return
             # the engine has already read them; on interrupt they're unused. Either
@@ -2706,6 +3554,11 @@ class QuantFuncGenerate:
             for _p in tmp_paths:
                 try:
                     os.unlink(_p)
+                except OSError:
+                    pass
+            if control_path:
+                try:
+                    os.unlink(control_path)
                 except OSError:
                     pass
             if mask_path:
@@ -3064,7 +3917,98 @@ class QuantFuncExport:
 # Registration
 # ============================================================================
 
+class QuantFuncLatentPreview:
+    """Live latent-preview viewer (no settings — just a display).
+
+    Wire the `latent_preview` OUTPUT of a 'QuantFunc Generate' node into this
+    node. Connecting it is all it takes to ENABLE the preview. During
+    generation the engine decodes a cheap per-step latent2rgb image of the
+    forming latent (negligible overhead vs the transformer step) and streams it
+    ONTO THIS node, so you watch the image form here instead of on the generate
+    node. When the run finishes, this node shows the final image.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_preview": ("QF_LATENT_PREVIEW",),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "QuantFunc"
+
+    def show(self, latent_preview=None, unique_id=None):
+        # Pure live viewer. The per-step latent2rgb frames are streamed onto
+        # THIS node's id by the engine preview callback during generation, and
+        # the frontend keeps the last frame shown. We deliberately do NOT
+        # persist a second copy via {"ui":{"images"}} — that produced a 2nd
+        # stacked image. The live latent frame is the only picture shown here.
+        return {}
+
+
+class QuantFuncGenerateVideo:
+    """#344 — LTX-2 text-to-video (+ audio). Outputs the frame batch as ComfyUI
+    IMAGE and the vocoder waveform as ComfyUI AUDIO. Requires an LTX-2 (lighting)
+    pipeline; non-AV / non-LTX pipelines return no audio (AUDIO output is None)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("QUANTFUNC_PIPELINE",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "num_frames": ("INT", {"default": 49, "min": 1, "max": 257, "step": 1}),
+                "steps": ("INT", {"default": 30, "min": 1, "max": 100}),
+                "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("frames", "audio")
+    FUNCTION = "generate_video"
+    CATEGORY = "QuantFunc"
+
+    def generate_video(self, pipeline, prompt, width, height, num_frames, steps,
+                       guidance_scale, seed, negative_prompt="", unique_id=None):
+        import torch
+        cfg = dict(pipeline)
+        cfg["options"] = dict(cfg.get("options", {}))
+        cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
+        # negative_prompt rides in options_json (the C-API t2v contract).
+        opts = {}
+        if isinstance(negative_prompt, str) and negative_prompt:
+            opts["negative_prompt"] = negative_prompt
+        pbar = None
+        try:
+            from comfy.utils import ProgressBar
+            pbar = ProgressBar(steps)
+        except Exception:
+            pass
+        frames, audio = _manager.text_to_video(
+            cache_key, prompt, height, width, steps, seed, float(guidance_scale),
+            num_frames, options_json=(json.dumps(opts) if opts else None), pbar=pbar)
+        image = torch.from_numpy(frames)                 # [N, H, W, 3] float32 [0,1] = IMAGE
+        audio_out = None
+        if audio is not None:
+            wav = torch.from_numpy(audio["waveform"]).unsqueeze(0)  # [1, C, N]
+            audio_out = {"waveform": wav, "sample_rate": int(audio["sample_rate"])}
+        return (image, audio_out)
+
+
 NODE_CLASS_MAPPINGS = {
+    "QuantFuncGenerateVideo": QuantFuncGenerateVideo,
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
@@ -3079,8 +4023,12 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncTransformerAutoLoader": QuantFuncTransformerAutoLoader,
     "QuantFuncLoRAAutoLoader": QuantFuncLoRAAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
+    "QuantFuncControlNetLoader": QuantFuncControlNetLoader,
+    "QuantFuncControlNetAutoLoader": QuantFuncControlNetAutoLoader,
+    "QuantFuncControlImage": QuantFuncControlImage,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
+    "QuantFuncLatentPreview": QuantFuncLatentPreview,
     "QuantFuncImageList": QuantFuncImageList,
     "QuantFuncMaskConfig": QuantFuncMaskConfig,
     "QuantFuncMaskScaleBy": QuantFuncMaskScaleBy,
@@ -3100,8 +4048,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncTransformerAutoLoader": "QuantFunc Transformer Auto Loader",
     "QuantFuncLoRAAutoLoader": "QuantFunc LoRA Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
+    "QuantFuncControlNetLoader": "QuantFunc ControlNet Loader",
+    "QuantFuncControlNetAutoLoader": "QuantFunc ControlNet Auto Loader",
+    "QuantFuncControlImage": "QuantFunc Control Image",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
+    "QuantFuncGenerateVideo": "QuantFunc Generate Video (LTX-2 +Audio)",
+    "QuantFuncLatentPreview": "QuantFunc Latent Preview",
     "QuantFuncImageList": "QuantFunc Image List",
     "QuantFuncMaskConfig": "QuantFunc Mask Config",
     "QuantFuncMaskScaleBy": "QuantFunc Mask Scale By",

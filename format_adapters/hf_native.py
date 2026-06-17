@@ -136,10 +136,18 @@ class HFLayoutAdapter(FormatAdapter):
             # engine fails at load with "Failed to open vocab.json". Backfill
             # from the plugin bundle (idempotent: skipped when one is present)
             # so an existing model_dir is always loadable.
-            from .tools.hf_layout import copy_tokenizer as _copy_tokenizer
+            from .tools.hf_layout import (
+                copy_tokenizer as _copy_tokenizer,
+                ensure_engine_tokenizer as _ensure_engine_tokenizer,
+            )
             _ex_tok = Path(existing) / "tokenizer"
-            if not ((_ex_tok / "tokenizer.json").is_file()
-                    or (_ex_tok / "vocab.json").is_file()):
+            # The engine needs vocab.json+merges.txt, NOT the fused
+            # tokenizer.json — first derive the split files from a fused
+            # tokenizer.json if that's all the dir ships (e.g. ideogram-4-fp8).
+            _ensure_engine_tokenizer(_ex_tok)
+            # Still no engine-native vocab.json (and nothing to derive from) →
+            # fall back to the bundled per-arch tokenizer.
+            if not (_ex_tok / "vocab.json").is_file():
                 _copy_tokenizer(arch, _ex_tok, [])
             return StagingResult(
                 model_dir=str(existing),

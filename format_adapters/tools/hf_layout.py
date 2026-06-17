@@ -492,6 +492,77 @@ def copy_tokenizer(arch: str, dst: Path, candidate_model_dirs=()) -> None:
     copy_tokenizer_bundle(arch, dst)
 
 
+def ensure_engine_tokenizer(tokenizer_dir) -> bool:
+    """Materialise the engine-native split tokenizer files from a fused
+    ``tokenizer.json`` when ``vocab.json`` / ``merges.txt`` are absent.
+
+    The C engine's ``Qwen3Tokenizer::load`` reads ``tokenizer/vocab.json`` +
+    ``tokenizer/merges.txt`` (the legacy GPT-2/Qwen split layout) and cannot
+    parse the modern fused HF ``tokenizer.json``. Most model packages ship the
+    split files, but some (e.g. ``ideogram-ai/ideogram-4-fp8``) ship ONLY the
+    fused ``tokenizer.json`` → the engine fails at load with
+    "Failed to open vocab.json". A fused HF BPE tokenizer.json embeds the same
+    data under ``model.vocab`` (token→id) and ``model.merges`` (BPE pairs), so
+    derive the split files from it losslessly here — using the model's OWN
+    tokenizer (correct vocab/merges for that exact model), not a generic bundle.
+
+    Special/added tokens are intentionally NOT written into vocab.json: the
+    working split-layout models don't carry them there either (the engine maps
+    them via its own hard-coded special-token table), so this mirrors the
+    canonical layout exactly.
+
+    Idempotent + best-effort: a no-op when both split files already exist, when
+    there is no ``tokenizer.json`` to derive from, or when it is not a fused BPE
+    tokenizer. Returns True only when it wrote the split files.
+    """
+    td = Path(tokenizer_dir)
+    vocab_p = td / "vocab.json"
+    merges_p = td / "merges.txt"
+    if vocab_p.is_file() and merges_p.is_file():
+        return False  # already engine-native
+    tj = td / "tokenizer.json"
+    if not tj.is_file():
+        return False  # nothing to derive from — let the engine report
+    try:
+        with open(tj, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        model = data.get("model") or {}
+        vocab = model.get("vocab")
+        merges = model.get("merges")
+        # Only a fused BPE tokenizer (dict vocab + list merges) is splittable;
+        # a unigram/sentencepiece tokenizer.json (no BPE merges) is left for the
+        # engine to handle. The list check also rejects a malformed string merges.
+        if (not isinstance(vocab, dict) or not vocab
+                or not isinstance(merges, list) or not merges):
+            return False
+        # Each split file is written under its own guard so an interrupted run
+        # that produced only one of the two self-heals on the next call.
+        wrote = []
+        if not vocab_p.is_file():
+            with open(vocab_p, "w", encoding="utf-8") as f:
+                json.dump(vocab, f, ensure_ascii=False)
+            wrote.append("vocab.json")
+        if not merges_p.is_file():
+            with open(merges_p, "w", encoding="utf-8") as f:
+                f.write("#version: 0.2\n")  # GPT-2/HF BPE header; engine skips line 1
+                for pair in merges:
+                    # New HF form: ["a", "b"]; legacy form: "a b" string.
+                    if isinstance(pair, (list, tuple)):
+                        f.write("{} {}\n".format(pair[0], pair[1]))
+                    else:
+                        f.write("{}\n".format(pair))
+            wrote.append("merges.txt")
+        if wrote:
+            logger.info("[staging] derived engine tokenizer %s from tokenizer.json "
+                        "(vocab %d, merges %d) in %s",
+                        "+".join(wrote), len(vocab), len(merges), td)
+        return True
+    except Exception as e:  # never block model load on a best-effort backfill
+        logger.warning("[staging] could not derive vocab.json/merges.txt from "
+                       "%s: %s", tj, e)
+        return False
+
+
 def bundled_transformer_config(arch: str) -> Optional[dict]:
     """Return bundled transformer config (architecture dims) for `arch`, or None.
 
