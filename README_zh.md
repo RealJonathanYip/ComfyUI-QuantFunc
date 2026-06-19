@@ -1,5 +1,5 @@
 <div align="center" style="margin-top: 50px;">
-  <img src="https://raw.githubusercontent.com/QuantFunc/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
+  <img src="https://raw.githubusercontent.com/RealJonathanYip/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
 </div>
 
 <p align="center">
@@ -68,7 +68,7 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/QuantFunc/ComfyUI-QuantFunc.git
+git clone https://github.com/RealJonathanYip/ComfyUI-QuantFunc.git
 ```
 
 插件首次启动时会**自动从 ModelScope 下载**最新兼容的 `libquantfunc.so`（Linux）或 `quantfunc.dll`（Windows），无需手动下载。

@@ -1,5 +1,5 @@
 <div align="center" style="margin-top: 50px;">
-  <img src="https://raw.githubusercontent.com/QuantFunc/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
+  <img src="https://raw.githubusercontent.com/RealJonathanYip/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
 </div>
 
 <p align="center">
@@ -68,7 +68,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/QuantFunc/ComfyUI-QuantFunc.git
+git clone https://github.com/RealJonathanYip/ComfyUI-QuantFunc.git
 ```
 
 The plugin will **automatically download** the latest compatible `libquantfunc.so` (Linux) or `quantfunc.dll` (Windows) from ModelScope on first startup. No manual binary download needed.
