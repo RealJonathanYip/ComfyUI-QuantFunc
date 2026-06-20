@@ -356,9 +356,11 @@ class QuantFuncPickCheckpoint:
 # real (engine-internal) layer structure, so downloading the matching series' config
 # is correct regardless of the source weight layout.
 _ARCH_TO_SERIES = {
-    "QwenImage":     "QuantFunc/Qwen-Image-Series",
-    "QwenImageEdit": "QuantFunc/Qwen-Image-Edit-Series",
+    "QwenImage":        "QuantFunc/Qwen-Image-Series",
+    "QwenImageEdit":    "QuantFunc/Qwen-Image-Edit-Series",
+    "QwenImageLayered": "QuantFunc/Qwen-Image-Layered-Series",
     "ZImage":        "QuantFunc/Z-Image-Series",
+    "Ideogram4":     "QuantFunc/Ideogram-4-Series",
     # Klein 4B (K=3072) and 9B (K=4096) deliberately share ONE precision-config:
     # the keys are layer-NAME patterns (transformer_blocks.attn / .ff / .ff_context
     # / single_transformer_blocks.attn / modulation / embedders / head), NOT
@@ -400,13 +402,21 @@ def _device_sm(device_idx: int) -> int:
 #                        an extra stamped-metadata check below before injecting.
 # Everything else (nvfp4_disk / raw_fp8 / raw_int8 / prequant_lighting_separate /
 # unknown "") is left untouched — the engine / SVDQ path uses its on-disk precision.
+# EXCEPTION — Ideogram-4: its official distribution IS an fp8 base the a4w4 recipe
+# is measured on, so it does NOT use this strict allowlist; it uses the broader
+# "anything not pre-quantized" denylist gate below (`_PREQUANTIZED_KINDS`), applied
+# only when series == "QuantFunc/Ideogram-4-Series" in `_autopick_*` below.
 _FULL_PRECISION_KINDS = frozenset({"raw_highprec", "bundled_checkpoint"})
+# Kinds that are ALREADY pre-quantized by a final pipeline (QuantFunc-stamped
+# lighting export, or a nunchaku NVFP4 disk format) — their on-disk precision is
+# the answer, so the auto-config is NEVER injected over them, for any family.
+_PREQUANTIZED_KINDS = frozenset({"prequant_lighting_separate", "nvfp4_disk"})
 
 
 def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
                                        data_source="modelscope"):
-    """Auto-pick a precision config for a FULL-PRECISION model when the user
-    left precision_config on [auto-derive] (no explicit config).
+    """Auto-pick a precision config for a config-eligible base model when the
+    user left precision_config on [auto-derive] (no explicit config).
 
     A full-precision diffusers base model OR an all-in-one (全家桶) checkpoint
     carries no quant metadata, so the engine's [auto-derive] would leave it at
@@ -415,9 +425,14 @@ def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
     precision config through the precision auto loader: the matching series' own
     per-layer config, at the variant suited to the selected GPU (FP4
     `50x-above` on Blackwell SM120+, INT4 `50x-below` otherwise);
-    `download_precision_config` fetches + caches it. Already-quantized inputs
-    (nunchaku NVFP4, raw FP8/INT8/FP4, or any QuantFunc-stamped export) are left
-    untouched — the engine consumes their on-disk precision directly."""
+    `download_precision_config` fetches + caches it.
+
+    Eligibility differs by family. For most families ONLY genuine full-precision
+    weights get a config injected — already-quantized inputs (nunchaku NVFP4, raw
+    FP8/INT8/FP4, or any QuantFunc-stamped export) keep their on-disk precision.
+    Ideogram-4 is the exception: its official distribution IS an fp8 base its a4w4
+    recipe is measured on, so ANY non-pre-quantized Ideogram base (fp16/bf16 AND
+    fp8) is eligible; only a stamped / nunchaku-final export is left untouched."""
     # Only act on the [auto-derive] preset (empty path, preset == 'auto').
     if not (isinstance(precision_map_xfm, dict)
             and precision_map_xfm.get("preset") == "auto"
@@ -433,9 +448,22 @@ def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
         return precision_map_xfm
     # Only inject onto GENUINE full-precision weights; everything else keeps its
     # on-disk precision (already quantized, or an unrecognized kind we won't touch).
-    if kind not in _FULL_PRECISION_KINDS:
-        logger.info("[BuildPipeline] [auto-derive]: %s kind=%s is not full-"
-                    "precision; engine uses its on-disk precision", arch, kind or "?")
+    # Eligibility gate — which inputs get the auto-config injected:
+    #   • Ideogram-4 ships as an FP8 base (and may also come as fp16/bf16); the
+    #     a4w4 recipe was MEASURED on that base. Per the product rule, activate
+    #     for ANY model that is NOT already pre-quantized — fp16/bf16 AND fp8
+    #     both get the recipe; only a QuantFunc-stamped / nunchaku-final export
+    #     is left untouched. (Empty/unknown kind is treated as not-eligible.)
+    #   • Every OTHER family keeps the strict full-precision-only gate: an FP8 /
+    #     INT8 / FP4 Klein/Qwen/ZImage is a final quantization, used as-is.
+    if series == "QuantFunc/Ideogram-4-Series":
+        is_eligible = bool(kind) and kind not in _PREQUANTIZED_KINDS
+    else:
+        is_eligible = kind in _FULL_PRECISION_KINDS
+    if not is_eligible:
+        logger.info("[BuildPipeline] [auto-derive]: %s kind=%s is pre-quantized / "
+                    "not a config-eligible base; engine uses its on-disk precision",
+                    arch, kind or "?")
         return precision_map_xfm
     if kind == "bundled_checkpoint":
         # A 全家桶 bundle may itself be a QuantFunc-stamped (already-quantized)
@@ -463,6 +491,11 @@ def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
                 fname = "40x-int4-f8-sample.json"       # Ada/Hopper FP8: INT4 + FP8 islands
             else:
                 fname = "30x-below-int4-i8-sample.json"  # no FP8: INT4 + INT8 islands
+        elif series == "QuantFunc/Ideogram-4-Series":
+            # Single GPU-adaptive map: ideogram4_a4w4.json uses AUTO_4 (FP4 on
+            # SM120 / INT4 on SM89) + AUTO_8 (FP8 on SM89+ / INT8 older), so one
+            # file fits every supported GPU — no 50x-above/below split.
+            fname = "ideogram4_a4w4.json"
         else:
             fname = ("50x-above-fp4-sample.json" if sm >= 120  # native NVFP4
                      else "50x-below-int4-sample.json")         # INT4 (RTX 20/30/40)

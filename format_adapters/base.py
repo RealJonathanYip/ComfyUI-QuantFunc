@@ -84,7 +84,7 @@ class FileRef:
     can dispatch without re-fingerprinting.
     """
     path: str
-    arch: str = ""              # "QwenImage" | "QwenImageEdit" | "Flux2Klein" | "ZImage" | ""
+    arch: str = ""              # "QwenImage" | "QwenImageEdit" | "QwenImageLayered" | "Flux2Klein" | "ZImage" | "Ideogram4" | ""
     kind: str = ""              # fingerprint_kind_from_metadata: "raw_highprec" | "prequant_lighting_separate" | "nvfp4_disk" | "raw_fp4" | "raw_fp8" | "raw_fp8_mixed" | "raw_int8" | "" ; or force_kind "bundled_checkpoint"
     mtime: float = 0.0
 

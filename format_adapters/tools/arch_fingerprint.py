@@ -26,6 +26,11 @@ CLASS_NAME_TO_ARCH = {
     "ZImageTurboPipeline":           "ZImage",
     "Flux2KleinPipeline":            "Flux2Klein",
     "Flux2Transformer2DModel":       "Flux2Klein",
+    "Ideogram4Pipeline":             "Ideogram4",
+    "Ideogram4Transformer2DModel":   "Ideogram4",
+    # Qwen-Image-Layered reuses QwenImageTransformer2DModel for its transformer
+    # (so the TRANSFORMER class can't disambiguate — only the PIPELINE class can).
+    "QwenImageLayeredPipeline":      "QwenImageLayered",
 }
 
 
@@ -54,6 +59,20 @@ def _detect_arch_by_keys(keys: list[str]) -> str:
     if has_single_xfm:
         return "Flux2Klein"
 
+    # Ideogram-4: `llm_cond_proj`/`llm_cond_norm` (the LLM-conditioning
+    # projection read by Ideogram4TransformerLighting) is unique to this arch —
+    # no other supported model carries it. Substring match tolerates the
+    # `unconditional_transformer.` prefix of the dual-transformer checkpoints.
+    # The input_proj + adaln_proj + t_embedding trio is a strong backup signal.
+    # Checked BEFORE ZImage because both share `layers.X.attention.qkv`, but
+    # only Ideogram-4 has llm_cond_* / the projection trio.
+    has_llm_cond = any("llm_cond_proj" in k or "llm_cond_norm" in k for k in keys)
+    has_ideo_trio = (any("input_proj" in k for k in keys)
+                     and any("adaln_proj" in k for k in keys)
+                     and any("t_embedding.mlp_" in k for k in keys))
+    if has_llm_cond or has_ideo_trio:
+        return "Ideogram4"
+
     # ZImage signature (both BFL and diffusers): cap_embedder + context_refiner.
     # Distinct from any other arch (no other model has these top-level names).
     has_cap = any("cap_embedder.0" in k or k.endswith("cap_embedder.0.weight")
@@ -61,6 +80,16 @@ def _detect_arch_by_keys(keys: list[str]) -> str:
     has_ctx_refiner = any("context_refiner." in k for k in keys[:500])
     if has_cap and has_ctx_refiner:
         return "ZImage"
+
+    # Qwen-Image-Layered: a Qwen-Image variant (same QwenImageTransformer2DModel
+    # class + transformer_blocks.X structure) distinguished by use_additional_t_cond,
+    # which adds the `time_text_embed.addition_t_embedding` weight that base
+    # Qwen-Image lacks. Checked BEFORE the generic Qwen block-count path so it
+    # doesn't collapse to plain "QwenImage". NOTE: that key lives only in shard-1 —
+    # `fingerprint_arch_from_keys` adds a shard-independent sibling-config fallback
+    # for sharded checkpoints where another shard is read.
+    if any("addition_t_embedding" in k for k in keys):
+        return "QwenImageLayered"
 
     # Qwen / fallback: pure transformer_blocks.X (no single_transformer_blocks)
     block_indices: set[int] = set()
@@ -83,8 +112,41 @@ def _detect_arch_by_keys(keys: list[str]) -> str:
     return ""
 
 
+def _is_qwen_layered_sibling(file_path: str | Path) -> bool:
+    """Shard-independent Qwen-Image-Layered probe for a diffusers-dir model.
+
+    Qwen-Image-Layered (QwenImageLayeredPipeline) reuses the base
+    QwenImageTransformer2DModel class + `transformer_blocks.X` structure, so the
+    only stable on-disk signal is the diffusers config flag `use_additional_t_cond`
+    (its distinctive `time_text_embed.addition_t_embedding` weight lives only in
+    shard-1, so a read of any other shard would mis-detect plain "QwenImage").
+    Confirm via the sibling transformer config.json / the pipeline model_index.json
+    sitting next to the weights. Returns False for standalone (non-diffusers) files.
+    """
+    try:
+        p = Path(file_path)
+        cfg = p.parent / "config.json"
+        if cfg.is_file():
+            c = json.loads(cfg.read_text(encoding="utf-8"))
+            if (c.get("use_additional_t_cond") is True
+                    and "QwenImageTransformer2DModel" in str(c.get("_class_name", ""))):
+                return True
+        mi = p.parent.parent / "model_index.json"   # <root>/transformer/<shard> -> <root>/model_index.json
+        if mi.is_file():
+            if json.loads(mi.read_text(encoding="utf-8")).get("_class_name") == "QwenImageLayeredPipeline":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def fingerprint_arch_from_keys(file_path: str | Path) -> str:
-    """Return arch tag ("QwenImage"/"QwenImageEdit"/"Flux2Klein"/"ZImage" or "")."""
+    """Return arch tag ("QwenImage"/"QwenImageEdit"/"QwenImageLayered"/"Flux2Klein"/"ZImage"/"Ideogram4" or "")."""
+    # 0. Diffusers-dir override (shard-independent): Qwen-Image-Layered can only be
+    #    told apart from base Qwen-Image by its config flag, not the metadata class
+    #    (shared) — and its distinctive key is shard-1-only. Check the sibling first.
+    if _is_qwen_layered_sibling(file_path):
+        return "QwenImageLayered"
     try:
         meta = read_safetensors_metadata(file_path)
     except Exception:
