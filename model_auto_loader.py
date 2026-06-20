@@ -35,6 +35,24 @@ MODEL_SERIES_LIST = [
     "QuantFunc/Klein-9B-Series",
 ]
 
+# Config-only series: repos that ship ONLY a precision-config/ dir (no
+# transformer/, prequant/, or base-model dir — weights stay on the official
+# upstream; we share only the per-layer precision recipe). They must NOT appear
+# in the model-download `model_series` dropdowns (nothing to download there), but
+# their precision configs SHOULD be auto-discovered + offered by the Precision
+# Config Auto Loader, exactly like the full series' configs.
+_PRECISION_CONFIG_ONLY_SERIES = [
+    "QuantFunc/Ideogram-4-Series",
+    "QuantFunc/Qwen-Image-Layered-Series",
+]
+
+# Every series scanned for downloadable resources (transformer / prequant /
+# precision-config). Config-only series contribute precision configs only; their
+# absent subdirs are skipped gracefully by _refresh_cache_for_series. Resource
+# discovery + selection-resolution iterate THIS; the model-series dropdowns in
+# nodes.py keep using MODEL_SERIES_LIST (full models only).
+_ALL_RESOURCE_SERIES = MODEL_SERIES_LIST + _PRECISION_CONFIG_ONLY_SERIES
+
 # Per-series: base model directory naming pattern in the repo
 # Actual dirs: qwen-image-edit-series-50x-below-base-model, etc.
 _BASE_MODEL_PATTERN = {
@@ -192,8 +210,8 @@ def _build_dropdown(resource_type, include_none=True):
     seen = set()
     with _cache_lock:
         cached = {s: list(_resource_cache.get(s, {}).get(resource_type, []))
-                  for s in MODEL_SERIES_LIST}
-    for series in MODEL_SERIES_LIST:
+                  for s in _ALL_RESOURCE_SERIES}
+    for series in _ALL_RESOURCE_SERIES:
         short = series.split("/")[-1]
         names = cached[series]
         for name in _list_local_resource_names(short, resource_type):
@@ -327,7 +345,7 @@ def _refresh_cache_for_series(series):
 def _refresh_all_caches():
     """Refresh resource caches for all series."""
     any_updated = False
-    for series in MODEL_SERIES_LIST:
+    for series in _ALL_RESOURCE_SERIES:
         try:
             if _refresh_cache_for_series(series):
                 any_updated = True
@@ -525,7 +543,7 @@ def _resolve_selection(selection, model_series, resource_label):
         return None, None
 
     short_name, name = selection.split("/", 1)
-    for s in MODEL_SERIES_LIST:
+    for s in _ALL_RESOURCE_SERIES:
         if s.endswith("/" + short_name):
             if s != model_series:
                 raise ValueError(
@@ -547,7 +565,7 @@ def resolve_selection_no_series(selection, resource_label):
     if "/" not in selection:
         return None, None
     short_name, name = selection.split("/", 1)
-    for s in MODEL_SERIES_LIST:
+    for s in _ALL_RESOURCE_SERIES:
         if s.endswith("/" + short_name):
             return s, name
     raise ValueError("Unknown series in {} selection: {}".format(
