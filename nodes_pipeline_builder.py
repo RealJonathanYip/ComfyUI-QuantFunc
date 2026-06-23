@@ -77,7 +77,12 @@ def install_loader_path_patches() -> bool:
         _orig_load_clip = _csd.load_clip
 
         def _patched_load_clip(ckpt_paths=None, *args, **kwargs):
-            c = _orig_load_clip(ckpt_paths=ckpt_paths, *args, **kwargs)
+            # Pass ckpt_paths POSITIONALLY: comfy.sd.load_clip takes it as the
+            # first positional param, so a caller passing ANY extra positional
+            # arg (whatever it currently is — don't name it, ComfyUI may change
+            # the call-site) would otherwise hit
+            # "got multiple values for argument 'ckpt_paths'".
+            c = _orig_load_clip(ckpt_paths, *args, **kwargs)
             try:
                 paths = list(ckpt_paths or [])
                 setattr(c, "qf_source_paths", paths)
@@ -138,8 +143,74 @@ def install_loader_path_patches() -> bool:
     return True
 
 
+def _recover_path_from_cached_init(obj: Any) -> Optional[str]:
+    """Best-effort source-path recovery when qf_source_path was stripped.
+
+    Our `qf_source_path` tag is set by the monkey-patches above, but ComfyUI's
+    `CLIP.clone()` / `ModelPatcher.clone()` only copy a fixed whitelist of
+    attributes that does NOT include it (comfy/sd.py CLIP.clone copies
+    patcher/cond_stage_model/tokenizer/layer_idx/...). So ANY node that clones
+    the object between the loader and BuildPipeline — CLIPSetLastLayer, most
+    LoRA loaders, the typical Qwen-Image-Edit graph — yields an untagged clone
+    and the bare-`getattr` path above fails.
+
+    ComfyUI's own clone() DOES preserve `cached_patcher_init`
+    (comfy/model_patcher.py: `n.cached_patcher_init = self.cached_patcher_init`),
+    a `(callable, args_tuple)` recording the original loader call. Its first
+    positional arg is the source path(s):
+      • diffusion model → `model.cached_patcher_init`        = (load_diffusion_model, (unet_path, ...))
+      • CLIP            → `clip.patcher.cached_patcher_init`  = (load_clip_model_patcher, (ckpt_paths, ...))
+      • checkpoint      → `model.cached_patcher_init` / `clip.patcher.cached_patcher_init` = (..., (ckpt_path, ...))
+    `ckpt_paths` is a list (CLIP/DualCLIP), `unet_path`/`ckpt_path` a string —
+    handle both. Returns the first arg that names an existing file, else None.
+
+    COVERAGE = MODEL + CLIP (and checkpoint, whose MODEL+CLIP both record the
+    same .ckpt — see nodes_format_adapters.py:668 which dedups te_path==xfm_path
+    and routes a unified checkpoint through the `checkpoint=` field). It does NOT
+    cover VAE: ComfyUI's `VAE` class sets no `cached_patcher_init`
+    (load_checkpoint_guess_config tags only out[0]=MODEL and out[1].patcher=CLIP;
+    load_clip tags the CLIP patcher; there is no VAE assignment site), so for a
+    VAE this returns None — which is fine, because `VAE` has NO `clone()` method
+    (only `CLIP.clone()` exists in comfy/sd.py), so a VAE's qf_source_path is
+    never clone-stripped. The only VAE failure mode is a third-party node that
+    rebuilds the VAE without the tag (rare); that still degrades to the clear
+    RuntimeError below.
+    """
+    # Holder order matters only as a search order, not correctness: MODEL is
+    # itself a ModelPatcher (attr on the object); CLIP holds it on `.patcher`.
+    # For a unified checkpoint both holders record the SAME .ckpt path, so
+    # whichever is found first yields the identical result.
+    for holder in (obj, getattr(obj, "patcher", None)):
+        if holder is None:
+            continue
+        cpi = getattr(holder, "cached_patcher_init", None)
+        if not (isinstance(cpi, tuple) and len(cpi) == 2):
+            continue
+        # ComfyUI declares the 2nd element a tuple of loader args; require a
+        # non-empty sequence so a malformed (fn, <dict/non-sequence>) record
+        # from a third-party plugin degrades to None instead of raising.
+        args = cpi[1]
+        if not (isinstance(args, (list, tuple)) and args):
+            continue
+        # Position 0 is always the load TARGET — a path string (UNET/checkpoint)
+        # or a list of paths (CLIP/DualCLIP); later args are embedding_dir / opts.
+        first = args[0]
+        cands = list(first) if isinstance(first, (list, tuple)) else [first]
+        for q in cands:
+            if isinstance(q, str) and os.path.isfile(q):
+                return q
+    return None
+
+
 def _extract_path(obj: Any, label: str) -> str:
-    """Pull qf_source_path off a MODEL/CLIP/VAE; raise with hint if missing."""
+    """Pull qf_source_path off a MODEL/CLIP/VAE; raise with hint if missing.
+
+    The qf_source_path/qf_source_paths attribute read covers MODEL, CLIP AND VAE.
+    The cached_patcher_init clone-recovery fallback below covers MODEL + CLIP ONLY
+    (VAE has no cached_patcher_init in ComfyUI) — so a VAE that is missing BOTH
+    attributes raises (acceptable: VAE has no clone() method, so its tag is never
+    clone-stripped; see _recover_path_from_cached_init).
+    """
     p = getattr(obj, "qf_source_path", None)
     if p and os.path.isfile(p):
         return p
@@ -148,12 +219,27 @@ def _extract_path(obj: Any, label: str) -> str:
         for q in paths:
             if q and os.path.isfile(q):
                 return q
+    # Clone-proof fallback: the tag is dropped by CLIP/ModelPatcher .clone(),
+    # but cached_patcher_init survives the clone — recover the path from it.
+    recovered = _recover_path_from_cached_init(obj)
+    if recovered:
+        logger.info(
+            "[QuantFunc] %s had no qf_source_path (likely a cloned object); "
+            "recovered source via cached_patcher_init: %s", label, recovered)
+        return recovered
     raise RuntimeError(
         f"Cannot recover source file for {label}. The MODEL/CLIP/VAE object "
-        f"has no qf_source_path attribute. Causes:\n"
+        f"has no qf_source_path attribute and the path could not be recovered "
+        f"from cached_patcher_init. Causes:\n"
         f"  • The QuantFunc loader monkey-patch on comfy.sd failed to install "
         f"(see ComfyUI startup log for 'comfy loader path patches failed'),\n"
-        f"  • The upstream node bypasses comfy.sd.load_* (custom loader),\n"
+        f"  • The upstream node bypasses comfy.sd.load_* (custom loader, e.g. "
+        f"GGUF / alternate text-encoder loaders),\n"
+        f"  • An intermediate node returned a clone that dropped BOTH "
+        f"qf_source_path and cached_patcher_init (the cached_patcher_init "
+        f"fallback covers MODEL + CLIP only; VAE has none, but VAE is also "
+        f"never clone-stripped — it has no clone() method — so a VAE failure "
+        f"here means a third-party node rebuilt it without the tag),\n"
         f"  • The object was created by another plugin without the patch.\n"
         f"Workarounds:\n"
         f"  1. Use QuantFunc Model Loader / QuantFunc Model Auto Loader, or\n"
