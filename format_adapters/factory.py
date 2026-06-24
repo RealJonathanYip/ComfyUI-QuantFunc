@@ -79,7 +79,20 @@ def adapter(priority: int = 50):
 # cached staging dirs (those carrying a `.staging_complete` marker) wrong, so
 # they are NOT reused. v2: tokenizer is now sourced from the model_dir rather
 # than only the plugin bundle — older staging dirs may have an empty tokenizer/.
-_STAGING_FORMAT_VERSION = 2
+# v3 (#408/#429): the SVDQ adapter used to write `vae_comfyui_alias: true` into
+# quantfunc_config.json UNCONDITIONALLY. For a diffusers-native VAE
+# (diffusion_pytorch_model.safetensors, keys like post_quant_conv.* /
+# encoder.conv_in.*) that flag makes the engine wrap the VAE in
+# ComfyUIVAEAliasProvider, which remaps the engine's `post_quant_conv.bias`
+# request → `conv2.bias` → "Tensor post_quant_conv.bias not found" at VAE load.
+# 049c5dc gated the flag on `_is_comfyui_flat_vae` (only set it for an actually
+# ComfyUI-FLAT VAE) but did NOT bump this version — so any machine that had
+# already cached a SVDQ staging dir with the stale `vae_comfyui_alias: true`
+# (and ZImage-mis-tagged TE/VAE configs from the same commit) reuses it as-is
+# and the fix never takes effect (qwenimage-svdq still fails on Qwen-Image-2512).
+# Bumping invalidates those poisoned dirs so the corrected, alias-free config is
+# regenerated.
+_STAGING_FORMAT_VERSION = 3
 
 
 def _stable_staging_id(sources: SourceBundle, context: BuildContext) -> str:
