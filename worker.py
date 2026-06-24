@@ -144,6 +144,10 @@ class I2IParams(ctypes.Structure):
         # Per-step latent preview (mirrors quantfunc_i2i_params_t). NULL = off.
         ("latent_preview_callback", LATENT_PREVIEW_CB),
         ("latent_preview_user_data", ctypes.c_void_p),
+        # Brush/context conditioning (QwenImage-Layered-Control-V2).
+        # Appended at END of struct — existing callers zero-init → NULL = disabled.
+        # Must match quantfunc_i2i_params_t::context_image_path in include/quantfunc.h.
+        ("context_image_path", ctypes.c_char_p),
     ]
 
 class ExportParams(ctypes.Structure):
@@ -264,6 +268,14 @@ def _load_dll(dll_path):
     _lib.quantfunc_image_float_data.argtypes = [IMG_PTR]
     _lib.quantfunc_image_data.restype = ctypes.POINTER(ctypes.c_uint8)
     _lib.quantfunc_image_data.argtypes = [IMG_PTR]
+    # Multi-image / RGBA accessors (QwenImageLayered → N RGBA layers). Guarded so an
+    # older .so without these symbols still works (falls back to single RGB N=1/C=3).
+    if hasattr(_lib, "quantfunc_image_count"):
+        _lib.quantfunc_image_count.restype = ctypes.c_int
+        _lib.quantfunc_image_count.argtypes = [IMG_PTR]
+    if hasattr(_lib, "quantfunc_image_channels"):
+        _lib.quantfunc_image_channels.restype = ctypes.c_int
+        _lib.quantfunc_image_channels.argtypes = [IMG_PTR]
     _lib.quantfunc_image_destroy.restype = None
     _lib.quantfunc_image_destroy.argtypes = [IMG_PTR]
 
@@ -423,35 +435,48 @@ def _extract_and_send_image(img_ptr, req_id):
     Falls back to legacy stdout-binary when /dev/shm isn't available."""
     w = _lib.quantfunc_image_width(img_ptr)
     h = _lib.quantfunc_image_height(img_ptr)
-    uint8_ptr = _lib.quantfunc_image_data(img_ptr)
-    n_bytes = h * w * 3  # uint8 RGB
+    # Multi-image / RGBA results (QwenImageLayered → N RGBA layers). Guarded so an
+    # older .so without count/channels falls back to the legacy single RGB image.
+    n_imgs = _lib.quantfunc_image_count(img_ptr) if hasattr(_lib, "quantfunc_image_count") else 1
+    n_ch = _lib.quantfunc_image_channels(img_ptr) if hasattr(_lib, "quantfunc_image_channels") else 3
+
+    if n_imgs <= 1 and n_ch == 3:
+        # Legacy fast path — byte-identical to before: image 0, uint8 RGB.
+        uint8_ptr = _lib.quantfunc_image_data(img_ptr)
+        n_bytes = h * w * 3
+        payload = bytes(memoryview(
+            ctypes.cast(uint8_ptr, ctypes.POINTER(ctypes.c_uint8 * n_bytes))[0]))
+        img_fmt = "rgb_uint8"
+    else:
+        # Multi-layer / RGBA: float32 [N,H,W,C] in [0,1], all N images stacked, sent
+        # raw — no conversion here (the parent has numpy; the worker stays numpy-free).
+        fptr = _lib.quantfunc_image_float_data(img_ptr)
+        n_floats = n_imgs * h * w * n_ch
+        n_bytes = n_floats * 4
+        payload = bytes(memoryview(
+            ctypes.cast(fptr, ctypes.POINTER(ctypes.c_float * n_floats))[0]))
+        img_fmt = "layers_f32"
+
+    meta = {
+        "type": "result", "req_id": req_id, "status": "ok",
+        "image_width": w, "image_height": h, "image_bytes": n_bytes,
+        "image_count": n_imgs, "image_channels": n_ch, "image_format": img_fmt,
+    }
 
     use_shm = os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
     if use_shm:
         shm_path = f"/dev/shm/qf_out_{os.getpid()}_{req_id}.raw"
-        # Zero-copy: write directly from C buffer via memoryview.
-        buf_view = ctypes.cast(uint8_ptr, ctypes.POINTER(ctypes.c_uint8 * n_bytes))[0]
         with open(shm_path, "wb") as f:
-            f.write(bytes(memoryview(buf_view)))
+            f.write(payload)
         _lib.quantfunc_image_destroy(img_ptr)
-        send_json({
-            "type": "result", "req_id": req_id, "status": "ok",
-            "image_width": w, "image_height": h, "image_bytes": n_bytes,
-            "image_format": "rgb_uint8",
-            "image_shm_path": shm_path,
-        })
+        meta["image_shm_path"] = shm_path
+        send_json(meta)
         return
 
     # Legacy fallback (Windows / no /dev/shm): stdout binary
-    buf = (ctypes.c_uint8 * n_bytes).from_address(ctypes.addressof(uint8_ptr.contents))
-    raw = bytes(buf)
     _lib.quantfunc_image_destroy(img_ptr)
-    send_json({
-        "type": "result", "req_id": req_id, "status": "ok",
-        "image_width": w, "image_height": h, "image_bytes": n_bytes,
-        "image_format": "rgb_uint8",
-    })
-    send_binary(raw)
+    send_json(meta)
+    send_binary(payload)
 
 
 # ============================================================================

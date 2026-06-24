@@ -1369,7 +1369,7 @@ class WorkerManager:
     def text_to_image(self, cache_key, prompt, height, width, steps, seed,
                       guidance_scale, options_json=None, pbar=None,
                       latent_preview=None):
-        """Generate text-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
+        """Generate text-to-image on the specified pipeline. Returns (images, masks) — see _read_image.
         `latent_preview` (dict with max_size/every_n_steps, already injected into
         options_json by the caller) enables per-step live preview."""
         with self._lock:
@@ -1484,7 +1484,7 @@ class WorkerManager:
                        options_json=None, pbar=None,
                        mask_path=None, mask_strength=1.0, mask_grow=6,
                        mask_blur=0.0, mask_no_snap=False, latent_preview=None):
-        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array.
+        """Generate image-to-image on the specified pipeline. Returns (images, masks) — see _read_image.
         Optional inpaint: pass `mask_path` to a pixel-space mask PNG (white=inpaint, black=preserve).
         Mirrors ComfyUI SetLatentNoiseMask + GrowMask + MaskBlur + VAEEncodeForInpaint.grow_mask_by.
         `latent_preview` enables per-step live preview (config already in options_json).
@@ -1689,9 +1689,12 @@ class WorkerManager:
     def _read_image(self, resp):
         """Read image data from worker response.
 
-        Prefers /dev/shm path (zero-copy mmap-style read) over stdout pipe
-        binary — the shm path avoids a ~3MB bytes() on worker side and
-        multiple pipe syscalls on parent side."""
+        Returns (images, masks):
+          images: float32 ndarray [N, H, W, 3] in [0,1]  (N==1 for single-image
+                  results — byte-identical to the legacy path).
+          masks:  float32 ndarray [N, H, W] in [0,1] (per-image alpha), or None when
+                  the result is RGB (no alpha).
+        Prefers /dev/shm (zero-copy) over the stdout pipe."""
         n_bytes = resp.get("image_bytes", 0)
         w = resp.get("image_width", 0)
         h = resp.get("image_height", 0)
@@ -1700,13 +1703,24 @@ class WorkerManager:
         # Bound + consistency-check the worker-reported sizes BEFORE the read /
         # reshape: a desynced or compromised worker could otherwise force an
         # unbounded blocking read, or a reshape mismatch deep in numpy.
+        N = int(resp.get("image_count", 1))
+        C = int(resp.get("image_channels", 3))
+        fmt = resp.get("image_format", "rgb_float32")
         _MAX_IMG_DIM = 16384
         if w > _MAX_IMG_DIM or h > _MAX_IMG_DIM:
             raise RuntimeError(f"Worker reported implausible image dims {w}x{h}")
-        _bpp = 3 if resp.get("image_format", "rgb_float32") == "rgb_uint8" else 12
-        if n_bytes != w * h * _bpp:
+        if N < 1 or N > 4096 or C not in (3, 4):
+            raise RuntimeError(f"Worker reported implausible count/channels N={N} C={C}")
+        if fmt == "rgb_uint8":
+            expected = w * h * 3
+        elif fmt == "layers_f32":
+            expected = N * h * w * C * 4
+        else:  # legacy single float32 RGB
+            expected = w * h * 3 * 4
+        if n_bytes != expected:
             raise RuntimeError(
-                f"Worker image_bytes={n_bytes} != expected {w * h * _bpp} ({w}x{h})")
+                f"Worker image_bytes={n_bytes} != expected {expected} "
+                f"(fmt={fmt} {w}x{h} N={N} C={C})")
         shm_path = resp.get("image_shm_path")
         if shm_path:
             try:
@@ -1719,14 +1733,19 @@ class WorkerManager:
                     pass
         else:
             raw = self._read_binary(n_bytes)
-        fmt = resp.get("image_format", "rgb_float32")
         if fmt == "rgb_uint8":
             # uint8 [0,255] → float32 [0,1], 4x less IPC data than float32
             arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).astype(np.float32) / 255.0
-        else:
-            # Legacy float32 path
-            arr = np.frombuffer(raw, dtype=np.float32).reshape(h, w, 3).copy()
-        return arr
+            return arr[None, ...].copy(), None          # [1,H,W,3], no alpha
+        if fmt == "layers_f32":
+            # All N images stacked, [N,H,W,C] float32 in [0,1]. Split RGB + alpha.
+            flat = np.frombuffer(raw, dtype=np.float32).reshape(N, h, w, C)
+            images = np.ascontiguousarray(flat[..., :3])               # [N,H,W,3]
+            masks = np.ascontiguousarray(flat[..., 3]) if C == 4 else None  # [N,H,W]
+            return images, masks
+        # Legacy single float32 RGB
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(h, w, 3).copy()
+        return arr[None, ...], None
 
 
 _manager = WorkerManager()
@@ -1857,12 +1876,14 @@ class QuantFuncPipelineConfig:
                 "attention_backend": (["auto", "sage", "flash", "sdpa"], {"default": "auto",
                                       "tooltip": "Attention implementation: auto picks best for your GPU"}),
                 "precision": (["bf16", "fp16"], {"default": "bf16", "tooltip": "Compute precision for pipeline"}),
-                "text_precision": (["int4", "int8", "fp4", "fp8", "fp16"], {"default": "int4",
-                                    "tooltip": "Text encoder quantization precision (fp4 requires SM120+/Blackwell)"}),
+                "text_precision": (["int4", "int8", "fp4", "fp8", "fp16", "bf16"], {"default": "int4",
+                                    "tooltip": "Text encoder quantization precision (fp4 requires SM120+/Blackwell; "
+                                               "bf16 = full-precision BF16 weights, used by Klein-base models)"}),
                 "vision_quant": (["int8", "int4", "fp8", "fp4", "fp16"], {"default": "int8",
                                   "tooltip": "Vision encoder quantization (int8 = INT8 weights + FP16 compute, best quality/size tradeoff)"}),
-                "vae_precision": (["auto", "fp16", "fp8", "int8"], {"default": "auto",
-                                  "tooltip": "VAE precision (auto picks fp8/int8 on SM120+ via cuDNN, falls back to fp16 elsewhere)"}),
+                "vae_precision": (["auto", "fp16", "fp8", "int8", "bf16"], {"default": "auto",
+                                  "tooltip": "VAE precision (auto picks fp8/int8 on SM120+ via cuDNN, falls back to fp16 elsewhere; "
+                                             "bf16 = full-precision BF16, used by Klein-base models)"}),
                 "act_quant_mode": (["absmax", "auto", "mse"], {"default": "absmax",
                                   "tooltip": "Activation quantization scale algorithm (Lighting backend, INT4 only):\n"
                                              "• absmax (default) — fast single-pass, scale = absmax/7\n"
@@ -2903,6 +2924,42 @@ class QuantFuncLoRAConfig:
         return (cfg,)
 
 
+class QuantFuncLayeredConfig:
+    """Configure Qwen-Image-Layered decomposition. Place between the pipeline builder
+    and Generate. Sets how many RGBA layers the model decomposes the input into — the
+    official `layers` parameter (variable 3/4/8...; default 4). It is a PER-GENERATION
+    setting (passed per-call like the official diffusers `layers`), so changing it does
+    NOT rebuild the pipeline — the next generation just decomposes into the new count.
+    Only affects QwenImageLayered models; harmless on others. Wire QuantFunc Generate's
+    `image`/`mask` outputs into a QuantFunc Layer Viewer to inspect the resulting layers."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("QUANTFUNC_PIPELINE",),
+                "layers": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1,
+                            "tooltip": "Number of RGBA layers to decompose into "
+                                       "(Qwen-Image-Layered `layers`; official default 4, "
+                                       "supports 3/4/8...). Higher = finer decomposition + slower."}),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "configure"
+    CATEGORY = "QuantFunc"
+
+    def configure(self, pipeline, layers):
+        cfg = dict(pipeline)
+        # Top-level key (NOT under "options") so it sits OUTSIDE _make_cache_key →
+        # changing the layer count does NOT rebuild/reload the pipeline. QuantFunc
+        # Generate reads it and passes it per-generation; the engine applies it via its
+        # per-call layered_layers override (matches the official per-call `layers`).
+        cfg["_layered_layers"] = int(layers)
+        return (cfg,)
+
+
 # ============================================================================
 # Node: QuantFunc Generate
 # ============================================================================
@@ -3126,29 +3183,12 @@ class QuantFuncGenerate:
                                "$QUANTFUNC_BACKUP_DIR / $TMPDIR / /var/tmp / /tmp while "
                                "the pipeline is alive (unlinked on clean exit).",
                 }),
-                "ideogram4_sampler": ("STRING", {
-                    "default": "",
-                    "tooltip": (
-                        "Ideogram-4 ADVANCED sampler override (optional; leave EMPTY "
-                        "for the default — you normally only set 'steps').\n\n"
-                        "By DEFAULT Ideogram-4 auto-selects the official sampler preset "
-                        "from your step count: steps<=12 -> TURBO, <=20 -> DEFAULT, "
-                        "<=48 -> QUALITY (sets mu/std/cleanup_steps/cleanup_gw for you; "
-                        ">48 clamps to QUALITY).\n\n"
-                        "Power users: paste a JSON object to OVERRIDE individual preset "
-                        "params, e.g. {\"ideogram4_mu\": 0.2, \"ideogram4_std\": 1.6, "
-                        "\"ideogram4_cleanup_steps\": 2, \"ideogram4_cleanup_gw\": 3.0}. "
-                        "Only the keys you supply override the auto-selected tier; the "
-                        "rest stay on-tier. Ignored by non-Ideogram models. Empty = "
-                        "pure auto (byte-identical default path)."
-                    ),
-                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
         }
 
-    RETURN_TYPES = ("IMAGE", "QF_LATENT_PREVIEW")
-    RETURN_NAMES = ("image", "latent_preview")
+    RETURN_TYPES = ("IMAGE", "QF_LATENT_PREVIEW", "MASK")
+    RETURN_NAMES = ("image", "latent_preview", "mask")
     OUTPUT_NODE = True
     FUNCTION = "generate"
     CATEGORY = "QuantFunc"
@@ -3184,7 +3224,7 @@ class QuantFuncGenerate:
                  scheduler="normal",
                  control_image=None,
                  activate_unload=False, unload_mode=None, unload_every_time=None,
-                 fbcache=0.0, ideogram4_sampler="",
+                 fbcache=0.0,
                  unique_id=None, workflow_prompt=None):
         # Backwards-compat with older saved workflows that used the
         # unload_mode dropdown or the unload_every_time bool: both are
@@ -3203,6 +3243,24 @@ class QuantFuncGenerate:
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # Qwen-Image-Layered guidance — NON-intrusive: we NEVER override your widget
+        # values (you control steps / true_cfg / negative_prompt / resolution). We only
+        # warn when the current settings are likely to under-perform vs the official
+        # reference (num_inference_steps=50, true_cfg_scale=4.0, negative_prompt=" ",
+        # 640/1024 resolution bucket). Plugin-only.
+        if str(cfg.get("_arch", "") or "").startswith("QwenImageLayered"):
+            if steps < 20:
+                logging.warning("[QuantFunc] Layered: steps=%d is low — the official ComfyUI template "
+                                "uses 20 steps + CFG 2.5 + 640px (the model's original 50/4.0 is ~2x "
+                                "slower); fewer than 20 may not form clean layers.", steps)
+            if true_cfg_scale > 1.0 and not (isinstance(negative_prompt, str) and negative_prompt):
+                logging.warning("[QuantFunc] Layered: true_cfg_scale=%.1f>1 but negative_prompt is "
+                                "empty — the engine applies CFG only with a non-empty negative prompt "
+                                "(official uses ' '); CFG will NOT engage as-is.", true_cfg_scale)
+            _area = int(width) * int(height)
+            if not (560 * 560 <= _area <= 1120 * 1120):
+                logging.warning("[QuantFunc] Layered: %dx%d is outside the recommended 640/1024 "
+                                "resolution buckets — try ~640x640 or ~1024x1024.", width, height)
         # Propagate activate_unload into the pipeline's comp_opts so the
         # C++ side builds the transformer's coalesced backup on disk
         # (enabling future releaseRamPages) instead of in pinned RAM.
@@ -3227,29 +3285,6 @@ class QuantFuncGenerate:
             cfg["options"]["ideogram4_fbcache"] = fbc
             cfg["options"]["ideogram4_fbcache_cond"] = fbc
             cfg["options"]["wan_fbcache_thresh"] = fbc
-        # #347 Ideogram-4 advanced sampler override (optional). By default the
-        # engine auto-selects the official preset from `steps` (TURBO_12 /
-        # DEFAULT_20 / QUALITY_48) — the user sets ONLY steps. A power user may
-        # OVERRIDE individual preset params via this JSON; each supplied key is
-        # injected as a create-time comp_opt, which the engine treats as EXPLICIT
-        # (kept over the tier value) while absent keys stay on the auto-selected
-        # tier. Empty (default) leaves cfg["options"] untouched → pure auto, so
-        # the default path does NOT perturb the pipeline cache key.
-        _ideo_override = (ideogram4_sampler or "").strip()
-        if _ideo_override:
-            try:
-                _ov = json.loads(_ideo_override)
-            except (ValueError, TypeError) as e:
-                raise ValueError(
-                    "ideogram4_sampler must be a JSON object like "
-                    '{"ideogram4_mu": 0.0, "ideogram4_std": 1.5}; got: %s' % e)
-            if not isinstance(_ov, dict):
-                raise ValueError(
-                    "ideogram4_sampler must be a JSON OBJECT, got %s" % type(_ov).__name__)
-            for _k in ("ideogram4_mu", "ideogram4_std",
-                       "ideogram4_cleanup_steps", "ideogram4_cleanup_gw"):
-                if _k in _ov:
-                    cfg["options"][_k] = _ov[_k]
         # Unpack ImageList dict format
         ref_img_resize = "720"
         ref_img_resize_others = "720"
@@ -3363,10 +3398,22 @@ class QuantFuncGenerate:
                     _have_cv2 = True
                 except ImportError:
                     _have_cv2 = False
-                from PIL import Image  # used only for output preview path
+                from PIL import Image  # output preview + RGBA-pipeline ref staging
+                # Most pipelines take an RGB reference (engine load_image channels=3)
+                # and use the fast QFRAW01 raw-RGB blob. But an RGBA-input pipeline
+                # (QwenImageLayered → its VAE encoder input_channels=4, so the engine
+                # calls load_image with channels=4) BYPASSES the RGB-only qfraw decoder
+                # and would fall to cv::imread on a raw blob → "Failed to load image".
+                # For those, stage a real PNG instead: the engine's already-correct
+                # cv::imread(IMREAD_UNCHANGED) path loads it at 4 channels (opaque
+                # alpha for an RGB source, real alpha for an RGBA source). No engine
+                # change; RGB pipelines keep the fast qfraw blob.
+                _RGBA_INPUT_ARCHS = ("QwenImageLayered",)  # arches whose refImageChannels()==4
+                pipeline_wants_rgba = str(cfg.get("_arch", "") or "").startswith(_RGBA_INPUT_ARCHS)
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
-                        fd, tmp_path = tempfile.mkstemp(suffix=".qfraw", dir=_staging_dir)
+                        suffix = ".png" if pipeline_wants_rgba else ".qfraw"
+                        fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=_staging_dir)
                         os.close(fd)
                         # Track the path BEFORE the write so a mid-write failure
                         # (e.g. %TEMP% disk-full on Windows — now real disk, not
@@ -3383,14 +3430,31 @@ class QuantFuncGenerate:
                         else:
                             img_np = (arr_f32 * 255).clip(0, 255).astype(np.uint8)
                         h, w = img_np.shape[0], img_np.shape[1]
-                        header = b"QFRAW01\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
-                        with open(tmp_path, "wb") as f:
-                            f.write(header)
-                            # tobytes() is C-contiguous HWC uint8 — RGB order
-                            # matches ComfyUI's IMAGE convention, so no swap.
-                            f.write(img_np.tobytes())
+                        c = img_np.shape[2] if img_np.ndim == 3 else 1
+                        if pipeline_wants_rgba:
+                            # Real PNG → engine cv::imread(IMREAD_UNCHANGED) loads it
+                            # at 4ch. PIL writes RGB(A) in the correct order (no BGR
+                            # swap), matching ComfyUI's IMAGE convention. compress_level
+                            # low — /dev/shm is RAM, so favor encode speed over size.
+                            mode = "RGBA" if c == 4 else "RGB"
+                            Image.fromarray(np.ascontiguousarray(img_np), mode).save(
+                                tmp_path, format="PNG", compress_level=1)
+                        else:
+                            header = b"QFRAW01\x00" + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+                            with open(tmp_path, "wb") as f:
+                                f.write(header)
+                                # tobytes() is C-contiguous HWC uint8 — RGB order
+                                # matches ComfyUI's IMAGE convention, so no swap.
+                                f.write(img_np.tobytes())
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 i2i_opts = {}
+                # Qwen-Image-Layered layer count (from QuantFunc Layered Config, stashed
+                # at cfg["_layered_layers"] OUTSIDE the cache key). Passed PER-GENERATION
+                # → the engine's per-call layered_layers override applies it with NO
+                # pipeline rebuild. Absent / non-layered → engine uses its default (4).
+                _layered_layers = cfg.get("_layered_layers")
+                if isinstance(_layered_layers, int) and _layered_layers >= 1:
+                    i2i_opts["layered_layers"] = _layered_layers
                 # #293 t2i img2img: strength → C-API options_json edit_strength →
                 # setEditImg2ImgStrength → flow-match SDEdit init in t2i generate().
                 if img2img_mode:
@@ -3446,7 +3510,7 @@ class QuantFuncGenerate:
                         f.write(header)
                         f.write(m_np.tobytes())
 
-                arr = _manager.image_to_image(
+                images_np, masks_np = _manager.image_to_image(
                     cache_key=cache_key,
                     prompt=prompt, ref_paths=tmp_paths,
                     height=height, width=width, steps=steps, seed=seed,
@@ -3460,12 +3524,15 @@ class QuantFuncGenerate:
                     latent_preview=lp_cfg)
                 # color_match (潜在色彩匹配): plugin-side Reinhard post-decode against
                 # the main reference image. Engine has the same algorithm but no
-                # i2i-options wiring, so we do it here — no C++ change. Edit-mode only.
-                if color_match > 0.0 and ref_images:
+                # i2i-options wiring, so we do it here — no C++ change. Single-image
+                # edit only — a multi-layer (QwenImageLayered) result has no defined
+                # per-layer reference, so color_match is skipped for N>1.
+                if color_match > 0.0 and ref_images and images_np.shape[0] == 1:
                     try:
                         ref0 = ref_images[0]
                         ref_np = (ref0[0] if ref0.dim() == 4 else ref0).detach().cpu().numpy()
-                        arr = _reinhard_color_match(arr, ref_np, color_match)
+                        images_np = images_np.copy()
+                        images_np[0] = _reinhard_color_match(images_np[0], ref_np, color_match)
                     except Exception as _cm_e:
                         logging.warning("[QuantFunc] color_match skipped: %s", _cm_e)
             else:
@@ -3518,7 +3585,7 @@ class QuantFuncGenerate:
                     sampler_solver_order, sampler_predictor_order,
                     sampler_corrector_order, opts_json)
 
-                arr = _manager.text_to_image(
+                images_np, masks_np = _manager.text_to_image(
                     cache_key=cache_key,
                     prompt=prompt, height=height, width=width,
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
@@ -3532,7 +3599,12 @@ class QuantFuncGenerate:
             with _manager._lock:
                 _manager._unload_modes[cache_key] = unload_mode_internal
 
-            out = torch.from_numpy(arr).unsqueeze(0)
+            out = torch.from_numpy(images_np)  # [N, H, W, 3] (N==1 for single-image)
+            # Per-image alpha → MASK output. None (RGB result) → opaque ones, so any
+            # downstream MASK consumer is safe. APPENDED as the 3rd port so the
+            # existing image/latent_preview slot indices are unchanged (no regression).
+            out_mask = (torch.from_numpy(masks_np) if masks_np is not None
+                        else torch.ones(out.shape[:3], dtype=torch.float32))  # [N, H, W]
             # 2nd output = wire to the Latent Preview viewer node. It only
             # anchors the connection (so we can locate the viewer + route the
             # live per-step frames to its node id) and triggers the viewer's
@@ -3540,12 +3612,12 @@ class QuantFuncGenerate:
             # is a lightweight sentinel (NOT the full image tensor — that would
             # be serialized over the wire for nothing). None when no viewer wired.
             lp_out = True if lp_node_id is not None else None
-            return (out, lp_out)  # [1, H, W, 3]
+            return (out, lp_out, out_mask)  # image [N,H,W,3], latent_preview, mask [N,H,W]
 
         except InterruptedError:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
             blank = torch.zeros(1, height, width, 3, dtype=torch.float32)
-            return (blank, None)
+            return (blank, None, torch.ones(1, height, width, dtype=torch.float32))
         finally:
             # Unlink the /dev/shm QFRAW staging files. By image_to_image's return
             # the engine has already read them; on interrupt they're unused. Either
@@ -4007,7 +4079,102 @@ class QuantFuncGenerateVideo:
         return (image, audio_out)
 
 
+class QuantFuncLayerViewer:
+    """Interactive viewer for QwenImageLayered's N RGBA layers.
+
+    Wire QuantFuncGenerate's `image` output to `images` (and `mask` → `masks` for true
+    transparency). The node body shows a thumbnail list of all layers + a main canvas:
+    click a layer to isolate it; the default (nothing selected) shows the alpha-over
+    composite of every layer. Non-layered inputs (N==1) just show that one image.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "masks": ("MASK", {"tooltip": "Per-layer alpha (wire QuantFunc Generate's `mask`)."}),
+                "save_layers": ("BOOLEAN", {"default": False,
+                    "tooltip": "Also write the N RGBA layers + the composite to the output/ folder."}),
+                "filename_prefix": ("STRING", {"default": "QF_layer"}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "view"
+    OUTPUT_NODE = True
+    CATEGORY = "QuantFunc"
+
+    @staticmethod
+    def _to_rgba_uint8(img_hw3, mask_hw):
+        """[H,W,3] float + optional [H,W] alpha → [H,W,4] uint8 (opaque if no mask)."""
+        rgb = (np.clip(img_hw3, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        if mask_hw is not None:
+            a = (np.clip(mask_hw, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        else:
+            a = np.full(rgb.shape[:2], 255, np.uint8)
+        return np.dstack([rgb, a])
+
+    @staticmethod
+    def _composite(rgba_list):
+        """Alpha-over the layers bottom→top → [H,W,4] uint8 with STRAIGHT (unassociated)
+        alpha, which is how PIL writes an RGBA PNG. Accumulate in PREMULTIPLIED form (the
+        numerically clean way to iterate Porter-Duff 'over'), then UN-premultiply the RGB
+        at the end — saving premultiplied RGB under PIL's straight-alpha PNG would darken
+        semi-transparent regions (the browser canvas display path is unaffected; it
+        composites straight RGBA via source-over)."""
+        out = np.zeros((*rgba_list[0].shape[:2], 4), np.float32)  # premultiplied accumulator
+        for rgba in rgba_list:
+            f = rgba.astype(np.float32) / 255.0
+            a = f[..., 3:4]
+            out[..., :3] = f[..., :3] * a + out[..., :3] * (1.0 - a)
+            out[..., 3:4] = a + out[..., 3:4] * (1.0 - a)
+        alpha = out[..., 3:4]
+        rgb = np.divide(out[..., :3], alpha, out=np.zeros_like(out[..., :3]), where=alpha > 1e-6)
+        straight = np.concatenate([rgb, alpha], axis=-1)
+        return (np.clip(straight, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    def view(self, images, masks=None, save_layers=False, filename_prefix="QF_layer"):
+        import random
+        from PIL import Image
+        import folder_paths
+
+        imgs = images.detach().cpu().numpy()                       # [N,H,W,3]
+        N, H, W = imgs.shape[0], imgs.shape[1], imgs.shape[2]
+        msk = masks.detach().cpu().numpy() if masks is not None else None  # [M,H,W]|None
+
+        rgba_list = [
+            self._to_rgba_uint8(imgs[i], msk[i] if (msk is not None and i < msk.shape[0]) else None)
+            for i in range(N)
+        ]
+
+        # Save each layer as an RGBA PNG to ComfyUI's temp dir for the live viewer.
+        temp_dir = folder_paths.get_temp_directory()
+        prefix = "qflayer_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(6))
+        full_dir, fname, counter, subfolder, _ = folder_paths.get_save_image_path(prefix, temp_dir, W, H)
+        ui_layers = []
+        for i, rgba in enumerate(rgba_list):
+            file = f"{fname}_{counter:05}_{i:03}.png"
+            Image.fromarray(rgba, "RGBA").save(os.path.join(full_dir, file), compress_level=1)
+            ui_layers.append({"filename": file, "subfolder": subfolder, "type": "temp"})
+
+        # Optional permanent save → output/ (each layer + the composite).
+        if save_layers:
+            out_dir = folder_paths.get_output_directory()
+            o_full, o_name, o_counter, _o_sub, _ = folder_paths.get_save_image_path(filename_prefix, out_dir, W, H)
+            for i, rgba in enumerate(rgba_list):
+                Image.fromarray(rgba, "RGBA").save(
+                    os.path.join(o_full, f"{o_name}_{o_counter:05}_layer{i:03}.png"))
+            Image.fromarray(self._composite(rgba_list), "RGBA").save(
+                os.path.join(o_full, f"{o_name}_{o_counter:05}_composite.png"))
+
+        return {"ui": {"qf_layers": ui_layers, "qf_size": [W, H]}}
+
+
 NODE_CLASS_MAPPINGS = {
+    "QuantFuncLayerViewer": QuantFuncLayerViewer,
     "QuantFuncGenerateVideo": QuantFuncGenerateVideo,
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
@@ -4027,6 +4194,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncControlNetAutoLoader": QuantFuncControlNetAutoLoader,
     "QuantFuncControlImage": QuantFuncControlImage,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
+    "QuantFuncLayeredConfig": QuantFuncLayeredConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
     "QuantFuncLatentPreview": QuantFuncLatentPreview,
     "QuantFuncImageList": QuantFuncImageList,
@@ -4052,7 +4220,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncControlNetAutoLoader": "QuantFunc ControlNet Auto Loader",
     "QuantFuncControlImage": "QuantFunc Control Image",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
+    "QuantFuncLayeredConfig": "QuantFunc Layered Config",
     "QuantFuncGenerate": "QuantFunc Generate",
+    "QuantFuncLayerViewer": "QuantFunc Layer Viewer",
     "QuantFuncGenerateVideo": "QuantFunc Generate Video (LTX-2 +Audio)",
     "QuantFuncLatentPreview": "QuantFunc Latent Preview",
     "QuantFuncImageList": "QuantFunc Image List",

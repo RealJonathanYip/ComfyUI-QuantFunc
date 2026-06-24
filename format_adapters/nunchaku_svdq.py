@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from .base import BuildContext, FormatAdapter, SourceBundle, StagingResult
@@ -84,17 +85,22 @@ class NunchakuSVDQAdapter(FormatAdapter):
             bundled_te_config, bundled_vae_config,
         )
         from .comfyui_clip import _detect_te_prefix
-        from .comfyui_vae import _detect_vae_prefix
+        from .comfyui_vae import _detect_vae_prefix, _is_comfyui_flat_vae
 
         assert sources.transformer is not None
         xfm_path = sources.transformer.path
         _, xfm_class = _detect_nunchaku(xfm_path)
 
         # Arch detection: prefer metadata _class_name, fall back to QwenImage.
-        # Nunchaku currently only ships QwenImage variants.
+        # Nunchaku ships QwenImage variants and (newer) Z-Image-Turbo SVDQ files.
+        # A ZImageTransformer2DModel must NOT stay mis-tagged QwenImage (#408) —
+        # that picks the wrong VAE/TE/tokenizer config + ZImagePipeline routing.
         arch = "QwenImage"
-        if xfm_class and "Edit" in xfm_class:
-            arch = "QwenImageEdit"
+        if xfm_class:
+            if "ZImage" in xfm_class or "Z_Image" in xfm_class or "ZImagePipeline" in xfm_class:
+                arch = "ZImage"
+            elif "Edit" in xfm_class:
+                arch = "QwenImageEdit"
 
         layout = HFLayout(staging_dir)
 
@@ -135,11 +141,19 @@ class NunchakuSVDQAdapter(FormatAdapter):
             layout.add_vae(vae_path, config=vae_cfg)
             if vae_prefix:
                 layout.set_key_filter("vae", vae_prefix)  # bundle slice: filter by `vae.` prefix
-            # ComfyUI VAE files (both standalone qwen_image_vae.safetensors and
-            # bundle-embedded vae.* slices) use flat naming (conv1.weight, head.0.gamma)
-            # vs diffusers nested (encoder.conv_in.weight, decoder.norm_out.weight).
-            # ComfyUIVAEAliasProvider translates flat → nested at lookup time.
-            layout.set_extra("vae_comfyui_alias", True)
+            # Only ComfyUI FLAT-named VAEs (standalone qwen_image_vae.safetensors
+            # or bundle-embedded vae.* slices: conv1.weight, head.0.gamma) need the
+            # engine's ComfyUIVAEAliasProvider (flat ↔ diffusers translation). A
+            # diffusers-native VAE (diffusion_pytorch_model.safetensors with
+            # post_quant_conv.*/encoder.conv_in.*) is ALREADY what the engine asks
+            # for; aliasing it remaps post_quant_conv.bias → conv2.bias → "not
+            # found" (#408). Gate the flag on the actual key shape.
+            if _is_comfyui_flat_vae(vae_path, vae_prefix):
+                layout.set_extra("vae_comfyui_alias", True)
+            else:
+                logger.info("[nunchaku_svdq] VAE is diffusers-native (%s) — engine "
+                            "reads it directly, ComfyUIVAEAliasProvider NOT applied",
+                            os.path.basename(str(vae_path)))
         else:
             layout.add_vae(xfm_path, config=vae_cfg)
             logger.warning("[nunchaku_svdq] no vae source — generation will fail "
