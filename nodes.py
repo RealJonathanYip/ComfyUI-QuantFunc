@@ -3410,6 +3410,26 @@ class QuantFuncGenerate:
                 # change; RGB pipelines keep the fast qfraw blob.
                 _RGBA_INPUT_ARCHS = ("QwenImageLayered",)  # arches whose refImageChannels()==4
                 pipeline_wants_rgba = str(cfg.get("_arch", "") or "").startswith(_RGBA_INPUT_ARCHS)
+                # #411 defense-in-depth: cfg["_arch"] can still be the plain "QwenImage"
+                # fallback if the per-file fingerprint missed the layered identity (flat
+                # lighting export / non-shard-1 shard / model_dir-as-path). Mirror the
+                # engine's OWN source of truth — model_dir/model_index.json _class_name
+                # == QwenImageLayeredPipeline (the signal it uses for refImageChannels()
+                # ==4) — plus a "layered" model_dir marker. A false positive only stages
+                # a PNG (engine loads it at 3 OR 4 channels — harmless); a false negative
+                # crashes with "Failed to load image .qfraw".
+                if not pipeline_wants_rgba:
+                    _md = str(cfg.get("model_dir", "") or "")
+                    try:
+                        _mi = os.path.join(_md, "model_index.json")
+                        if os.path.isfile(_mi):
+                            with open(_mi, "r", encoding="utf-8") as _mf:
+                                if json.load(_mf).get("_class_name") == "QwenImageLayeredPipeline":
+                                    pipeline_wants_rgba = True
+                    except Exception:
+                        pass
+                    if not pipeline_wants_rgba and "layered" in os.path.basename(_md).lower():
+                        pipeline_wants_rgba = True
                 for img_tensor in ref_images:
                     for i in range(img_tensor.shape[0]):
                         suffix = ".png" if pipeline_wants_rgba else ".qfraw"

@@ -925,6 +925,42 @@ class QuantFuncBuildPipeline:
             backend = "lighting"
             transformer_path = ""
 
+        # #411: robustly recover the Qwen-Image-Layered identity. The per-file
+        # fingerprint (fingerprint_arch_from_keys) collapses a layered model to
+        # plain "QwenImage" on several load layouts — a flat lighting export whose
+        # metadata _class_name is the SHARED QwenImageTransformer2DModel; a
+        # non-shard-1 shard read with no sibling config; a model_dir handed in as a
+        # directory. The ENGINE picks QwenImageLayered — and refImageChannels()==4 —
+        # from model_index.json _class_name, so mirror that exact source of truth
+        # here. Without it cfg["_arch"] != "QwenImageLayered" -> QuantFunc Generate
+        # stages the RGBA ref as an RGB-only QFRAW blob -> engine load_image(
+        # channels=4) bypasses the QFRAW decoder -> cv::imread on a raw blob ->
+        # "Failed to load image .qfraw" (regressed #397). A false positive is
+        # harmless (a real PNG loads at 3 OR 4 channels); a false negative crashes,
+        # so bias toward detecting layered.
+        eff_arch = staging.arch
+        if not str(eff_arch or "").startswith("QwenImageLayered"):
+            _layered = False
+            try:
+                import json as _json
+                _mi = os.path.join(str(staging.model_dir or ""), "model_index.json")
+                if os.path.isfile(_mi):
+                    with open(_mi, "r", encoding="utf-8") as _f:
+                        if _json.load(_f).get("_class_name") == "QwenImageLayeredPipeline":
+                            _layered = True
+            except Exception:
+                pass
+            if not _layered:
+                _pc = precision_config if isinstance(precision_config, str) else ""
+                if ("layered" in os.path.basename(str(staging.model_dir or "")).lower()
+                        or "layered" in _pc.lower()):
+                    _layered = True
+            if _layered:
+                logger.info(
+                    "[BuildPipeline] arch upgraded %r -> QwenImageLayered "
+                    "(model_index/precision_config layered marker, #411)", eff_arch)
+                eff_arch = "QwenImageLayered"
+
         cfg = {
             "model_dir": staging.model_dir,
             "transformer": transformer_path,
@@ -934,14 +970,14 @@ class QuantFuncBuildPipeline:
             "device": device_idx,
             "options": options,
             "unload": False,
-            "_arch": staging.arch,
+            "_arch": eff_arch,
             "_method_hint": staging.method_hint,
             "_staging_cleanup": staging.cleanup_dir,
         }
         logger.info(
             "[BuildPipeline] arch=%s method=%s xfm=%s te=%s vae=%s "
             "precision=%s vae_prec=%s text_prec=%s",
-            staging.arch, staging.method_hint,
+            eff_arch, staging.method_hint,
             os.path.basename(xfm_ref.path),
             os.path.basename(te_ref.path) if te_ref else "(none)",
             os.path.basename(vae_ref.path) if vae_ref else "(none)",
