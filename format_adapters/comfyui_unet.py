@@ -47,6 +47,7 @@ from .tools.hf_layout import (
     copy_tokenizer_bundle,
     bundled_te_config,
     bundled_vae_config,
+    assert_vae_matches_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,10 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
         if sources.vae is not None:
             from .comfyui_vae import _detect_vae_prefix
             vae_path = sources.vae.path
+            # Fail LOUD if the wired VAE's channel count is wrong for this arch
+            # (QwenImageLayered needs a 4-channel RGBA VAE) — a clear, actionable
+            # error instead of the engine's cryptic deep conv_out [4]vs[3] crash.
+            assert_vae_matches_arch(arch, vae_path)
             vae_prefix = _detect_vae_prefix(vae_path)
             # ZImage / SDXL-style BFL VAE files use `mid.attn_1.{q,k,v}` +
             # `up.N.block.M` etc.; HF AutoencoderKL uses

@@ -47,6 +47,7 @@ from .tools.hf_layout import (
     copy_tokenizer_bundle,
     bundled_te_config,
     bundled_vae_config,
+    assert_vae_matches_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,10 @@ class BundledCheckpointAdapter(FormatAdapter):
         if sources.vae is not None:
             from .comfyui_vae import _detect_vae_prefix
             vae_path = sources.vae.path
+            # A separately-wired VAE can be the wrong channel count for this arch
+            # (e.g. a QwenImageLayered qf_flat_bundle + the standard 3-ch
+            # qwen_image_vae): fail LOUD instead of a cryptic engine conv_out crash.
+            assert_vae_matches_arch(arch, vae_path)
             vae_prefix = _detect_vae_prefix(vae_path)
             layout.add_vae(vae_path, config=vae_cfg)
             if vae_prefix:

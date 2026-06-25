@@ -162,6 +162,7 @@ class HFLayoutAdapter(FormatAdapter):
         from .tools.hf_layout import (
             HFLayout, copy_tokenizer, bundled_transformer_config,
             bundled_te_config, bundled_vae_config, ARCH_TO_TRANSFORMER_CLASS,
+            assert_vae_matches_arch,
         )
         arch = fingerprint_arch_from_keys(ref.path) or ref.arch or "QwenImage"
         layout = HFLayout(staging_dir)
@@ -211,6 +212,9 @@ class HFLayoutAdapter(FormatAdapter):
                 config=(_sibling_config(sources.text_encoder.path)
                         or bundled_te_config(arch)))
         if sources.vae:
+            # QwenImageLayered needs a 4-channel RGBA VAE: fail LOUD on a wrong
+            # (3-ch) wired VAE instead of a cryptic engine conv_out [4]vs[3] crash.
+            assert_vae_matches_arch(arch, sources.vae.path)
             layout.add_vae(
                 sources.vae.path,
                 config=(_sibling_config(sources.vae.path)

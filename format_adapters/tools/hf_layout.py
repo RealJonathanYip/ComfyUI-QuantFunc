@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from .fs_util import link_or_copy
+from .safetensors_io import read_safetensors_header
 
 logger = logging.getLogger(__name__)
 
@@ -635,3 +636,66 @@ def bundled_vae_config(arch: str) -> Optional[dict]:
         logger.warning("[staging] no bundled VAE config for arch=%s at %s", arch, p)
         return None
     return json.loads(p.read_text())
+
+
+# Archs whose VAE MUST be 4-channel RGBA: the layered decomposition emits N RGBA
+# layers, each carrying a per-layer ALPHA channel, so its VAE decodes 4 channels
+# (the official Qwen-Image-Layered VAE has decoder out_channels=4). Base QwenImage
+# and QwenImageEdit output plain RGB (3 channels, no per-pixel alpha) — they are NOT
+# in this set and correctly accept the standard 3-channel qwen_image_vae.
+_RGBA_VAE_ARCHS = {"QwenImageLayered"}
+
+# Candidate "final decoder output convolution" tensor-name suffixes across the two
+# QwenImage VAE key conventions: diffusers AutoencoderKLQwenImage (`decoder.conv_out.*`)
+# and the ComfyUI-flat layout (`decoder.head.2.*` — the Conv ending the `head` =
+# [RMSNorm, SiLU, Conv] sequence). shape[0] of either is the output channel count
+# (3 = RGB, 4 = RGBA). Suffix-matched so a `vae.` wrapper prefix is tolerated.
+_VAE_OUT_CONV_SUFFIXES = (
+    "decoder.conv_out.bias", "decoder.conv_out.weight",
+    "decoder.head.2.bias", "decoder.head.2.weight",
+)
+
+
+def vae_decoder_out_channels(vae_path) -> Optional[int]:
+    """Best-effort: the VAE decoder's OUTPUT channel count (3=RGB / 4=RGBA), read
+    from the final decoder-conv tensor shape in the safetensors header. Handles both
+    the diffusers (`decoder.conv_out`) and ComfyUI-flat (`decoder.head.2`) QwenImage
+    VAE namings. Returns None when the file can't be read or no recognised output
+    conv is found — callers MUST treat None as 'unknown' (never a mismatch), so an
+    unreadable / differently-keyed VAE is never falsely blocked."""
+    try:
+        hdr = read_safetensors_header(vae_path)
+    except Exception:
+        return None
+    for suffix in _VAE_OUT_CONV_SUFFIXES:
+        for k, info in hdr.items():
+            if k == "__metadata__":
+                continue
+            if k.endswith(suffix):
+                shape = (info or {}).get("shape") or []
+                if shape:
+                    return int(shape[0])
+    return None
+
+
+def assert_vae_matches_arch(arch: str, vae_path, vae_name: str = "") -> None:
+    """Fail LOUD with an ACTIONABLE message when the WIRED VAE's channel count is
+    wrong for `arch`, BEFORE the engine reaches a cryptic deep `conv_out [N] vs [M]`
+    copy-overflow. Guards the RGBA-VAE archs (QwenImageLayered): a layered
+    decomposition emits per-layer alpha, so it REQUIRES a 4-channel RGBA VAE; the
+    standard 3-channel RGB qwen_image_vae cannot represent the alpha. A NO-OP for
+    every other arch (QwenImage / QwenImageEdit keep the standard 3-ch VAE) and when
+    the channel count can't be determined (best-effort, never a false block)."""
+    if arch not in _RGBA_VAE_ARCHS:
+        return
+    ch = vae_decoder_out_channels(vae_path)
+    if ch is None or ch == 4:
+        return
+    name = vae_name or Path(vae_path).name
+    raise ValueError(
+        f"{arch} requires a 4-channel RGBA VAE (the layered decomposition emits "
+        f"per-layer alpha), but the wired VAE '{name}' decodes {ch} channels — this "
+        f"is a standard RGB QwenImage VAE, which cannot produce layered RGBA output. "
+        f"Wire the Qwen-Image-Layered model's OWN 4-channel RGBA VAE (the official "
+        f"diffusers model's vae/ — its decoder.conv_out has 4 output channels), not "
+        f"the base qwen_image_vae.")

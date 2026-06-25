@@ -82,7 +82,7 @@ class NunchakuSVDQAdapter(FormatAdapter):
               context: BuildContext) -> StagingResult:
         from .tools.hf_layout import (
             HFLayout, copy_tokenizer_bundle,
-            bundled_te_config, bundled_vae_config,
+            bundled_te_config, bundled_vae_config, assert_vae_matches_arch,
         )
         from .comfyui_clip import _detect_te_prefix
         from .comfyui_vae import _detect_vae_prefix, _is_comfyui_flat_vae
@@ -147,6 +147,9 @@ class NunchakuSVDQAdapter(FormatAdapter):
         vae_cfg = bundled_vae_config(arch) or {"_class_name": "AutoencoderKL"}
         if sources.vae is not None:
             vae_path = sources.vae.path
+            # QwenImageLayered needs a 4-channel RGBA VAE: fail LOUD on a wrong
+            # (3-ch) wired VAE instead of a cryptic engine conv_out [4]vs[3] crash.
+            assert_vae_matches_arch(arch, vae_path)
             vae_prefix = _detect_vae_prefix(vae_path)
             layout.add_vae(vae_path, config=vae_cfg)
             if vae_prefix:
