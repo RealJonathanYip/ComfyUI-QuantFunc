@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .base import BuildContext, FormatAdapter, SourceBundle, StagingResult
 from .factory import adapter
-from .tools import read_safetensors_metadata
+from .tools import read_safetensors_metadata, fingerprint_arch_from_keys
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,16 @@ class NunchakuSVDQAdapter(FormatAdapter):
                 arch = "ZImage"
             elif "Edit" in xfm_class:
                 arch = "QwenImageEdit"
+        # QwenImageLayered reuses the base QwenImageTransformer2DModel class, so the
+        # `xfm_class` metadata CANNOT tell it apart from base QwenImage — the only
+        # stable on-disk signal is the key fingerprint (its distinctive
+        # `addition_t_embedding` weight, see arch_fingerprint._detect_arch_by_keys).
+        # Confirm it whenever we'd otherwise default to base QwenImage. Only ever
+        # UPGRADES QwenImage → QwenImageLayered, so the ZImage/Edit class-string
+        # detection (#408) is untouched. Needed so the layered RGBA 4-ch VAE config +
+        # QwenImageLayeredPipeline routing are selected instead of the base 3-ch path.
+        if arch == "QwenImage" and fingerprint_arch_from_keys(xfm_path) == "QwenImageLayered":
+            arch = "QwenImageLayered"
 
         layout = HFLayout(staging_dir)
 

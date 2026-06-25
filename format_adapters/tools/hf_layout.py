@@ -36,18 +36,41 @@ logger = logging.getLogger(__name__)
 
 # Map our internal arch tag → diffusers _class_name (what detectPipelineKind expects)
 ARCH_TO_PIPELINE_CLASS = {
-    "QwenImage":      "QwenImagePipeline",
-    "QwenImageEdit":  "QwenImageEditPipeline",
-    "Flux2Klein":     "Flux2KleinPipeline",
-    "ZImage":         "ZImagePipeline",
+    "QwenImage":        "QwenImagePipeline",
+    "QwenImageEdit":    "QwenImageEditPipeline",
+    "QwenImageLayered": "QwenImageLayeredPipeline",
+    "Flux2Klein":       "Flux2KleinPipeline",
+    "ZImage":           "ZImagePipeline",
 }
 
 ARCH_TO_TRANSFORMER_CLASS = {
-    "QwenImage":      "QwenImageTransformer2DModel",
-    "QwenImageEdit":  "QwenImageTransformer2DModel",  # same class, edit_mode=true
-    "Flux2Klein":     "Flux2Transformer2DModel",
-    "ZImage":         "ZImageTransformer2DModel",
+    "QwenImage":        "QwenImageTransformer2DModel",
+    "QwenImageEdit":    "QwenImageTransformer2DModel",  # same class, edit_mode=true
+    "QwenImageLayered": "QwenImageTransformer2DModel",  # same class, use_additional_t_cond=true
+    "Flux2Klein":       "Flux2Transformer2DModel",
+    "ZImage":           "ZImageTransformer2DModel",
 }
+
+# Arch variants whose bundled TEXT-ENCODER / TOKENIZER / SCHEDULER assets are
+# byte-identical to a base arch's — reuse the base's bundle (single source of
+# truth) instead of duplicating files. NOTE: the VAE config is intentionally NOT
+# aliased here: QwenImageLayered's VAE is 4-channel RGBA (AutoencoderKLQwenImage
+# with input_channels=4), distinct from base QwenImage's 3-channel — it ships its
+# own bin/vae_configs/QwenImageLayered.json. The transformer is likewise NOT
+# aliased (its dims are weight-derived per arch).
+BUNDLED_ASSET_ARCH_ALIAS = {
+    # QwenImageLayered reuses the base QwenImage Qwen3/Qwen2.5-VL text encoder
+    # (hidden 3584 / 28 layers / 28 heads / 4 kv / 18944 ffn — identical), the
+    # same tokenizer, and the same FlowMatchEuler scheduler.
+    "QwenImageLayered": "QwenImage",
+}
+
+
+def _bundled_asset_arch(arch: str) -> str:
+    """Resolve `arch` to the arch whose bundled TE/tokenizer/scheduler asset to
+    use. Identity for most archs; aliases an identical variant onto its base
+    (see BUNDLED_ASSET_ARCH_ALIAS). Does NOT affect VAE/transformer lookups."""
+    return BUNDLED_ASSET_ARCH_ALIAS.get(arch, arch)
 
 
 class HFLayout:
@@ -433,8 +456,9 @@ class HFLayout:
             shutil.copy2(scheduler_config_path, dst)
             return
         if arch:
+            asset_arch = _bundled_asset_arch(arch)
             plugin_root = Path(__file__).resolve().parent.parent.parent
-            bundled = plugin_root / "bin" / "scheduler_configs" / f"{arch}.json"
+            bundled = plugin_root / "bin" / "scheduler_configs" / f"{asset_arch}.json"
             if bundled.is_file():
                 shutil.copy2(bundled, dst)
                 return
@@ -449,9 +473,14 @@ class HFLayout:
 
 
 def copy_tokenizer_bundle(arch: str, dst: Path) -> None:
-    """Copy the bundled tokenizer for `arch` from <plugin>/bin/tokenizers/<arch>/."""
+    """Copy the bundled tokenizer for `arch` from <plugin>/bin/tokenizers/<arch>/.
+
+    Identical-tokenizer variants (e.g. QwenImageLayered) resolve onto the base
+    arch's bundle via _bundled_asset_arch (avoids duplicating the ~5 MB tokenizer).
+    """
+    asset_arch = _bundled_asset_arch(arch)
     plugin_root = Path(__file__).resolve().parent.parent.parent
-    src = plugin_root / "bin" / "tokenizers" / arch
+    src = plugin_root / "bin" / "tokenizers" / asset_arch
     if not src.is_dir():
         logger.warning("[staging] no bundled tokenizer for arch=%s at %s", arch, src)
         return
@@ -586,10 +615,12 @@ def bundled_te_config(arch: str) -> Optional[dict]:
     when the source file (e.g. a bundled multi-component checkpoint)
     doesn't ship per-component config.json — without this, our C++ TE
     loader falls back to defaults (Qwen3 2.5B) and crashes when the actual
-    weights are Qwen2.5-VL 7B.
+    weights are Qwen2.5-VL 7B. Identical-TE variants (e.g. QwenImageLayered)
+    resolve onto the base arch's bundle via _bundled_asset_arch.
     """
+    asset_arch = _bundled_asset_arch(arch)
     plugin_root = Path(__file__).resolve().parent.parent.parent
-    p = plugin_root / "bin" / "text_encoder_configs" / f"{arch}.json"
+    p = plugin_root / "bin" / "text_encoder_configs" / f"{asset_arch}.json"
     if not p.is_file():
         logger.warning("[staging] no bundled TE config for arch=%s at %s", arch, p)
         return None

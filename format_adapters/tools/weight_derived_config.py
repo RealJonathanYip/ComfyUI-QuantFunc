@@ -251,6 +251,10 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
 }
 # QwenImageEdit shares QwenImage's transformer layout (same class, edit_mode).
 _TRANSFORMER_DESCRIPTORS["QwenImageEdit"] = _TRANSFORMER_DESCRIPTORS["QwenImage"]
+# QwenImageLayered also reuses QwenImageTransformer2DModel (same transformer_blocks
+# layout; only use_additional_t_cond adds an extra time-cond embedding) → identical
+# weight-derived dims (num_layers / num_attention_heads / head_dim).
+_TRANSFORMER_DESCRIPTORS["QwenImageLayered"] = _TRANSFORMER_DESCRIPTORS["QwenImage"]
 
 
 def derive_transformer_config(path: str, arch: Optional[str]) -> Optional[dict]:

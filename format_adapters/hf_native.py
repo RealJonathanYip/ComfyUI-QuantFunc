@@ -161,7 +161,7 @@ class HFLayoutAdapter(FormatAdapter):
         # Build a minimal staging dir referencing it.
         from .tools.hf_layout import (
             HFLayout, copy_tokenizer, bundled_transformer_config,
-            bundled_te_config, bundled_vae_config,
+            bundled_te_config, bundled_vae_config, ARCH_TO_TRANSFORMER_CLASS,
         )
         arch = fingerprint_arch_from_keys(ref.path) or ref.arch or "QwenImage"
         layout = HFLayout(staging_dir)
@@ -175,12 +175,9 @@ class HFLayoutAdapter(FormatAdapter):
         # Without these overrides the C engine reads the bundled config and
         # mis-allocates blocks, producing shape mismatches at load.
         xfm_config = bundled_transformer_config(arch) or {
-            "_class_name": {
-                "QwenImage": "QwenImageTransformer2DModel",
-                "QwenImageEdit": "QwenImageTransformer2DModel",
-                "Flux2Klein": "Flux2Transformer2DModel",
-                "ZImage": "ZImageTransformer2DModel",
-            }.get(arch, ""),
+            # Central arch→transformer-class table (covers QwenImageLayered etc.);
+            # the per-arch weight-derived dims are merged in by add_transformer.
+            "_class_name": ARCH_TO_TRANSFORMER_CLASS.get(arch, ""),
         }
         # add_transformer derives the architecture dims from the weights and
         # overrides the bundled base (single header read inside the layout) — no
