@@ -92,7 +92,19 @@ def adapter(priority: int = 50):
 # and the fix never takes effect (qwenimage-svdq still fails on Qwen-Image-2512).
 # Bumping invalidates those poisoned dirs so the corrected, alias-free config is
 # regenerated.
-_STAGING_FORMAT_VERSION = 3
+# v4 (#446b/#449/#450): the bundled VAE config bin/vae_configs/QwenImage.json
+# used to carry a stray `"input_channels": 4` — a QwenImageLayered (RGBA 4-ch)
+# characteristic wrongly placed on the base QwenImage 3-ch VAE. The SVDQ adapter
+# (raw nunchaku files have no sibling VAE config.json) ALWAYS falls back to this
+# bundled config, so the staged vae/config.json got input_channels=4 → the engine
+# (out_channels = value("out_channels", value("input_channels", 3))) built a
+# conv_out=[4] and failed LOUD against the real [3] weights ("conv_out.bias dst
+# [4] vs src [3]"). The lighting/hf_native path prefers the sibling config.json
+# (no input_channels) so it was unaffected. Removing input_channels from the base
+# config (now 3-ch by engine default, matching QwenImageEdit.json) changes the
+# staging OUTPUT without any source-file change — same class as the v3 miss — so
+# this bump invalidates v3-staged dirs that baked the old input_channels=4.
+_STAGING_FORMAT_VERSION = 4
 
 
 def _stable_staging_id(sources: SourceBundle, context: BuildContext) -> str:
