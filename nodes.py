@@ -3159,11 +3159,38 @@ class QuantFuncGenerate:
                         "faster but progressively LOSSY (softer / less prompt-faithful). "
                         "Typical 0.03-0.12; tune per model + step count (few-step "
                         "distilled models need a smaller value).\n\n"
+                        "This is the COND (positive-prompt) branch threshold. For models "
+                        "that run sequential true-CFG (a cond pass on the prompt + an "
+                        "uncond pass on the negative prompt — Ideogram4, QwenImage-Layered) "
+                        "the UNCOND branch has its own 'fbcache_uncond' threshold below "
+                        "(0 = uncond not cached). Single-cache models (QwenImage t2i, "
+                        "ZImage, Wan) use only this cond value.\n\n"
                         "Create-time knob: the engine reads it PER MODEL FAMILY "
                         "(QwenImage / ZImage / Ideogram4 / Wan lighting). The active "
                         "model auto-consumes the matching key; families with no FBCache "
                         "path (e.g. Klein) ignore it. Changing this value recreates the "
                         "pipeline."
+                    ),
+                }),
+                "fbcache_uncond": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 0.3, "step": 0.01,
+                    "tooltip": (
+                        "FBCache UNCOND threshold — the step-skip budget for the "
+                        "UNCONDITIONAL (negative-prompt) CFG branch.\n\n"
+                        "Only meaningful for models that run sequential true-CFG with a "
+                        "SEPARATE uncond pass: Ideogram4 and QwenImage-Layered. There the "
+                        "cond pass uses 'fbcache' (above) and the uncond pass uses this "
+                        "value, each with its OWN cache so the two branches never pollute "
+                        "each other.\n\n"
+                        "0.0 = OFF (default, the uncond branch is NEVER cached — bit-exact "
+                        "for it). Single-cache models (QwenImage t2i, ZImage, Wan) have no "
+                        "uncond branch and IGNORE this value, so the default leaves them "
+                        "unchanged.\n\n"
+                        "Independent of 'fbcache': you can cache cond only (fbcache>0, "
+                        "fbcache_uncond=0), both, or neither (both 0 = FBCache fully OFF, "
+                        "byte-identical). The uncond velocity is the slower-varying signal, "
+                        "so a slightly HIGHER uncond threshold is often safe. Changing this "
+                        "recreates the pipeline."
                     ),
                 }),
                 "activate_unload": ("BOOLEAN", {
@@ -3224,7 +3251,7 @@ class QuantFuncGenerate:
                  scheduler="normal",
                  control_image=None,
                  activate_unload=False, unload_mode=None, unload_every_time=None,
-                 fbcache=0.0,
+                 fbcache=0.0, fbcache_uncond=0.0,
                  unique_id=None, workflow_prompt=None):
         # Backwards-compat with older saved workflows that used the
         # unload_mode dropdown or the unload_every_time bool: both are
@@ -3268,23 +3295,43 @@ class QuantFuncGenerate:
         # medium is baked in during warmup and can't be switched later
         # without a 13 GB re-pack.
         cfg["options"]["activate_unload"] = bool(activate_unload)
-        # FBCache (First-Block Cache, TeaCache-style step skipping) — a
-        # CREATE-TIME comp_opt the engine reads PER MODEL FAMILY
-        # (qwenimage_fbcache / zimage_fbcache / ideogram4_fbcache[/_cond] /
-        # wan_fbcache_thresh; all default 0.0 = OFF). Each key is consumed
-        # ONLY by its own model's factory, so a QwenImage pipeline reads
-        # qwenimage_fbcache and ignores the rest — setting every family key to
-        # the same value is model-agnostic and never enables FBCache on a model
-        # that isn't loaded. Only inject when ENABLED (>0): the default-off path
-        # leaves cfg["options"] byte-identical so it does NOT perturb the
-        # pipeline cache key / force a spurious recreate.
-        fbc = float(fbcache or 0.0)
-        if fbc > 0.0:
-            cfg["options"]["qwenimage_fbcache"] = fbc
-            cfg["options"]["zimage_fbcache"] = fbc
-            cfg["options"]["ideogram4_fbcache"] = fbc
-            cfg["options"]["ideogram4_fbcache_cond"] = fbc
-            cfg["options"]["wan_fbcache_thresh"] = fbc
+        # FBCache (First-Block Cache, TeaCache-style step skipping) — CREATE-TIME
+        # comp_opts the engine reads PER MODEL FAMILY. Two model-agnostic knobs,
+        # mirroring the engine's #472 split: `fbcache` = the COND (positive-prompt)
+        # branch threshold, `fbcache_uncond` = the UNCOND (negative-prompt) branch.
+        # Sequential true-CFG families (Ideogram4, QwenImage-Layered) keep a
+        # SEPARATE cache per branch; single-cache families (QwenImage t2i, ZImage,
+        # Wan) only have a cond/primary cache and ignore the uncond keys.
+        #
+        # Each key is consumed ONLY by its own model's factory, so setting every
+        # family key to the same branch value stays model-agnostic and never
+        # enables FBCache on a model that isn't loaded. Map to the engine's ACTUAL
+        # accepted keys (verified against the engine):
+        #   COND  → generic "fbcache" (Ideogram4Pipeline + QwenImage-Layered xfm
+        #           factory read this first), plus the per-family cond/single keys
+        #           qwenimage_fbcache (QwenImage t2i), zimage_fbcache (ZImage),
+        #           wan_fbcache_thresh (Wan), ideogram4_fbcache_cond (Ideogram4
+        #           legacy cond fallback).
+        #   UNCOND→ generic "fbcache_uncond" (Ideogram4Pipeline + QwenImage-Layered
+        #           xfm factory), plus ideogram4_fbcache (Ideogram4 legacy uncond
+        #           fallback). Single-cache families have no uncond key.
+        # Setting the generic "fbcache"/"fbcache_uncond" keys is what reaches the
+        # QwenImage-Layered dual-slot FBCache (it reads ONLY the generic keys).
+        #
+        # Each branch is gated independently (>0): both default 0.0 leaves
+        # cfg["options"] byte-identical → no perturbation of the pipeline cache key
+        # / no spurious recreate, and a model's existing output is unchanged.
+        fbc_cond = float(fbcache or 0.0)
+        fbc_uncond = float(fbcache_uncond or 0.0)
+        if fbc_cond > 0.0:
+            cfg["options"]["fbcache"] = fbc_cond              # generic cond (Ideogram4 + QwenImage-Layered)
+            cfg["options"]["qwenimage_fbcache"] = fbc_cond    # QwenImage t2i single cache
+            cfg["options"]["zimage_fbcache"] = fbc_cond       # ZImage single cache
+            cfg["options"]["ideogram4_fbcache_cond"] = fbc_cond  # Ideogram4 legacy cond fallback
+            cfg["options"]["wan_fbcache_thresh"] = fbc_cond   # Wan single cache
+        if fbc_uncond > 0.0:
+            cfg["options"]["fbcache_uncond"] = fbc_uncond     # generic uncond (Ideogram4 + QwenImage-Layered)
+            cfg["options"]["ideogram4_fbcache"] = fbc_uncond  # Ideogram4 legacy uncond fallback
         # Unpack ImageList dict format
         ref_img_resize = "720"
         ref_img_resize_others = "720"
