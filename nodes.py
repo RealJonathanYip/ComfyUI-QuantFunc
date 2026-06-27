@@ -3193,6 +3193,20 @@ class QuantFuncGenerate:
                         "recreates the pipeline."
                     ),
                 }),
+                "vram_budget": (
+                    ["off", "10%", "20%", "30%", "40%", "50%",
+                     "60%", "70%", "80%", "90%", "100%"],
+                    {
+                        "default": "100%",
+                        "tooltip": "限制本 pipeline 可用的显存上限,按所选设备物理总显存的"
+                                   "百分比计。对应引擎的 workspace VRAM budget"
+                                   "(vram_budget_mb):引擎会「按这个大小的显卡来规划 + 强制」"
+                                   "offload / 分块 / VAE tiling 等策略。\n\n"
+                                   "100%(默认)/ off:不限制,用满整张卡。\n"
+                                   "例:80% 在 24G 卡上 ≈ 19.2G;在 12G 卡上 ≈ 9.6G。\n\n"
+                                   "Create-time 旋钮:改这个值会重建 pipeline。",
+                    },
+                ),
                 "activate_unload": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Let ComfyUI unload this pipeline when it needs VRAM for "
@@ -3214,8 +3228,12 @@ class QuantFuncGenerate:
             "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
         }
 
-    RETURN_TYPES = ("IMAGE", "QF_LATENT_PREVIEW", "MASK")
-    RETURN_NAMES = ("image", "latent_preview", "mask")
+    # Output order: image · mask · latent_preview. MIGRATION: mask and
+    # latent_preview swapped slots vs an earlier build (was image ·
+    # latent_preview · mask) — workflows saved against the old order must
+    # re-wire those two ports. The IMAGE output (slot 0) is unchanged.
+    RETURN_TYPES = ("IMAGE", "MASK", "QF_LATENT_PREVIEW")
+    RETURN_NAMES = ("image", "mask", "latent_preview")
     OUTPUT_NODE = True
     FUNCTION = "generate"
     CATEGORY = "QuantFunc"
@@ -3242,6 +3260,45 @@ class QuantFuncGenerate:
             return "Unknown sampler_name: {}".format(sampler_name)
         return True
 
+    @staticmethod
+    def _resolve_vram_budget_mb(vram_budget, device):
+        """vram_budget dropdown ("80%" / "off") → engine vram_budget_mb (MiB),
+        or None (= no cap) for off / >=100% / unresolvable. `device` is the
+        selected card's index — the SAME one the worker runs on, so the percent
+        is taken of THAT card's physical VRAM (correct on heterogeneous /
+        masked-GPU boxes). Fails open (None), never crashes a generate."""
+        import torch
+        vb = str(vram_budget or "off").strip().rstrip("%")
+        if not (vb.isdigit() and int(vb) > 0):
+            return None
+        pct = int(vb)
+        if pct >= 100:
+            # 100% = whole card = no real cap → treat as off (don't inject); an
+            # explicit budget == total still trips the engine's budget-run mode
+            # (skips VRAM-probe cache writes) for no benefit.
+            return None
+        try:
+            dev = int(device)
+            if not torch.cuda.is_available():
+                raise RuntimeError("torch reports no CUDA device")
+            count = torch.cuda.device_count()
+            if not (0 <= dev < count):
+                raise IndexError(
+                    "device index %d out of range (visible cuda count=%d); "
+                    "check CUDA_VISIBLE_DEVICES" % (dev, count))
+            props = torch.cuda.get_device_properties(dev)
+            total_mib = props.total_memory // (1024 * 1024)
+            budget_mib = int(total_mib * pct / 100)
+            logging.info(
+                "[QuantFunc] vram_budget=%d%% of cuda:%d (%s, total %d MiB) "
+                "→ vram_budget_mb=%d", pct, dev, props.name, total_mib, budget_mib)
+            return budget_mib
+        except Exception as e:
+            logging.warning(
+                "[QuantFunc] vram_budget=%d%%: cannot resolve device %r VRAM "
+                "(%s) — running WITHOUT the cap (unlimited).", pct, device, e)
+            return None
+
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=1.0,
@@ -3250,6 +3307,7 @@ class QuantFuncGenerate:
                  sampler_predictor_order=3, sampler_corrector_order=4,
                  scheduler="normal",
                  control_image=None,
+                 vram_budget="100%",
                  activate_unload=False, unload_mode=None, unload_every_time=None,
                  fbcache=0.0, fbcache_uncond=0.0,
                  unique_id=None, workflow_prompt=None):
@@ -3295,6 +3353,12 @@ class QuantFuncGenerate:
         # medium is baked in during warmup and can't be switched later
         # without a 13 GB re-pack.
         cfg["options"]["activate_unload"] = bool(activate_unload)
+        # VRAM workspace budget (create-time): inject only when a real cap is
+        # resolved → default "off" leaves cfg["options"] untouched (no spurious
+        # recreate), mirroring the fbcache>0 gate below.
+        _budget_mib = self._resolve_vram_budget_mb(vram_budget, cfg.get("device", 0))
+        if _budget_mib is not None:
+            cfg["options"]["vram_budget_mb"] = _budget_mib
         # FBCache (First-Block Cache, TeaCache-style step skipping) — CREATE-TIME
         # comp_opts the engine reads PER MODEL FAMILY. Two model-agnostic knobs,
         # mirroring the engine's #472 split: `fbcache` = the COND (positive-prompt)
@@ -3667,24 +3731,23 @@ class QuantFuncGenerate:
                 _manager._unload_modes[cache_key] = unload_mode_internal
 
             out = torch.from_numpy(images_np)  # [N, H, W, 3] (N==1 for single-image)
-            # Per-image alpha → MASK output. None (RGB result) → opaque ones, so any
-            # downstream MASK consumer is safe. APPENDED as the 3rd port so the
-            # existing image/latent_preview slot indices are unchanged (no regression).
+            # Per-image alpha → MASK output (slot 1, the 2nd port). None (RGB
+            # result) → opaque ones, so any downstream MASK consumer is safe.
             out_mask = (torch.from_numpy(masks_np) if masks_np is not None
                         else torch.ones(out.shape[:3], dtype=torch.float32))  # [N, H, W]
-            # 2nd output = wire to the Latent Preview viewer node. It only
-            # anchors the connection (so we can locate the viewer + route the
-            # live per-step frames to its node id) and triggers the viewer's
+            # 3rd output (slot 2) = wire to the Latent Preview viewer node. It
+            # only anchors the connection (so we can locate the viewer + route
+            # the live per-step frames to its node id) and triggers the viewer's
             # execution; the viewer shows ONLY those live frames, so the payload
             # is a lightweight sentinel (NOT the full image tensor — that would
             # be serialized over the wire for nothing). None when no viewer wired.
             lp_out = True if lp_node_id is not None else None
-            return (out, lp_out, out_mask)  # image [N,H,W,3], latent_preview, mask [N,H,W]
+            return (out, out_mask, lp_out)  # image [N,H,W,3], mask [N,H,W], latent_preview
 
         except InterruptedError:
             logging.info("[QuantFunc] Generation interrupted, returning blank image.")
             blank = torch.zeros(1, height, width, 3, dtype=torch.float32)
-            return (blank, None, torch.ones(1, height, width, dtype=torch.float32))
+            return (blank, torch.ones(1, height, width, dtype=torch.float32), None)
         finally:
             # Unlink the /dev/shm QFRAW staging files. By image_to_image's return
             # the engine has already read them; on interrupt they're unused. Either
