@@ -18,3 +18,7 @@ bin/linux/resource_cache.json
 bin/windows/resource_cache.json
 # Local Claude Code settings — never publish
 .claude/
+
+# SHA-256 integrity verify: runtime cache + heal-state (per-version manifest cache + marker)
+bin/*/verify-*.json
+bin/*/verify.state

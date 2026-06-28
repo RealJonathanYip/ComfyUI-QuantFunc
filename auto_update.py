@@ -22,6 +22,8 @@ Local bin/<platform>/version.json:
 { "comfy": "0.0.01" }
 """
 
+import errno
+import hashlib
 import json
 import logging
 import os
@@ -133,6 +135,15 @@ def _ver_cmp(a: str, b: str) -> int:
 
 
 _MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"
+
+# --- SHA-256 integrity verification (from plugin 0.0.12) ---
+# Each shipped engine lib has a sha256 recorded in a per-version manifest
+# {version}/verify.json on ModelScope. On startup we fetch it (remote-first,
+# local cache only when the network is blocked), compare the local lib, and
+# self-heal (re-download, verify-before-replace) on a mismatch. Never blocks
+# loading; never touches a locally-compiled dev build.
+_VERIFY_FLOOR = "0.0.12"          # manifests only exist from this version onward
+_VERIFY_SCHEMA_MAX = 1            # highest manifest schema this code understands
 
 
 def _ensure_modelscope():
@@ -372,59 +383,419 @@ def _apply_pending_update():
             logger.debug("[QuantFunc] Cannot apply pending update: %s", e)
 
 
+# --------------------------------------------------------------------------- #
+# SHA-256 integrity verification (from plugin 0.0.12)
+# --------------------------------------------------------------------------- #
+def _verify_cache_path(version: str) -> str:
+    """Per-version manifest cache; filename IS the version key (no envelope)."""
+    return os.path.join(_get_bin_dir(), "verify-{}.json".format(version))
+
+
+def _verify_state_path() -> str:
+    """Heal-state marker that bounds the self-heal to one heavy re-download."""
+    return os.path.join(_get_bin_dir(), "verify.state")
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    """Return the file's sha256 hex digest, or None on any IO error."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _atomic_write_json(path: str, obj: Dict) -> None:
+    """Write JSON atomically (temp on the SAME dir/fs as path, then os.replace)."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _fetch_remote_verify(version: str) -> Tuple[str, Optional[Dict]]:
+    """Fetch {version}/verify.json from ModelScope, remote-first.
+
+    Returns (status, data) where status is one of:
+      "ok"          - data is the parsed manifest dict (also written to the cache)
+      "no_manifest" - HTTP 404: the server has no manifest for this version -> SKIP, do NOT use cache
+      "corrupt"     - 200 but body is not valid JSON / not a dict -> SKIP, do NOT use cache
+      "blocked"     - network down / non-404 HTTP error -> caller may fall back to the local cache
+
+    urllib is the PRIMARY path (uncached -> truly remote-first + real HTTP status);
+    the modelscope SDK is a secondary REACH only when blocked (proxy/auth-only envs).
+    """
+    import urllib.request
+    import urllib.error
+
+    url = "{}/{}/verify.json".format(_MODELSCOPE_RAW_URL, version)
+    status, data = "blocked", None
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            raw = resp.read()
+        # A 200 whose body we have but can't decode/parse is corruption, NOT a network block.
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueError
+            return "corrupt", None
+        if not isinstance(parsed, dict):
+            return "corrupt", None
+        status, data = "ok", parsed
+    except urllib.error.HTTPError as e:
+        if getattr(e, "code", None) == 404:
+            return "no_manifest", None
+        status, data = "blocked", None
+    except Exception:
+        status, data = "blocked", None
+
+    if status == "blocked" and _ensure_modelscope():
+        # degraded mode (network down): try the SDK as a secondary reach (may be cache-stale)
+        try:
+            from modelscope.hub.file_download import model_file_download
+            p = model_file_download(
+                model_id=_MODELSCOPE_REPO, file_path="{}/verify.json".format(version)
+            )
+            with open(p, "r", encoding="utf-8") as f:
+                parsed = json.load(f)
+            if isinstance(parsed, dict):
+                status, data = "ok", parsed
+        except Exception:
+            pass
+
+    if status == "ok":
+        try:
+            _atomic_write_json(_verify_cache_path(version), data)
+        except Exception:
+            pass  # cache write is best-effort
+    return status, data
+
+
+def _read_cached_verify(version: str) -> Optional[Dict]:
+    """Read the per-version cache; any error or non-dict -> None (never raises)."""
+    try:
+        with open(_verify_cache_path(version), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _load_verify_for(version: str) -> Tuple[Optional[Dict], Optional[str]]:
+    """Remote-first; fall back to the local cache ONLY when the network is blocked."""
+    status, data = _fetch_remote_verify(version)
+    if status == "ok":
+        return data, "remote"
+    if status == "blocked":
+        cached = _read_cached_verify(version)
+        if cached is not None:
+            return cached, "cache"
+    return None, None
+
+
+def _heal_state_read() -> Tuple[Optional[str], Optional[str]]:
+    """Return (version, expected) of the last bounded heal attempt, or (None, None)."""
+    try:
+        with open(_verify_state_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return (d.get("version"), d.get("expected"))
+    except Exception:
+        pass
+    return (None, None)
+
+
+def _heal_state_write(version: str, expected: str) -> None:
+    try:
+        _atomic_write_json(_verify_state_path(), {"version": version, "expected": expected})
+    except Exception:
+        pass
+
+
+def _heal_state_clear() -> None:
+    try:
+        os.remove(_verify_state_path())
+    except OSError:
+        pass
+
+
+def _heal_download(version: str, expected: str) -> str:
+    """Re-download the official lib and install it ONLY if its sha matches `expected`.
+
+    VERIFY-BEFORE-REPLACE + EXDEV-safe + disk-safe. Returns one of:
+      "healed"   - downloaded, sha matched, replaced the lib (restart to use)
+      "pending"  - downloaded, sha matched, but the DLL was locked (Windows) -> .update pending
+      "unhealed" - a heavy transfer happened but did NOT yield a matching lib
+                   (sha mismatch OR a non-space install error) -> caller MARKS to bound re-downloads
+      "failed"   - cheap/transient: no/low disk, 404, network error, truncated, temp-read error
+                   -> caller does NOT mark (safe to retry next startup)
+    Never destroys the existing lib unless a verified replacement is in place.
+    """
+    bin_dir = _get_bin_dir()
+    dest = os.path.join(bin_dir, _LIB_NAME)
+    remote_subdir = "windows" if _IS_WINDOWS else "linux"
+    remote_path = "{}/{}/{}".format(version, remote_subdir, _LIB_NAME)
+    download_url = "{}/{}".format(_MODELSCOPE_RAW_URL, remote_path)
+
+    # Pre-flight free space: peak need is ~2x lib (existing dest kept + bindir temp copy) + margin.
+    try:
+        existing = os.path.getsize(dest) if os.path.exists(dest) else (64 << 20)
+        if shutil.disk_usage(bin_dir).free < existing * 2 + (64 << 20):
+            print("[QuantFunc] verify: not enough free space in {} to heal; skipping".format(bin_dir))
+            return "failed"
+    except OSError:
+        pass  # if we cannot stat, proceed; the bounded install try still protects
+
+    scratch = None
+    scratch_is_ours = False
+    bindir_tmp = None
+    try:
+        # Download to a scratch temp. urllib first (own scratch + Content-Length), SDK fallback.
+        try:
+            import urllib.request
+            fd, scratch = tempfile.mkstemp(suffix=".heal")
+            scratch_is_ours = True  # mark BEFORE close so an (unlikely) close raise still cleans up
+            os.close(fd)
+            with urllib.request.urlopen(download_url, timeout=60) as resp:
+                clen = resp.headers.get("Content-Length")
+                clen = int(clen) if (clen and clen.isdigit()) else None
+                got = 0
+                with open(scratch, "wb") as out:
+                    while True:
+                        buf = resp.read(1 << 20)
+                        if not buf:
+                            break
+                        out.write(buf)
+                        got += len(buf)
+            if clen is not None and got != clen:
+                print("[QuantFunc] verify: heal download truncated ({}/{} bytes)".format(got, clen))
+                return "failed"
+        except Exception:
+            # Remove our own partial scratch BEFORE nulling it, else the finally can't reach it.
+            if scratch and scratch_is_ours and os.path.exists(scratch):
+                try:
+                    os.remove(scratch)
+                except OSError:
+                    pass
+            scratch, scratch_is_ours = None, False
+            if _ensure_modelscope():
+                try:
+                    from modelscope.hub.file_download import model_file_download
+                    scratch = model_file_download(model_id=_MODELSCOPE_REPO, file_path=remote_path)
+                except Exception:
+                    scratch = None
+            if not scratch or not os.path.exists(str(scratch)):
+                return "failed"
+
+        actual = _sha256_file(scratch)
+        if actual is None:
+            return "failed"
+        if actual != expected:
+            return "unhealed"  # wrong publish / corrupt download -> bounded by caller
+
+        # Verified-good bytes. Install into bin_dir (same fs as dest). Bound copy2+replace together.
+        try:
+            os.makedirs(bin_dir, exist_ok=True)
+            fd, bindir_tmp = tempfile.mkstemp(dir=bin_dir, suffix=".tmp")
+            os.close(fd)
+            shutil.copy2(scratch, bindir_tmp)
+            if _IS_WINDOWS:
+                # DLL may be locked by a worker — reproduce _download_lib's backup+rename dance.
+                backup = dest + ".bak"
+                try:
+                    if os.path.exists(backup):
+                        os.remove(backup)
+                    if os.path.exists(dest):
+                        os.rename(dest, backup)
+                    os.rename(bindir_tmp, dest)
+                    try:
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                    except OSError:
+                        pass
+                    return "healed"
+                except OSError:
+                    pending = dest + ".update"
+                    if os.path.exists(pending):
+                        os.remove(pending)
+                    os.rename(bindir_tmp, pending)
+                    return "pending"
+            else:
+                os.replace(bindir_tmp, dest)
+                return "healed"
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.ENOSPC:
+                # Transient: disk filled after the pre-flight check. Don't mark -> retry once freed.
+                print("[QuantFunc] verify: no disk space to install the verified lib; will retry")
+                return "failed"
+            print("[QuantFunc] verify: install of verified lib failed: {}".format(e))
+            return "unhealed"  # heavy transfer done but no matching lib installed -> bounded
+    finally:
+        for p, ours in ((bindir_tmp, True), (scratch, scratch_is_ours)):
+            if ours and p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+def _verify_local_lib() -> None:
+    """Verify the installed lib's sha256 against the per-version ModelScope manifest.
+
+    Self-heals (bounded, verify-before-replace) on a mismatch. SKIPs (never blocks
+    loading, never touches the file) on any 'cannot verify' condition: a dev build
+    (unreadable lib version), a pre-0.0.12 lib, no reachable manifest, a newer manifest
+    schema, an unregistered artifact, or an unreadable file.
+    """
+    local_lib = _read_lib_version()
+    if local_lib is None:
+        return  # dev build / unreadable -> never touch
+    if _ver_cmp(local_lib, _VERIFY_FLOOR) < 0:
+        return  # no manifest exists before the floor
+
+    data, source = _load_verify_for(local_lib)
+    if data is None:
+        print("[QuantFunc] verify: no manifest reachable for v{} (offline / no cache); "
+              "skipping integrity check".format(local_lib))
+        return
+
+    schema = data.get("schema", 1)
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema > _VERIFY_SCHEMA_MAX:
+        print("[QuantFunc] verify: manifest schema {} newer than supported ({}); "
+              "skipping".format(schema, _VERIFY_SCHEMA_MAX))
+        return
+
+    platform_map = data.get(_PLATFORM)
+    if not isinstance(platform_map, dict):
+        return
+    expected = platform_map.get(_LIB_NAME)
+    if not isinstance(expected, str) or not expected:
+        return  # this artifact is not registered for this version
+
+    bin_dir = _get_bin_dir()
+    dest = os.path.join(bin_dir, _LIB_NAME)
+    actual = _sha256_file(dest)
+    if actual is None:
+        return
+    if actual == expected:
+        return  # OK — integrity verified
+
+    # ---- MISMATCH: bounded, verify-before-replace self-heal ----
+    if os.path.exists(dest + ".update"):
+        print("[QuantFunc] verify: SHA mismatch, but a verified update is pending; "
+              "it applies on the next restart")
+        return
+    if _heal_state_read() == (local_lib, expected):
+        print("[QuantFunc] verify: SHA mismatch persists after a heal attempt for v{} — "
+              "the published manifest may be wrong; NOT re-downloading. Delete {} to retry."
+              .format(local_lib, _verify_state_path()))
+        return
+
+    print("[QuantFunc] verify: SHA-256 MISMATCH for {} (v{}, manifest from {})".format(
+        _LIB_NAME, local_lib, source))
+    print("[QuantFunc]   expected (ModelScope): {}...".format(expected[:16]))
+    print("[QuantFunc]   local file:            {}...".format(actual[:16]))
+    print("[QuantFunc] verify: re-downloading the official artifact...")
+
+    result = _heal_download(local_lib, expected)
+    if result == "healed":
+        _heal_state_clear()
+        print("[QuantFunc] verify: downloaded a verified official {}. "
+              "Restart ComfyUI to use it.".format(_LIB_NAME))
+    elif result == "pending":
+        print("[QuantFunc] verify: verified official {} saved as pending; "
+              "applies on the next restart.".format(_LIB_NAME))
+    elif result == "unhealed":
+        _heal_state_write(local_lib, expected)
+        print("[QuantFunc] verify: the official download did NOT match the manifest "
+              "(wrong publish / corrupt / install error); keeping the current {} "
+              "untouched.".format(_LIB_NAME))
+    else:  # "failed"
+        print("[QuantFunc] verify: could not download/install the official {} "
+              "(offline / 404 / low disk / truncated); keeping current.".format(_LIB_NAME))
+
+
+def _run_update_check() -> None:
+    """The plugin-version-driven auto-update flow (extracted from _check_and_update).
+
+    Its internal early-returns no longer skip the integrity verify, which runs
+    separately in _check_and_update.
+    """
+    comfy_version = _read_comfy_version()
+    local_lib = _read_lib_version()
+    lib_path = os.path.join(_get_bin_dir(), _LIB_NAME)
+    lib_file_exists = os.path.exists(lib_path)
+
+    if local_lib is None and not lib_file_exists:
+        print(
+            "[QuantFunc] No library found, checking ModelScope for download "
+            "(plugin v{})...".format(comfy_version)
+        )
+    elif local_lib is None and lib_file_exists:
+        # Library file exists but version can't be read (e.g. locally compiled
+        # build, or incompatible binary). Don't overwrite it.
+        print("[QuantFunc] Library exists but version unreadable, skipping update")
+        return
+    else:
+        print(
+            "[QuantFunc] Checking for updates (plugin v{}, lib v{})...".format(
+                comfy_version, local_lib
+            )
+        )
+
+    remote_versions = _fetch_remote_versions()
+    if remote_versions is None:
+        print("[QuantFunc] Could not reach ModelScope, skipping update check")
+        return
+
+    result = _find_best_compatible_version(remote_versions, comfy_version, local_lib)
+
+    if result is None:
+        if local_lib:
+            print("[QuantFunc] Library is up to date (v{})".format(local_lib))
+        else:
+            print("[QuantFunc] No compatible library version found on ModelScope")
+        return
+
+    best_key, best_info = result
+    best_lib = best_info.get("lib", best_key)
+    if local_lib:
+        print("[QuantFunc] Update available: v{} -> v{}".format(local_lib, best_lib))
+    else:
+        print("[QuantFunc] Downloading library v{}...".format(best_lib))
+    _download_lib(best_key, best_info)
+
+
 def _check_and_update():
-    """Check for updates and download if available. Runs in background thread."""
+    """Check for updates, download if available, then verify lib integrity.
+
+    Runs in a background thread. Two isolated phases: the plugin-version-driven
+    update flow, then the SHA-256 integrity verify. The verify runs regardless of
+    whether the update flow reached ModelScope (it has its own fetch + cache
+    fallback), and neither phase masks the other.
+    """
     try:
         _apply_pending_update()
-
-        comfy_version = _read_comfy_version()
-        local_lib = _read_lib_version()
-        lib_path = os.path.join(_get_bin_dir(), _LIB_NAME)
-        lib_file_exists = os.path.exists(lib_path)
-
-        if local_lib is None and not lib_file_exists:
-            print(
-                "[QuantFunc] No library found, checking ModelScope for download "
-                "(plugin v{})...".format(comfy_version)
-            )
-        elif local_lib is None and lib_file_exists:
-            # Library file exists but version can't be read (e.g. locally compiled
-            # build, or incompatible binary). Don't overwrite it.
-            print(
-                "[QuantFunc] Library exists but version unreadable, skipping update"
-            )
-            return
-        else:
-            print(
-                "[QuantFunc] Checking for updates (plugin v{}, lib v{})...".format(
-                    comfy_version, local_lib
-                )
-            )
-
-        remote_versions = _fetch_remote_versions()
-        if remote_versions is None:
-            print("[QuantFunc] Could not reach ModelScope, skipping update check")
-            return
-
-        result = _find_best_compatible_version(remote_versions, comfy_version, local_lib)
-
-        if result is None:
-            if local_lib:
-                print("[QuantFunc] Library is up to date (v{})".format(local_lib))
-            else:
-                print("[QuantFunc] No compatible library version found on ModelScope")
-            return
-
-        best_key, best_info = result
-        best_lib = best_info.get("lib", best_key)
-        if local_lib:
-            print("[QuantFunc] Update available: v{} -> v{}".format(local_lib, best_lib))
-        else:
-            print("[QuantFunc] Downloading library v{}...".format(best_lib))
-        _download_lib(best_key, best_info)
-
+        _run_update_check()
     except Exception as e:
         print("[QuantFunc] Update check failed: {}".format(e))
+
+    try:
+        _verify_local_lib()
+    except Exception as e:
+        print("[QuantFunc] Integrity verify failed (non-fatal): {}".format(e))
 
 
 def check_for_updates():
