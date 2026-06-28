@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -662,6 +663,8 @@ def _verify_local_lib() -> None:
     local_lib = _read_lib_version()
     if local_lib is None:
         return  # dev build / unreadable -> never touch
+    if not re.fullmatch(r"\d+(?:\.\d+)*", local_lib):
+        return  # defense-in-depth: only a clean dotted-numeric version feeds the URL / cache path
     if _ver_cmp(local_lib, _VERIFY_FLOOR) < 0:
         return  # no manifest exists before the floor
 
@@ -691,7 +694,7 @@ def _verify_local_lib() -> None:
         return
     if actual == expected:
         print("[QuantFunc] verify: {} integrity OK (v{}, sha256 {}…, manifest from {})".format(
-            _LIB_NAME, local_lib, actual[:12], source))
+            _LIB_NAME, local_lib, actual[:16], source))
         return
 
     # ---- MISMATCH: bounded, verify-before-replace self-heal ----
