@@ -16,3 +16,5 @@ __pycache__/
 
 bin/linux/resource_cache.json
 bin/windows/resource_cache.json
+# Local Claude Code settings — never publish
+.claude/
