@@ -4,13 +4,16 @@
 
 ## 1. 概述
 
-本目录提供一个**全家桶示例工作流**，演示所有 QuantFunc 节点、所有加载模型的方式以及所有用途。导入 ComfyUI 后，使用与你场景匹配的分组即可。
+本目录提供一个**全家桶示例工作流**（演示所有 QuantFunc 节点），以及针对新增生成模式的**单功能工作流**。导入与你场景匹配的那个即可。
 
 | 工作流 | 说明 |
 |--------|------|
 | `QuantFunc-Sample-WorkFlow-All-In-One.json` | 一个综合工作流：**3 种加载权重方式** × **文生图 / 图像编辑 / 模型导出**。画布内的便签对每个分组做了说明。 |
+| `QuantFunc-Ideogram4.json` | **Ideogram4** 文生图 —— *Model Loader* → *Build Pipeline* → *Generate*，配合 Ideogram-4 提示词构建节点写排版/文字提示词。 |
+| `QuantFunc-QwenImage-Layered.json` | **分层（透明 RGBA）** 生成 —— *Layered Config* 设定图层数；*Layer Viewer* + *Image List* 预览拆解出的每个 RGBA 图层。 |
+| `QuantFunc-ControlNet.json` | **ControlNet** 结构引导生成 —— *ControlNet Auto Loader* + *Control Image* 将条件输入接入 *Generate*。 |
 
-> 此工作流替代了原先按用途拆分的多个示例文件 —— 现在全部集中在一个工作流里。
+> 建议先用全家桶熟悉节点连线，再用单功能工作流做日常生成。
 
 ## 2. 工作流内容
 
@@ -46,6 +49,10 @@
 | **Generate** | 推理 —— 文生图，或接入 Image List 后做参考图编辑。 |
 | **Image List** | 打包 1~N 张参考图及可选的局部重绘蒙版用于编辑。 |
 | **Export** | 导出运行时量化模型（checkpoint = 全家桶，diffusers = 分组件）。 |
+| **Layered Config** | 为 **QwenImage Layered** 透明 RGBA 分层生成设定图层数 / 选项。 |
+| **Layer Viewer** | 预览分层生成拆解出的每个 RGBA 图层。 |
+| **ControlNet Auto Loader** | 一键下载并加载 ControlNet 模型（QwenImage InstantX）。 |
+| **Control Image** | 预处理 / 传入控制图（边缘、深度、姿态等）到管线。 |
 
 ## 4. 模型下载
 

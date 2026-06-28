@@ -4,13 +4,16 @@
 
 ## 1. Overview
 
-This directory ships a single **all-in-one sample workflow** that demonstrates every QuantFunc node, every way to load a model, and every task. Import it into ComfyUI and use the labelled group that matches your case.
+This directory ships an **all-in-one workflow** that demonstrates every QuantFunc node, plus **focused per-feature workflows** for the newer generation modes. Import the one that matches your case.
 
 | Workflow | Description |
 |----------|-------------|
 | `QuantFunc-Sample-WorkFlow-All-In-One.json` | One comprehensive workflow: **3 model-loading methods** × **text-to-image / image editing / model export**. In-canvas notes explain each group. |
+| `QuantFunc-Ideogram4.json` | **Ideogram4** text-to-image — *Model Loader* → *Build Pipeline* → *Generate*, with the Ideogram-4 prompt builder for typography-aware prompts. |
+| `QuantFunc-QwenImage-Layered.json` | **Layered (transparent RGBA)** generation — *Layered Config* sets the layer count; *Layer Viewer* + *Image List* preview each decomposed RGBA layer. |
+| `QuantFunc-ControlNet.json` | **ControlNet** structure-guided generation — *ControlNet Auto Loader* + *Control Image* feed the conditioning into *Generate*. |
 
-> This replaces the older per-task sample files — everything now lives in one workflow.
+> Start from the all-in-one to learn the node graph, then use a per-feature workflow for day-to-day work.
 
 ## 2. What's Inside
 
@@ -46,6 +49,10 @@ Drag the canvas to the labelled group you need.
 | **Generate** | Run inference — text-to-image, or reference-based editing when an Image List is connected. |
 | **Image List** | Bundle 1–N reference image(s) and an optional inpaint mask for editing. |
 | **Export** | Export a runtime-quantized model (checkpoint = AIO bundle, diffusers = individual components). |
+| **Layered Config** | Set the layer count / options for **QwenImage Layered** transparent-RGBA generation. |
+| **Layer Viewer** | Preview each decomposed RGBA layer produced by a layered generation. |
+| **ControlNet Auto Loader** | One-click download + load of a ControlNet model (InstantX for QwenImage). |
+| **Control Image** | Preprocess / pass a control image (edges, depth, pose, …) into the pipeline. |
 
 ## 4. Model Download
 

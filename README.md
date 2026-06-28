@@ -29,8 +29,30 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 | Plugin (`comfy`) | Engine (`lib`) | Summary |
 |:---:|:---:|---|
-| **0.0.02** *(current)* | **0.0.07** | v2 loader architecture · inpainting · full GPU coverage · faster editing — details below |
+| **0.0.06** *(current)* | **0.0.12** | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download — details below |
+| 0.0.02 | 0.0.07 | v2 loader architecture · inpainting · full GPU coverage · faster editing |
 | 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
+
+### What's New in 0.0.06 (engine 0.0.12)
+
+**🧩 New generation modes** — each ships with a ready-to-run workflow in [`workflow_sample/`](workflow_sample/):
+- **Ideogram4 text-to-image** — strong prompt & text/typography following; renders 1024² / 1536² / 2048² and runs on 8 GB VRAM (`QuantFunc-Ideogram4.json`).
+- **Layered generation (QwenImage Layered)** — generate a scene decomposed into transparent **RGBA layers** in a single pass, accelerated by FBCache (`QuantFunc-QwenImage-Layered.json`).
+- **ControlNet** — structure-guided generation (InstantX ControlNet for QwenImage) (`QuantFunc-ControlNet.json`).
+
+**🎛️ New nodes & controls**
+- **VRAM budget** dropdown on *Build Pipeline* — cap VRAM at create time; the engine then plans as if running on a smaller card.
+- **FBCache acceleration** with separate **cond / uncond** thresholds (`fbcache` / `fbcache_uncond`).
+- **Image-to-image** — `init_img` socket + `init_img_strength` on the *Generate* node.
+- **Klein 4B / 9B** one-click auto-download (3-tier 50x / 40x / 30x-below) in the *Auto Loader*.
+- **Ideogram-4 + Qwen-Image-Layered** precision configs auto-detected by the auto-loader.
+
+**⚡ Engine improvements (0.0.12 vs 0.0.11)**
+- **VRAM workspace budget** — run large models on tight cards by planning to a fixed budget.
+- **Wider low-VRAM & RTX 20 (Turing) support** — Ideogram4 and layered generation now run on 8 GB and SM75.
+- **RTX 50 (Blackwell) FP4 fast lane** for the new pipelines.
+
+> The plugin auto-pulls the matching engine on startup: bumping `comfy` to **0.0.06** lets the updater fetch engine **0.0.12** from ModelScope.
 
 ### What's New in 0.0.02 (engine 0.0.07)
 
@@ -198,14 +220,14 @@ QuantFunc has pre-exported commonly used models (runtime-quantized and ready to 
 
 ### 3.4 Example Workflows
 
-Import from `workflow_sample/`:
+Import from [`workflow_sample/`](workflow_sample/):
 
 | File | Use Case |
 |------|----------|
-| `QuantFunc-Easy-Gen.json` | **Beginners** — 3-node auto-download workflow |
-| `QuantFunc-Text-to-Image-Workflow.json` | Text-to-image (SVDQ + Lighting side by side) |
-| `QuantFunc-Image-to-Image-Workflow.json` | Image editing with reference images |
-| `QuantFunc-Model-Export.json` | Export runtime-quantized models (supports LoRA fusion) |
+| `QuantFunc-Sample-WorkFlow-All-In-One.json` | **All-in-one** — every node × 3 model-loading methods × text-to-image / editing / export |
+| `QuantFunc-Ideogram4.json` | Ideogram4 text-to-image with prompt builder |
+| `QuantFunc-QwenImage-Layered.json` | Layered (transparent RGBA) generation + layer viewer |
+| `QuantFunc-ControlNet.json` | ControlNet structure-guided generation |
 
 ## 4. Troubleshooting
 
