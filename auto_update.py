@@ -670,8 +670,8 @@ def _verify_local_lib() -> None:
 
     data, source = _load_verify_for(local_lib)
     if data is None:
-        print("[QuantFunc] verify: no manifest reachable for v{} (offline / no cache); "
-              "skipping integrity check".format(local_lib))
+        print("[QuantFunc] verify: no usable manifest for v{} (not published / unreachable / "
+              "corrupt); skipping integrity check".format(local_lib))
         return
 
     schema = data.get("schema", 1)
