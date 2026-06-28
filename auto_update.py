@@ -690,7 +690,9 @@ def _verify_local_lib() -> None:
     if actual is None:
         return
     if actual == expected:
-        return  # OK — integrity verified
+        print("[QuantFunc] verify: {} integrity OK (v{}, sha256 {}…, manifest from {})".format(
+            _LIB_NAME, local_lib, actual[:12], source))
+        return
 
     # ---- MISMATCH: bounded, verify-before-replace self-heal ----
     if os.path.exists(dest + ".update"):
