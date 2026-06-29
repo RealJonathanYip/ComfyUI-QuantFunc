@@ -29,7 +29,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 | Plugin (`comfy`) | Engine (`lib`) | Summary |
 |:---:|:---:|---|
-| **0.0.06** *(current)* | **0.0.12** | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download — details below |
+| **0.0.06** *(current)* | **0.0.12** | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download · SHA-256 integrity check — details below |
 | 0.0.02 | 0.0.07 | v2 loader architecture · inpainting · full GPU coverage · faster editing |
 | 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
 
@@ -46,6 +46,9 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - **Image-to-image** — `init_img` socket + `init_img_strength` on the *Generate* node.
 - **Klein 4B / 9B** one-click auto-download (3-tier 50x / 40x / 30x-below) in the *Auto Loader*.
 - **Ideogram-4 + Qwen-Image-Layered** precision configs auto-detected by the auto-loader.
+
+**🔒 Engine integrity check (new)**
+- On startup the plugin verifies the installed engine library's **SHA-256** against the official manifest published on ModelScope (`<version>/verify.json`), re-fetched on every launch (the local cache is used only when the network is unreachable). A corrupt, incomplete, or wrong-build binary **self-heals** — the official artifact is re-downloaded and swapped in **only if its hash matches** (verify-before-replace, so a bad download never replaces a working library). It never blocks node loading, and a locally-compiled build is left untouched.
 
 **⚡ Engine improvements (0.0.12 vs 0.0.11)**
 - **VRAM workspace budget** — run large models on tight cards by planning to a fixed budget.
