@@ -87,10 +87,11 @@ library / dependency bundles / models.
 |---|---|---|---|
 | **Automatic, every startup** (background thread) | **Engine update-check** — read `version.json` (is a newer engine lib published?) + `{version}/verify.json` (the SHA-256 integrity manifest for the installed lib) | GET `{RAW}/version.json`; GET `{RAW}/{version}/verify.json` | `check_for_updates()` `auto_update.py:804`; `:192-193`, `:443-446` |
 | **Automatic, every startup** (background thread) | **Dropdown resource-cache refresh** — list the public `.safetensors`/`.json` files under each model series to populate the node dropdowns | ModelScope `HubApi.get_model_files` | `refresh_cache_background()` → `_list_ms_dir` `model_auto_loader.py:288` |
-| **Automatic, every startup** (background thread) | **Base-model repo discovery** — list available base-model repos for the BaseModelAutoLoader dropdown | ModelScope `HubApi` search | `refresh_base_model_repos_background()` → `_search_base_model_repos` `model_auto_loader.py:624` |
+| **Automatic, every startup** (background thread) | **Base-model repo discovery** — list available base-model repos for the BaseModelAutoLoader dropdown | ModelScope `HubApi.list_models` | `refresh_base_model_repos_background()` → `_search_base_model_repos` (`api.list_models` `model_auto_loader.py:629`) |
 | **Conditional** — lib missing or SHA-256 mismatch | **Engine-lib download / self-heal** — download the `.so`/`.dll`, SHA-256-verify **before** replacing | GET `{RAW}/<platform-path>` | `auto_update.py:282`, `:549-570` |
 | **Conditional** — worker can't load the lib (missing platform deps), typically first run | **CUDA dependency-bundle download** — fetch + zip-slip-guarded extract of the deps zip | ModelScope (SDK `model_file_download` / urllib) | `_download_dep_zip` → `_download_from_modelscope` `lib_setup.py:329`; trigger `nodes.py:918` |
-| **User-initiated** — you click download in a node | **Model downloads** | ModelScope `snapshot_download` / Hugging Face `snapshot_download` / `hf_hub_download` | `model_auto_loader.py:442/451/491/496/716/762` |
+| **User-initiated** — you click download in a node | **Model downloads** | ModelScope `snapshot_download` / Hugging Face `snapshot_download` / `hf_hub_download` | `model_auto_loader.py:443/452/491/496/717/763` |
+| **Opt-in ONLY** (`QUANTFUNC_PLUGIN_AUTOPULL=1`, **OFF by default**) | **Plugin self-update** — `git pull --rebase` of the plugin's own source from its git remote. Off by default (the normal update path is ComfyUI-Manager); this is the C1 opt-in escape hatch | the plugin's git remote (e.g. `github.com`) | `__init__.py` opt-in block (gated on the env var) |
 
 `{RAW}` = `_MODELSCOPE_RAW_URL = https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master`
 (`auto_update.py:138`).
