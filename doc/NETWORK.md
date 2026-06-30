@@ -133,9 +133,11 @@ find the ComfyUI process id (`pgrep -f main.py` on Linux) and run:
 ### Linux — what hosts does it connect to?
 ```bash
 # Every outbound connection the process makes. Expect EXACTLY: service.quantfunc.com (engine
-# license heartbeat), AND www.modelscope.cn AT STARTUP (the plugin auto-update version-check,
-# see §1b — this appears even if you generate/download nothing), plus ModelScope/HuggingFace
-# only WHEN you download models. No other hosts.
+# license heartbeat), AND www.modelscope.cn AT STARTUP (the plugin's three automatic startup
+# checks — update-check + dropdown cache + base-model repo discovery, see §1b — these appear
+# even if you generate/download nothing), plus ModelScope/HuggingFace only WHEN you download
+# models. No other hosts in the default config. (If you set the opt-in QUANTFUNC_PLUGIN_AUTOPULL=1,
+# you will ALSO see the plugin's git remote — e.g. github.com — at startup; see the §1b opt-in row.)
 sudo strace -f -e trace=connect -p <comfyui_pid> 2>&1 | grep -i 'sin_addr\|sin6_addr'
 ```
 
