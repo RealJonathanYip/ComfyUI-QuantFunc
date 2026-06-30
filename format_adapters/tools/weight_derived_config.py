@@ -241,7 +241,15 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
         "layer_counts": {"num_layers": ["transformer_blocks"]},
         "hidden_from": ["img_in.weight", "img_in.bias", "img_in._qweight",
                         "x_embedder.weight", "x_embedder.bias", "x_embedder._qweight"],
-        # Same lighting/FP4 fallthrough class as Flux2Klein (shared key layout).
+        # PREEMPTIVE / UNVERIFIED (验证契约 rule 3) — layout-symmetric with Flux2Klein
+        # but NOT exercised by any deployed QwenImage export. MEASURED 2026-06-30:
+        # QwenImage lighting/FP4 (50x-above) AND INT4 (30x-below) BOTH ship
+        # img_in.weight [hidden,in_ch] → the PRIMARY hidden_from fires and this
+        # fallback NEVER runs (staging A/B: OLD == FIXED, heads=24, no regression).
+        # QwenImage also has no context_embedder/norm_out.norm key today, so these
+        # would not match anyway. Kept for the (currently hypothetical) future
+        # QwenImage export that ships neither img_in nor x_embedder; will VALIDATE
+        # the dim-0==hidden assumption when such a checkpoint actually ships.
         "hidden_extra_from": ["context_embedder.weight", "context_embedder._qweight",
                               "context_embedder._weight", "norm_out.norm.weight",
                               "norm_out.norm.bias"],
