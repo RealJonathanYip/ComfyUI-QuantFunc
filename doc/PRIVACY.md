@@ -5,9 +5,11 @@ receives and stores. It is the governance counterpart to the technical network a
 [`NETWORK.md`](NETWORK.md), which shows the same facts at the wire level and tells you how
 to verify them yourself.
 
-> **In one sentence:** the QuantFunc license server receives and stores **only** a one-way
-> hash of your GPU's UUID, your license key, and request timestamps — and **never** any of
-> your prompts, images, generated outputs, files, or system information.
+> **In one sentence:** the engine sends the license server **only** a one-way hash of your GPU's
+> UUID, your license key, and request timestamps — **never** your prompts, images, outputs, files,
+> or system information (a *code-verifiable* fact about the open client); and MYNDEER's policy is
+> that the closed server **retains only** those same license fields (an *operator commitment*).
+> These are two different kinds of guarantee and are kept honestly distinct below.
 
 ## What the license server receives and stores
 
@@ -18,17 +20,22 @@ publisher-protected models, a key-map request, the server receives **only**:
 |---|---|---|
 | `device_id` | `hex(SHA256(GPU_UUID))` — a **one-way, irreversible** hash of your GPU's hardware UUID only. **Not** your hostname, MAC, username, IP, or `/etc/machine-id`. | Binds a license to hardware (license enforcement). |
 | `api_key` | Your license key. | Identifies your entitlement. |
-| `_t` (timestamp) + `_s` (HMAC signature) | A request timestamp and an `HMAC-SHA256` keyed on your `api_key`. | Clock calibration + replay-attack prevention. Carry no user content. |
+| `_t` (timestamp) + `_s` (HMAC) | A recent server-time estimate (`_t`) and an `HMAC-SHA256` keyed on your `api_key` (`_s`). | Replay-attack prevention (`_t`, the server checks it is recent) + request authentication (`_s`). Carry no user content. |
 | `model_id` | The identifier of a **publisher-protected** model (key-map requests only). | Fetch/store the model's encrypted key map. |
 
 That is the complete set. (Standard transport-level metadata such as your source IP is
 inherently visible to any server you connect to over the internet; we do not use it to
 profile or track you, and the engine sends no IP-derived identifier in the request body.)
 
-## What we NEVER receive or store
+## What is NEVER sent (client) vs what the server retains (operator policy)
 
-The engine has **no code path** that transmits, and the server has no facility that stores,
-any of the following:
+These are two distinct kinds of guarantee. We keep them honestly separate: one is provable from
+code, the other is a policy promise about a server you cannot read.
+
+### ① CLIENT — code-verifiable (provable, and checkable by you)
+
+The engine has **no code path** that transmits any of the following — verifiable from the open
+plugin Python, the `src/auth/` network surface, and your own capture (see [`NETWORK.md`](NETWORK.md)):
 
 - ❌ prompt text
 - ❌ input or reference images
@@ -37,9 +44,18 @@ any of the following:
 - ❌ system inventory (CPU/RAM/OS, installed software, drive contents) beyond the GPU-UUID hash
 - ❌ telemetry, analytics, usage tracking, or behavioral profiling
 
-**The text-to-image / image-to-image generation path makes zero network calls** — your
-creative inputs and outputs never leave your machine via the engine. This is verifiable: see
-the `tcpdump` / `strace` recipes in [`NETWORK.md`](NETWORK.md).
+This is a claim about **code**, and it is independently checkable. **The text-to-image /
+image-to-image generation path makes zero network calls** — your creative inputs and outputs never
+leave your machine via the engine.
+
+### ② SERVER — operator policy commitment
+
+The license server is **closed** — it is not in this repository and cannot be verified from source.
+As a binding **operational policy**, **MYNDEER commits that the license server retains only the
+`device_id` hash, your `api_key`, and request timestamps, and stores none of the user content
+listed in ① above.** This is a policy promise about the closed server (stated deliberately as a
+commitment, not as a code-verifiable fact), so the trust posture stays honest about which claim is
+which.
 
 ## Retention
 
