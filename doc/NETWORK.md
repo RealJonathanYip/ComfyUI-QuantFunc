@@ -49,7 +49,7 @@ a TLS-decrypted capture shows a **binary gzip blob**, which you must `gunzip` to
 | 1 | `POST {server_url}/api/auth/refresh` | License check — on init + a background refresh (1/3-lifetime rule) | `device_id`, `api_key`, `_t`, `_s` — **raw, not compressed** | body `AuthClient.cpp:666`; `_t`/`_s` `RequestSigning.cpp:106`; POST `AuthClient.cpp:691` |
 | 2 | `POST {server_url}/api/models/keymap/batch` | Protected-model **bundle EXPORT** — the **PRIMARY** publisher path (sent for every protected bundle exported with `obfuscation_percent > 0`) | `api_key`, `items_json` (a JSON array of `{model_id, encrypted_map}` pairs), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:467`; body `:474-475`; caller `PipelineLoader.cpp:1962` |
 | 3 | `POST {server_url}/api/models/keymap` | Protected-model EXPORT — single-model **FALLBACK** (used only if the batch endpoint above fails) | `api_key`, `model_id`, `encrypted_map`, `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:378`; body `:396`; AES-encrypt `:384`; fallback caller `PipelineLoader.cpp:1969` |
-| 4 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** — decrypt one model's key map | `api_key`, `model_id`, `device_id`, `_t`, `_s` — **gzip** | live fn `downloadKeyMapEncrypted`: url `KeyMapClient.cpp:661`, body `:667-669` (callers `ComponentImpl.cpp:1164`, `SDXLPipeline.cpp:116`). *(A same-URL sibling `downloadKeyMap` at `:509`/`:515-517` is currently unused.)* |
+| 4 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** — decrypt one model's key map | `api_key`, `model_id`, `device_id`, `_t`, `_s` — **gzip** | live fn `downloadKeyMapEncrypted`: url `KeyMapClient.cpp:661`, body `:667-669` (all live callers: `ComponentImpl.cpp:1164`, `SDXLPipeline.cpp:116`, `sdxl_factory.cpp:109`). *(A same-URL sibling `downloadKeyMap` at `:509`/`:515-517` is currently unused.)* |
 | 5 | `POST {server_url}/api/models/keymap/batch/download` | Protected-model **LOAD (batch)** — **FORTHCOMING**: implemented in the engine but has **no live caller yet**; documented now so a future deploy generates no undocumented traffic | `api_key`, `device_id`, `model_ids` (CSV), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:587`; body `:592-594` |
 
 ### What each field is
@@ -77,25 +77,30 @@ a TLS-decrypted capture shows a **binary gzip blob**, which you must `gunzip` to
 
 ## 1b. Plugin-side (Python) network calls
 
-Separately from the engine, the **open plugin Python** makes a few network calls. All target
-**ModelScope** (`www.modelscope.cn`, repo `QuantFunc/Plugin`) except user-initiated model
-downloads, which may also hit **Hugging Face**. **None carries user content** — they are GETs of
-public version manifests and downloads of the engine library / models.
+Separately from the engine, the **open plugin Python** makes network calls — all to **ModelScope**
+(`www.modelscope.cn`; the `QuantFunc/Plugin` repo, plus upstream base-model repos for discovery),
+except user-initiated model downloads which may also hit **Hugging Face**. **None carries user
+content** — they read public version manifests, list public repo files, or download the engine
+library / dependency bundles / models.
 
-| When | What | Endpoint(s) | Code |
+| When | What | Endpoint(s) / API | Code |
 |---|---|---|---|
-| **Automatic, on every ComfyUI startup** (background thread) | **Engine update-check** — reads the published `version.json` to see if a newer engine lib exists, and `{version}/verify.json` (the SHA-256 integrity manifest) to check the installed lib | GET `{RAW}/version.json`; GET `{RAW}/{version}/verify.json` | `check_for_updates()` `auto_update.py:804`; `version.json` `:192-193`; `verify.json` `:443-446` |
-| **Conditional** — only if the lib is missing or a SHA-256 mismatch is found | **Engine-lib download / self-heal** — downloads the `.so`/`.dll`, SHA-256-verifies **before** replacing | GET `{RAW}/<platform-path>` | `auto_update.py:282`, `:549-570` |
-| **User-initiated** — you click download in a node | **Model downloads** | ModelScope `snapshot_download` / Hugging Face `huggingface_hub` | `model_auto_loader.py` |
+| **Automatic, every startup** (background thread) | **Engine update-check** — read `version.json` (is a newer engine lib published?) + `{version}/verify.json` (the SHA-256 integrity manifest for the installed lib) | GET `{RAW}/version.json`; GET `{RAW}/{version}/verify.json` | `check_for_updates()` `auto_update.py:804`; `:192-193`, `:443-446` |
+| **Automatic, every startup** (background thread) | **Dropdown resource-cache refresh** — list the public `.safetensors`/`.json` files under each model series to populate the node dropdowns | ModelScope `HubApi.get_model_files` | `refresh_cache_background()` → `_list_ms_dir` `model_auto_loader.py:288` |
+| **Automatic, every startup** (background thread) | **Base-model repo discovery** — list available base-model repos for the BaseModelAutoLoader dropdown | ModelScope `HubApi` search | `refresh_base_model_repos_background()` → `_search_base_model_repos` `model_auto_loader.py:624` |
+| **Conditional** — lib missing or SHA-256 mismatch | **Engine-lib download / self-heal** — download the `.so`/`.dll`, SHA-256-verify **before** replacing | GET `{RAW}/<platform-path>` | `auto_update.py:282`, `:549-570` |
+| **Conditional** — worker can't load the lib (missing platform deps), typically first run | **CUDA dependency-bundle download** — fetch + zip-slip-guarded extract of the deps zip | ModelScope (SDK `model_file_download` / urllib) | `_download_dep_zip` → `_download_from_modelscope` `lib_setup.py:329`; trigger `nodes.py:918` |
+| **User-initiated** — you click download in a node | **Model downloads** | ModelScope `snapshot_download` / Hugging Face `snapshot_download` / `hf_hub_download` | `model_auto_loader.py:442/451/491/496/716/762` |
 
 `{RAW}` = `_MODELSCOPE_RAW_URL = https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master`
 (`auto_update.py:138`).
 
-> **Important for the verify recipe (§3):** because of the startup update-check, a connection to
+> **Important for the verify recipe (§3):** because of the THREE automatic startup checks above
+> (update-check + dropdown cache + base-model repo discovery), one or more connections to
 > `www.modelscope.cn` **will appear at ComfyUI startup even if you never generate or download
-> anything** — that is the `version.json`/`verify.json` GET (a public-manifest read), not data
-> egress. *(Gating it behind explicit consent / an opt-out is a planned follow-up; today it runs
-> automatically in a background thread and never blocks node loading.)*
+> anything** — these are public version-manifest reads + repo file listings (no user content, no
+> data egress). *(Gating them behind explicit consent / an opt-out is a planned follow-up; today
+> they run in background threads and never block node loading.)*
 
 ---
 
