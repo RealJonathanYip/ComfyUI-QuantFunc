@@ -198,6 +198,13 @@ def _first_nonempty_shape(keys, suffixes) -> Optional[list]:
 #   hidden_from  : ordered tensor-key SUFFIXES whose dim-0 = transformer hidden
 #                  width; a 2-D ``.weight``/``._qweight`` additionally yields
 #                  ``in_channels`` from dim-1, a 1-D ``.bias`` is a fallback.
+#   hidden_extra_from : ordered SUFFIXES used as a HIDDEN-ONLY fallback (dim-0 =
+#                  hidden) when NONE of ``hidden_from`` is present — e.g. a
+#                  klein/qwen *lighting/FP4* export ships neither ``img_in`` nor
+#                  ``x_embedder`` (only its ``context_embedder`` + final norm
+#                  carry the hidden dim). These keys' dim-1 is NOT in_channels
+#                  (context_embedder dim-1 = joint), so they NEVER set
+#                  in_channels — only hidden → num_attention_heads.
 #   joint_from   : ordered SUFFIXES whose 2-D dim-1 = ``joint_attention_dim``
 #                  (text cross-condition width).
 #   head_dim     : num_attention_heads = hidden // head_dim.
@@ -216,6 +223,15 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
         },
         "hidden_from": ["img_in.weight", "img_in.bias", "img_in._qweight",
                         "x_embedder.weight", "x_embedder.bias", "x_embedder._qweight"],
+        # klein-9b/4b LIGHTING/FP4 exports ship neither img_in nor x_embedder
+        # (only x_embedder._wscales, a 1-D scale) → hidden falls through to the
+        # bundled 4B template (24 heads → 3072) → norm_out [3072]!=[4096] load
+        # crash on a real 9B. Derive hidden from dim-0 of the context embedder /
+        # final norm instead (present in every klein export). HIDDEN-ONLY: dim-1
+        # of context_embedder is JOINT, never in_channels.
+        "hidden_extra_from": ["context_embedder.weight", "context_embedder._qweight",
+                              "context_embedder._weight", "norm_out.norm.weight",
+                              "norm_out.norm.bias"],
         "joint_from":  ["txt_in.weight", "txt_in._qweight",
                         "context_embedder.weight", "context_embedder._qweight",
                         "context_embedder._weight"],
@@ -225,6 +241,10 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
         "layer_counts": {"num_layers": ["transformer_blocks"]},
         "hidden_from": ["img_in.weight", "img_in.bias", "img_in._qweight",
                         "x_embedder.weight", "x_embedder.bias", "x_embedder._qweight"],
+        # Same lighting/FP4 fallthrough class as Flux2Klein (shared key layout).
+        "hidden_extra_from": ["context_embedder.weight", "context_embedder._qweight",
+                              "context_embedder._weight", "norm_out.norm.weight",
+                              "norm_out.norm.bias"],
         "joint_from":  ["txt_in.weight", "txt_in._qweight",
                         "context_embedder.weight", "context_embedder._qweight",
                         "context_embedder._weight"],
@@ -283,6 +303,9 @@ def derive_transformer_config(path: str, arch: Optional[str]) -> Optional[dict]:
 
     # 2. hidden width → num_attention_heads (+ in_channels from a 2-D embed)
     head_dim = desc.get("head_dim", _DEFAULT_HEAD_DIM)
+    hidden = None
+    # 2a. PRIMARY: img_in / x_embedder — dim-0 = hidden AND (2-D) dim-1 =
+    # in_channels. This is the only source that may set in_channels.
     embed_shape = _first_nonempty_shape(keys, desc.get("hidden_from", []))
     if embed_shape:
         hidden = embed_shape[0]
@@ -293,14 +316,24 @@ def derive_transformer_config(path: str, arch: Optional[str]) -> Optional[dict]:
         if (len(embed_shape) >= 2 and desc.get("derive_in_channels", True)
                 and _sane_dim(embed_shape[1])):
             out["in_channels"] = embed_shape[1]
-        if hidden and head_dim and hidden % head_dim == 0:
-            heads = hidden // head_dim
-            # heads must be a plausible positive count: a crafted hidden < head_dim
-            # gives heads==0, and a giant hidden gives an implausible count.
-            if heads < 1 or heads > _MAX_SANE_HEADS:
-                return None  # implausible head count → untrusted weights → bail
-            out["num_attention_heads"] = heads
-            out["attention_head_dim"] = head_dim
+    # 2b. HIDDEN-ONLY FALLBACK: a lighting/FP4 export ships NEITHER img_in nor
+    # x_embedder (klein-9b-*-lighting) — derive hidden from dim-0 of the context
+    # embedder / final norm. NEVER touches in_channels (context_embedder dim-1 =
+    # joint; a 1-D norm has no dim-1) → in_channels stays from the bundled config
+    # (4B/9B share it), uncorrupted. Without this, 9B hidden falls through to the
+    # bundled 4B default (24 heads → 3072) → norm_out [3072]!=[4096] crash.
+    if hidden is None:
+        hidden_shape = _first_nonempty_shape(keys, desc.get("hidden_extra_from", []))
+        if hidden_shape:
+            hidden = hidden_shape[0]
+    if hidden and head_dim and hidden % head_dim == 0:
+        heads = hidden // head_dim
+        # heads must be a plausible positive count: a crafted hidden < head_dim
+        # gives heads==0, and a giant hidden gives an implausible count.
+        if heads < 1 or heads > _MAX_SANE_HEADS:
+            return None  # implausible head count → untrusted weights → bail
+        out["num_attention_heads"] = heads
+        out["attention_head_dim"] = head_dim
 
     # 3. joint_attention_dim (text cross-condition width) from a 2-D text embed
     joint_shape = _first_nonempty_shape(keys, desc.get("joint_from", []))
