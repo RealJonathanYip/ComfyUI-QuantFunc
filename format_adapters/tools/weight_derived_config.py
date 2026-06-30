@@ -229,6 +229,10 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
         # crash on a real 9B. Derive hidden from dim-0 of the context embedder /
         # final norm instead (present in every klein export). HIDDEN-ONLY: dim-1
         # of context_embedder is JOINT, never in_channels.
+        # MEASURED (klein-9b-50x-lighting.safetensors header, 2026-06-30): img_in/
+        # x_embedder ABSENT, context_embedder._qweight=[4096,12288] dim-0==4096 →
+        # this fallback derives num_attention_heads=32 (not the 4B default 24).
+        # Proof: /media/jonathan/Data/temp/klein9b-staging-proof-20260630-105200.log
         "hidden_extra_from": ["context_embedder.weight", "context_embedder._qweight",
                               "context_embedder._weight", "norm_out.norm.weight",
                               "norm_out.norm.bias"],
@@ -241,18 +245,11 @@ _TRANSFORMER_DESCRIPTORS: dict[str, dict] = {
         "layer_counts": {"num_layers": ["transformer_blocks"]},
         "hidden_from": ["img_in.weight", "img_in.bias", "img_in._qweight",
                         "x_embedder.weight", "x_embedder.bias", "x_embedder._qweight"],
-        # PREEMPTIVE / UNVERIFIED (验证契约 rule 3) — layout-symmetric with Flux2Klein
-        # but NOT exercised by any deployed QwenImage export. MEASURED 2026-06-30:
-        # QwenImage lighting/FP4 (50x-above) AND INT4 (30x-below) BOTH ship
-        # img_in.weight [hidden,in_ch] → the PRIMARY hidden_from fires and this
-        # fallback NEVER runs (staging A/B: OLD == FIXED, heads=24, no regression).
-        # QwenImage also has no context_embedder/norm_out.norm key today, so these
-        # would not match anyway. Kept for the (currently hypothetical) future
-        # QwenImage export that ships neither img_in nor x_embedder; will VALIDATE
-        # the dim-0==hidden assumption when such a checkpoint actually ships.
-        "hidden_extra_from": ["context_embedder.weight", "context_embedder._qweight",
-                              "context_embedder._weight", "norm_out.norm.weight",
-                              "norm_out.norm.bias"],
+        # NOTE: no hidden_extra_from here. Every deployed QwenImage export (lighting
+        # FP4 50x-above AND INT4 30x-below, measured 2026-06-30) ships img_in.weight
+        # [hidden,in_ch], so the primary hidden_from always fires; QwenImage also has
+        # no context_embedder/norm_out.norm key. Add a (verified) fallback only if a
+        # QwenImage export lacking img_in/x_embedder ever ships.
         "joint_from":  ["txt_in.weight", "txt_in._qweight",
                         "context_embedder.weight", "context_embedder._qweight",
                         "context_embedder._weight"],
