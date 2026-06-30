@@ -51,11 +51,14 @@ leave your machine via the engine.
 ### ② SERVER — operator policy commitment
 
 The license server is **closed** — it is not in this repository and cannot be verified from source.
-As a binding **operational policy**, **MYNDEER commits that the license server retains only the
-`device_id` hash, your `api_key`, and request timestamps, and stores none of the user content
-listed in ① above.** This is a policy promise about the closed server (stated deliberately as a
-commitment, not as a code-verifiable fact), so the trust posture stays honest about which claim is
-which.
+As a binding **operational policy**, **MYNDEER** (the operator behind QuantFunc; its exact
+registered legal entity is being finalized — see the note at the foot of this document)
+**commits that the license server retains only the `device_id` hash, your `api_key`, and request
+timestamps, and stores none of the user content listed in ① above.** This is a policy promise about
+the closed server (stated deliberately as a commitment, not as a code-verifiable fact), so the
+trust posture stays honest about which claim is which. *(Before this policy is published at ship
+time, the operator must replace this with the confirmed legal entity name; an unconfirmed entity
+cannot bind the commitment.)*
 
 ## Retention
 

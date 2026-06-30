@@ -13,7 +13,12 @@ confirms them rather than contradicts them.
 
 ---
 
-## 1. Every endpoint, and the EXACT fields it sends
+## 1. Every ENGINE endpoint, and the EXACT fields it sends
+
+*(This section covers the closed C++ **engine** — `service.quantfunc.com` via `src/auth/`. The
+open **plugin Python** also makes a small number of network calls — an automatic startup
+update-check and optional downloads — enumerated separately in §1b below, so this is not the whole
+picture by itself.)*
 
 `server_url` is **not hardcoded** — it is supplied via `config.json` / CLI / API options (the
 shipped plugin config points it at `https://service.quantfunc.com`). Setting it empty skips auth
@@ -44,15 +49,16 @@ a TLS-decrypted capture shows a **binary gzip blob**, which you must `gunzip` to
 | 1 | `POST {server_url}/api/auth/refresh` | License check — on init + a background refresh (1/3-lifetime rule) | `device_id`, `api_key`, `_t`, `_s` — **raw, not compressed** | body `AuthClient.cpp:666`; `_t`/`_s` `RequestSigning.cpp:106`; POST `AuthClient.cpp:691` |
 | 2 | `POST {server_url}/api/models/keymap/batch` | Protected-model **bundle EXPORT** — the **PRIMARY** publisher path (sent for every protected bundle exported with `obfuscation_percent > 0`) | `api_key`, `items_json` (a JSON array of `{model_id, encrypted_map}` pairs), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:467`; body `:474-475`; caller `PipelineLoader.cpp:1962` |
 | 3 | `POST {server_url}/api/models/keymap` | Protected-model EXPORT — single-model **FALLBACK** (used only if the batch endpoint above fails) | `api_key`, `model_id`, `encrypted_map`, `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:378`; body `:396`; AES-encrypt `:384`; fallback caller `PipelineLoader.cpp:1969` |
-| 4 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** — decrypt one model's key map | `api_key`, `model_id`, `device_id`, `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:509`; body `:515-517` |
+| 4 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** — decrypt one model's key map | `api_key`, `model_id`, `device_id`, `_t`, `_s` — **gzip** | live fn `downloadKeyMapEncrypted`: url `KeyMapClient.cpp:661`, body `:667-669` (callers `ComponentImpl.cpp:1164`, `SDXLPipeline.cpp:116`). *(A same-URL sibling `downloadKeyMap` at `:509`/`:515-517` is currently unused.)* |
 | 5 | `POST {server_url}/api/models/keymap/batch/download` | Protected-model **LOAD (batch)** — **FORTHCOMING**: implemented in the engine but has **no live caller yet**; documented now so a future deploy generates no undocumented traffic | `api_key`, `device_id`, `model_ids` (CSV), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:587`; body `:592-594` |
 
 ### What each field is
 
 - **`device_id`** = `hex(SHA256(GPU_UUID))` — a **one-way SHA-256 hash of the GPU's hardware UUID
   only**. It is **not** your hostname, MAC address, username, IP, or `/etc/machine-id`. It is the
-  minimal hardware-binding fingerprint for license enforcement, and it is irreversible.
-  `AuthClient.cpp:108-126`.
+  minimal hardware-binding fingerprint for license enforcement, and it is irreversible. The full
+  `computeDeviceId` is `AuthClient.cpp:108-148`; the SHA-256 step itself is `:134-141` (under
+  `HAVE_AUTH`, which production builds use — `:108-126` is only the UUID-string formatting).
 - **`api_key`** — your license key.
 - **`model_id`** / **`model_ids`** — the identifier(s) of publisher-protected/published model(s)
   (key-map endpoints 2–5 only; `model_ids` is a comma-separated list for the batch-load endpoint).
@@ -66,6 +72,30 @@ a TLS-decrypted capture shows a **binary gzip blob**, which you must `gunzip` to
 > The model-name obfuscation (`encrypted_map`) remaps **model tensor names** for publisher DRM. It
 > never obfuscates code or behavior, applies only on the protected-model export/load paths, and is
 > off for ordinary unprotected models.
+
+---
+
+## 1b. Plugin-side (Python) network calls
+
+Separately from the engine, the **open plugin Python** makes a few network calls. All target
+**ModelScope** (`www.modelscope.cn`, repo `QuantFunc/Plugin`) except user-initiated model
+downloads, which may also hit **Hugging Face**. **None carries user content** — they are GETs of
+public version manifests and downloads of the engine library / models.
+
+| When | What | Endpoint(s) | Code |
+|---|---|---|---|
+| **Automatic, on every ComfyUI startup** (background thread) | **Engine update-check** — reads the published `version.json` to see if a newer engine lib exists, and `{version}/verify.json` (the SHA-256 integrity manifest) to check the installed lib | GET `{RAW}/version.json`; GET `{RAW}/{version}/verify.json` | `check_for_updates()` `auto_update.py:804`; `version.json` `:192-193`; `verify.json` `:443-446` |
+| **Conditional** — only if the lib is missing or a SHA-256 mismatch is found | **Engine-lib download / self-heal** — downloads the `.so`/`.dll`, SHA-256-verifies **before** replacing | GET `{RAW}/<platform-path>` | `auto_update.py:282`, `:549-570` |
+| **User-initiated** — you click download in a node | **Model downloads** | ModelScope `snapshot_download` / Hugging Face `huggingface_hub` | `model_auto_loader.py` |
+
+`{RAW}` = `_MODELSCOPE_RAW_URL = https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master`
+(`auto_update.py:138`).
+
+> **Important for the verify recipe (§3):** because of the startup update-check, a connection to
+> `www.modelscope.cn` **will appear at ComfyUI startup even if you never generate or download
+> anything** — that is the `version.json`/`verify.json` GET (a public-manifest read), not data
+> egress. *(Gating it behind explicit consent / an opt-out is a planned follow-up; today it runs
+> automatically in a background thread and never blocks node loading.)*
 
 ---
 
@@ -96,8 +126,10 @@ find the ComfyUI process id (`pgrep -f main.py` on Linux) and run:
 
 ### Linux — what hosts does it connect to?
 ```bash
-# Every outbound connection the process makes (you'll see only service.quantfunc.com,
-# plus ModelScope/HuggingFace IF you are downloading models):
+# Every outbound connection the process makes. Expect EXACTLY: service.quantfunc.com (engine
+# license heartbeat), AND www.modelscope.cn AT STARTUP (the plugin auto-update version-check,
+# see §1b — this appears even if you generate/download nothing), plus ModelScope/HuggingFace
+# only WHEN you download models. No other hosts.
 sudo strace -f -e trace=connect -p <comfyui_pid> 2>&1 | grep -i 'sin_addr\|sin6_addr'
 ```
 

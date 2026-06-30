@@ -438,7 +438,7 @@ def download_base_model(series, gpu_variant, data_source):
 
     if data_source == "huggingface":
         if not _ensure_huggingface_hub():
-            raise RuntimeError("Cannot install huggingface_hub")
+            raise RuntimeError("huggingface_hub is required but not installed (declared in requirements.txt)")
         from huggingface_hub import snapshot_download
         snapshot_download(
             repo_id=series,
@@ -447,7 +447,7 @@ def download_base_model(series, gpu_variant, data_source):
         )
     else:
         if not _ensure_modelscope():
-            raise RuntimeError("Cannot install modelscope")
+            raise RuntimeError("modelscope is required but not installed (declared in requirements.txt)")
         from modelscope import snapshot_download as ms_download
         ms_download(
             model_id=series,
@@ -486,12 +486,12 @@ def _download_single_file(series, remote_path, data_source):
 
     if data_source == "huggingface":
         if not _ensure_huggingface_hub():
-            raise RuntimeError("Cannot install huggingface_hub")
+            raise RuntimeError("huggingface_hub is required but not installed (declared in requirements.txt)")
         from huggingface_hub import hf_hub_download
         hf_hub_download(repo_id=series, filename=remote_path, local_dir=local_base)
     else:
         if not _ensure_modelscope():
-            raise RuntimeError("Cannot install modelscope")
+            raise RuntimeError("modelscope is required but not installed (declared in requirements.txt)")
         from modelscope.hub.file_download import model_file_download
         model_file_download(
             model_id=series, file_path=remote_path, local_dir=local_base)
@@ -712,12 +712,12 @@ def download_base_model_repo(repo_id, data_source):
 
     if data_source == "huggingface":
         if not _ensure_huggingface_hub():
-            raise RuntimeError("Cannot install huggingface_hub")
+            raise RuntimeError("huggingface_hub is required but not installed (declared in requirements.txt)")
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=repo_id, local_dir=local_dir)
     else:
         if not _ensure_modelscope():
-            raise RuntimeError("Cannot install modelscope")
+            raise RuntimeError("modelscope is required but not installed (declared in requirements.txt)")
         from modelscope import snapshot_download as ms_download
         ms_download(model_id=repo_id, local_dir=local_dir)
 
@@ -758,12 +758,12 @@ def download_base_model_to_diffusers(repo_id, data_source):
 
     if data_source == "huggingface":
         if not _ensure_huggingface_hub():
-            raise RuntimeError("Cannot install huggingface_hub")
+            raise RuntimeError("huggingface_hub is required but not installed (declared in requirements.txt)")
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=repo_id, local_dir=local_dir)
     else:
         if not _ensure_modelscope():
-            raise RuntimeError("Cannot install modelscope")
+            raise RuntimeError("modelscope is required but not installed (declared in requirements.txt)")
         from modelscope import snapshot_download as ms_download
         ms_download(model_id=repo_id, local_dir=local_dir)
 
