@@ -22,18 +22,30 @@ entirely (`AuthClient.cpp:965`).
 Every request below is signed by `request_signing::signRequest`, which appends **two signing
 fields** to the body before it is sent:
 
-- **`_t`** — an estimated server unix timestamp (used for clock calibration). `RequestSigning.cpp:95-96`.
-- **`_s`** — an `HMAC-SHA256` of the request, keyed on your `api_key` (replay-attack prevention).
-  `RequestSigning.cpp:101-106`.
+- **`_t`** — the client's estimate of the current server unix timestamp, **sent TO the server to
+  prevent replay attacks** (the server rejects a request whose `_t` is not recent).
+  `RequestSigning.cpp:95-96`. *(Clock calibration is a separate, CLIENT-side step — NOT what `_t`
+  is for: on an HTTP 401 the client reads the `X-Server-Time` response header and adjusts its own
+  offset, `AuthClient.cpp:702-706`.)*
+- **`_s`** — an `HMAC-SHA256` of the request keyed on your `api_key`: request authentication +
+  tamper-evidence. `RequestSigning.cpp:101-106`.
 
-**`_t` and `_s` carry ZERO user content.** They exist only to make each request time-bound and
+**`_t` and `_s` carry ZERO user content.** They exist only to make each request recent and
 tamper-evident. **You WILL see `_t` and `_s` on the wire — that is expected and correct.**
+
+**Compression (matters for the verify recipe below):** the license **heartbeat** (endpoint 1) is
+sent as **raw, uncompressed** POST fields (`AuthClient.cpp:681`) — so after you decrypt TLS you see
+the four fields in plaintext. The **key-map** requests (endpoints 2–5) are **gzip-compressed**
+before sending (`Content-Encoding: gzip`, `KeyMapClient.cpp:316`) — so during a model export/load
+a TLS-decrypted capture shows a **binary gzip blob**, which you must `gunzip` to read.
 
 | # | Endpoint | When | EXACT body fields | Code |
 |---|---|---|---|---|
-| 1 | `POST {server_url}/api/auth/refresh` | License check — on init + a background refresh (1/3-lifetime rule) | `device_id`, `api_key`, `_t`, `_s` | body `AuthClient.cpp:666`; signing appended `RequestSigning.cpp:106`; POST `AuthClient.cpp:691` |
-| 2 | `POST {server_url}/api/models/keymap` | Protected-model **EXPORT** (publisher path only) | `api_key`, `model_id`, `encrypted_map`, `_t`, `_s` (gzip-compressed) | url `KeyMapClient.cpp:378`; body `KeyMapClient.cpp:396`; AES-encrypt `KeyMapClient.cpp:384` |
-| 3 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** (decrypt the publisher's key map) | `api_key`, `model_id`, `device_id`, `_t`, `_s` (gzip-compressed) | url `KeyMapClient.cpp:509`; body `KeyMapClient.cpp:515-517` |
+| 1 | `POST {server_url}/api/auth/refresh` | License check — on init + a background refresh (1/3-lifetime rule) | `device_id`, `api_key`, `_t`, `_s` — **raw, not compressed** | body `AuthClient.cpp:666`; `_t`/`_s` `RequestSigning.cpp:106`; POST `AuthClient.cpp:691` |
+| 2 | `POST {server_url}/api/models/keymap/batch` | Protected-model **bundle EXPORT** — the **PRIMARY** publisher path (sent for every protected bundle exported with `obfuscation_percent > 0`) | `api_key`, `items_json` (a JSON array of `{model_id, encrypted_map}` pairs), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:467`; body `:474-475`; caller `PipelineLoader.cpp:1962` |
+| 3 | `POST {server_url}/api/models/keymap` | Protected-model EXPORT — single-model **FALLBACK** (used only if the batch endpoint above fails) | `api_key`, `model_id`, `encrypted_map`, `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:378`; body `:396`; AES-encrypt `:384`; fallback caller `PipelineLoader.cpp:1969` |
+| 4 | `POST {server_url}/api/models/keymap/download` | Protected-model **LOAD** — decrypt one model's key map | `api_key`, `model_id`, `device_id`, `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:509`; body `:515-517` |
+| 5 | `POST {server_url}/api/models/keymap/batch/download` | Protected-model **LOAD (batch)** — **FORTHCOMING**: implemented in the engine but has **no live caller yet**; documented now so a future deploy generates no undocumented traffic | `api_key`, `device_id`, `model_ids` (CSV), `_t`, `_s` — **gzip** | url `KeyMapClient.cpp:587`; body `:592-594` |
 
 ### What each field is
 
@@ -42,11 +54,14 @@ tamper-evident. **You WILL see `_t` and `_s` on the wire — that is expected an
   minimal hardware-binding fingerprint for license enforcement, and it is irreversible.
   `AuthClient.cpp:108-126`.
 - **`api_key`** — your license key.
-- **`model_id`** — the identifier of a publisher-protected/published model (endpoints 2 & 3 only).
-- **`encrypted_map`** — the model's tensor-name→UUID map, **AES-encrypted client-side** before it
-  ever leaves your machine (endpoint 2, the publisher EXPORT path only). It contains no prompts,
-  images, or outputs — it is model-DRM metadata.
-- **`_t`, `_s`** — request signing fields (see above). No user content.
+- **`model_id`** / **`model_ids`** — the identifier(s) of publisher-protected/published model(s)
+  (key-map endpoints 2–5 only; `model_ids` is a comma-separated list for the batch-load endpoint).
+- **`encrypted_map`** / **`items_json`** — the model's tensor-name→UUID map, **AES-encrypted
+  client-side** before it ever leaves your machine. `items_json` (batch-export) is a JSON array of
+  `{model_id, encrypted_map}` pairs, each `encrypted_map` being the same AES-encrypted DRM
+  metadata. Publisher EXPORT paths only; contains no prompts, images, or outputs.
+- **`_t`, `_s`** — request signing fields (a replay-prevention timestamp + an HMAC authentication
+  tag — see above). No user content.
 
 > The model-name obfuscation (`encrypted_map`) remaps **model tensor names** for publisher DRM. It
 > never obfuscates code or behavior, applies only on the protected-model export/load paths, and is
@@ -88,11 +103,20 @@ sudo strace -f -e trace=connect -p <comfyui_pid> 2>&1 | grep -i 'sin_addr\|sin6_
 
 ### Linux — capture the license traffic and read the fields
 ```bash
-# See the heartbeat on the wire. You will observe device_id, api_key, _t, _s — and NOTHING ELSE:
+# See the license HEARTBEAT on the wire. It is sent RAW (uncompressed), so after TLS-decrypt you
+# observe exactly device_id, api_key, _t, _s in plaintext — and nothing else:
 sudo tcpdump -A -s0 host service.quantfunc.com
-# HTTPS note: the bodies are TLS-encrypted on the wire. To read plaintext, either run the
-# traffic through mitmproxy (install its CA) or set SSLKEYLOGFILE and decrypt in Wireshark.
+# HTTPS note: bodies are TLS-encrypted on the wire. To read plaintext, run the traffic through
+# mitmproxy (install its CA) or set SSLKEYLOGFILE and decrypt in Wireshark.
 ```
+
+> **Scope of this recipe (important — so a capture confirms the doc rather than contradicting it):**
+> the **heartbeat** (endpoint 1) is uncompressed, so the four plaintext fields are directly visible
+> after TLS-decrypt. The **key-map** traffic (endpoints 2–5, seen *only* during a protected-model
+> **export or load**) is **gzip-compressed** — after TLS-decrypt it appears as a binary gzip blob;
+> pipe it through `gunzip` to read its fields (`api_key` / `model_id`(s) / the AES-encrypted map /
+> `_t` / `_s`). Either way you will find **no** prompts, images, or outputs — and the text-to-image
+> generation path emits no network traffic at all.
 
 ### Linux — what files does it write?
 ```bash
