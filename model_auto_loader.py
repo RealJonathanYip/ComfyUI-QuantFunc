@@ -242,39 +242,38 @@ def get_precision_config_options():
 # ============================================================================
 
 def _ensure_modelscope():
-    """Install modelscope if not available."""
+    """Return True if modelscope is importable; do NOT install it at runtime.
+
+    Runtime `pip install` from a custom node is prohibited by the ComfyUI registry
+    security policy (it bypasses the user's package manager). modelscope is declared
+    in requirements.txt and installed at install time by ComfyUI-Manager / pip; if it
+    is missing we fail gracefully with an actionable message instead of installing.
+    """
     try:
         import modelscope  # noqa: F401
         return True
     except ImportError:
-        print("[QuantFunc] Installing modelscope...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "modelscope", "-q"],
-                stdout=subprocess.DEVNULL)
-            print("[QuantFunc] modelscope installed successfully")
-            return True
-        except Exception as e:
-            print("[QuantFunc] Failed to install modelscope: {}".format(e))
-            return False
+        print("[QuantFunc] modelscope is not installed; ModelScope features are "
+              "unavailable. Install it with `pip install modelscope` (declared in "
+              "requirements.txt) and restart ComfyUI.")
+        return False
 
 
 def _ensure_huggingface_hub():
-    """Install huggingface_hub if not available."""
+    """Return True if huggingface_hub is importable; do NOT install it at runtime.
+
+    Same ComfyUI-registry-compliance reasoning as _ensure_modelscope: no runtime
+    `pip install`. huggingface_hub is declared in requirements.txt; if missing we
+    fail gracefully instead of installing.
+    """
     try:
         import huggingface_hub  # noqa: F401
         return True
     except ImportError:
-        print("[QuantFunc] Installing huggingface_hub...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "huggingface_hub", "-q"],
-                stdout=subprocess.DEVNULL)
-            print("[QuantFunc] huggingface_hub installed successfully")
-            return True
-        except Exception as e:
-            print("[QuantFunc] Failed to install huggingface_hub: {}".format(e))
-            return False
+        print("[QuantFunc] huggingface_hub is not installed; HuggingFace features "
+              "are unavailable. Install it with `pip install huggingface_hub` "
+              "(declared in requirements.txt) and restart ComfyUI.")
+        return False
 
 
 def _list_ms_dir(repo_id, subdir):

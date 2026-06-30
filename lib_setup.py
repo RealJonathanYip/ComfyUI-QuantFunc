@@ -309,22 +309,21 @@ _MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve
 
 
 def _ensure_modelscope():
-    """Install modelscope SDK if not available."""
+    """Return True if the modelscope SDK is importable; do NOT install it at runtime.
+
+    Runtime `pip install` from a custom node is prohibited by the ComfyUI registry
+    security policy (it bypasses the user's package manager). modelscope is declared
+    in requirements.txt and installed at install time by ComfyUI-Manager / pip; if it
+    is missing we fail gracefully with an actionable message instead of installing.
+    """
     try:
         import modelscope  # noqa: F401
         return True
     except ImportError:
-        print("[QuantFunc] Installing modelscope SDK...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "modelscope", "-q"],
-                stdout=subprocess.DEVNULL,
-            )
-            print("[QuantFunc] modelscope installed successfully")
-            return True
-        except Exception as e:
-            print(f"[QuantFunc] Failed to install modelscope: {e}")
-            return False
+        print("[QuantFunc] modelscope is not installed; ModelScope features are "
+              "unavailable. Install it with `pip install modelscope` (declared in "
+              "requirements.txt) and restart ComfyUI.")
+        return False
 
 
 def _download_from_modelscope(file_path: str):
