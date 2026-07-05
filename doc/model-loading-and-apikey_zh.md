@@ -27,6 +27,17 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 ![加载 → Build Pipeline → Generate 的整体连线](assets/model-loading-overview.png)
 <!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截“文生图”那一组，展示 加载节点 → QuantFunc Build Pipeline → QuantFunc Generate → Preview Image 的完整连线 -->
 
+### 在 ComfyUI 里怎么添加这些节点？
+
+如果你是从零搭工作流（而不是导入现成的 `.json`），有两种加节点方式：
+
+- **右键画布 → Add Node → 选分类**：QuantFunc 的节点在两个分类下——
+  - **`QuantFunc`**：加载 / 生成 / 导出等主力节点（如 Model Loader、Model Auto Loader、Generate、Export）；
+  - **`QuantFunc/v2`**：Build Pipeline 与 Pick 系列（Pick Diffusion Model / Pick CLIP / Pick VAE / Pick Checkpoint / Build Pipeline / Precision Config Loader）。
+- **双击画布**：弹出搜索框，直接输入节点显示名（如 `QuantFunc Build Pipeline`）搜索添加。
+
+> 最快的上手方式仍是直接导入 `workflow_sample/` 里的示例 `.json`（连线都接好了），再按需改参数。
+
 ---
 
 ## 二、三大类加载方式（按你的场景选一种）
@@ -54,7 +65,11 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 - `50x-above`：Blackwell（SM120+，如 RTX 50 系）——文本编码器用 FP4 基础模型；
 - `50x-below`：其他所有卡（SM<120，含 RTX 20 / 30 / 40）——文本编码器用 INT4 基础模型。
 
-> 你不需要手动选 50x-above / 50x-below，节点会替你选对；`transformer` 下拉里列出的变体也会按你的 GPU 过滤。首次使用会下载（取决于网速），之后走本地缓存。
+> **只有“基础模型”按你的 GPU 自动选 50x-above / 50x-below**，你不用手动选。
+>
+> ⚠️ **但 `transformer`（以及后面 precision_config）下拉不按 GPU 过滤**——它列出所有系列的全部变体，选择时只校验“系列匹配”，**不校验 GPU / SM tier**。所以手动指定 `transformer` 变体时，**务必选与你 GPU 同一 tier 的那个**：在 **SM120 以下**的 GPU 上选了 **FP4 / `50x-above` 档**的 transformer 或精度表，会在推理时触发 `__trap()` **崩溃**（FP4 需要 Blackwell SM120+）。拿不准就把 `transformer` 留 `None`，用基础模型自带的默认 Transformer——那个 tier 一定和你的基础模型一致。
+>
+> 首次使用会下载（取决于网速），之后走本地缓存。
 
 ![Model Auto Loader 参数](assets/model-loading-autoloader.png)
 <!-- TODO-SCREENSHOT: QuantFunc-ControlNet.json 或 All-In-One 里的 QuantFunc Model Auto Loader 节点，展示 model_series / data_source / transformer 三个参数 -->
@@ -69,8 +84,10 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 | `transformer_path` | Transformer 权重路径（`.safetensors` 文件或目录）。留空则用 `model_dir/transformer/` 下的第一个 `.safetensors` |
 | `prequant_weights`（可选） | 预量化调制权重 `.safetensors` 路径（仅 Lighting 后端；低显存 GPU 推荐） |
 
-> **什么是 diffusers 格式？** 目录里有 `model_index.json`，并带 `transformer/`、`vae/`、`text_encoder/` 等子目录。
-> `model_dir` 内的组件文件（transformer / text_encoder / vae）由节点在标准 HF 目录布局里自动定位。
+> **什么是 diffusers 格式？** 目录里有 `model_index.json`；其中的组件文件（transformer / text_encoder / vae）由节点在标准 HF 目录布局里自动定位。
+
+![Model Loader 参数](assets/model-loading-modelloader.png)
+<!-- TODO-SCREENSHOT: All-In-One 或 QuantFunc-Ideogram4.json 里的 QuantFunc Model Loader 节点，清晰展示 model_dir / transformer_path / prequant_weights 三个参数标签与输入框 -->
 
 ### C. 组件挑选 / 全家桶 —— Pick 系列（ComfyUI 原生风格）
 
@@ -99,9 +116,10 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 | **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速，无需预量化模型。**必须配 precision_config**（见下节） |
 | **Lighting 预量化模型** | 元数据 `method` 为 `lighting` / `lighting_precomputed` / `flux2klein_runtime`，或权重键含 `._qweight` | **Lighting** | QuantFunc Lighting 导出的预量化权重，加载即用，跳过运行时量化 |
 | **SVDQ 预量化模型** | 元数据 `method=svdquant` / `model_class` 含 `Nunchaku`，或权重键含裸 `.qweight` + LoRA 旁挂 | **SVDQ** | Nunchaku SVDQ 预量化权重 |
-| **全家桶单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存） | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片，无需 CheckpointLoader |
+| **全家桶（已量化）单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存），且带 QuantFunc stamp 的量化元数据 | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片，无需 CheckpointLoader。**自带逐层精度，无需配 precision_config** |
+| **全家桶（原精度）单文件 checkpoint** | 同上的键前缀，但权重是 FP16/BF16、无量化元数据 | 自动识别为 bundled checkpoint | 同样自动切片；但**精度处理跟原精度 diffusers 一样**——`[auto-derive]` 会像对待原精度基础模型那样**自动注入精度表**（见下节） |
 
-> 检测无法确定时安全回退到 **Lighting**（若文件缺失，引擎会给出清晰报错）。
+> 当头部无法读取、或格式无法判定时，安全回退到 **Lighting** 后端。若指向的权重文件根本不存在（路径写错、文件没下全），加载会在引擎侧失败并报出**明确的文件路径错误**，而不是静默出错。
 
 ---
 
@@ -111,14 +129,16 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 | 选项 | 含义 |
 |------|------|
-| **`[auto-derive]`（默认）** | 对**没有量化元数据的原精度 diffusers 基础模型 / 全家桶**，自动识别模型并按你选的 GPU 加载匹配的精度表（Blackwell SM120+ 用 FP4，其他用 INT4）；SVDQ / 已量化模型保留自身元数据里的逐层配置 |
+| **`[auto-derive]`（默认）** | 对**没有量化元数据的原精度 diffusers 基础模型 / 原精度全家桶 checkpoint**，自动识别模型并按你选的 GPU 加载匹配的精度表（Blackwell SM120+ 用 FP4，其他用 INT4）；SVDQ / 已量化模型（含已 stamp 的全家桶）保留自身元数据里的逐层配置，不注入 |
 | **`[none]`** | 从不注入精度表 |
 | **`[builtin] xxx.json`** | 使用插件内置（`<plugin>/configs` 或 `$QUANTFUNC_CONFIGS_DIR`）的固定精度表 |
 | **`[series] yyy.json`** | 使用 QuantFunc 模型系列预设（按需从 ModelScope 下载） |
 
 也可以把这个下拉**转成输入接口**，从 **QuantFunc Precision Config Loader (path)** 或 **QuantFunc Precision Config Auto Loader** 用绝对路径喂进来。
 
-> **重点：加载“原精度 diffusers 基础模型”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份；如果你选了 `[none]` 又没有量化元数据，模型会停留在原精度（很慢、很占显存）。**预量化 / SVDQ / 全家桶模型自带精度信息，不需要额外配。**
+> **重点：加载“原精度 diffusers 基础模型”或“原精度全家桶 checkpoint”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份并注入；如果你改成了 `[none]` 又没有量化元数据，模型会停留在原精度（很慢、很占显存）。
+>
+> **只有“已量化 / 已 stamp”的模型（Lighting 预量化、SVDQ、已量化的全家桶）自带逐层精度信息，无需额外配置。** 原精度全家桶不在此列——它和原精度基础模型一样要靠 `[auto-derive]` 注入。
 >
 > precision_config **与模型架构绑定**，不同系列不能混用。
 
@@ -139,6 +159,11 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 | **QuantFunc Transformer Auto Loader** | `transformer_path` | 从 `models/QuantFunc/transformer/` 挑 `.safetensors` |
 | **QuantFunc Prequant Auto Loader** | `prequant_weights` | 自动下载预量化调制权重 |
 | **QuantFunc Precision Config Auto Loader** | `precision_config` | 自动下载逐层精度表，接到 Build Pipeline 的 `precision_config` |
+
+> **三个“Base Model”加载器怎么选？**
+> - **Base Series Model Auto Loader** —— 你想用 **QuantFunc 官方系列**的基础模型：按系列一键下载，且自动挑对 GPU 变体。**最常用**。
+> - **Base Model Auto Loader** —— 你已经把模型放在了 `ComfyUI/models/diffusers/` 下：**不下载**，只从本地下拉里挑一个。
+> - **Base Model Auto Loader with Download** —— 你想用**上游（非 QuantFunc 系列）**的任意基础模型：从上游仓库发现并下载到 `models/diffusers/`。
 
 > 这些是可选的“便利件”。最简单的路子仍是 **Model Auto Loader → Build Pipeline**，不需要它们。
 
@@ -204,4 +229,4 @@ A：下拉是联网懒加载的。检查网络与 `data_source`（国内选 `mod
 A：**免费测试期间不需要**——插件已内置共享测试 key。正式发布后到 https://www.quantfunc.com 注册，把 key 填到 Build Pipeline 的 `api_key` 或 `config.json`。
 
 **Q：50x-below 和 50x-above 怎么选？**
-A：不用手动选，Auto Loader 会按你的 GPU 自动判定（RTX 50 系 = 50x-above，其余 = 50x-below）。若你手动混用基础模型与 Transformer 权重，务必用**同一个变体**。
+A：**基础模型**不用手动选——Auto Loader 会按你的 GPU 自动判定（RTX 50 系 = 50x-above，其余 = 50x-below）。但 **`transformer` / 精度表下拉不按 GPU 过滤**，若你手动指定它们，务必和基础模型用**同一个 tier**；尤其别在 SM120 以下的卡上选 FP4 / `50x-above` 档（会 `__trap()` 崩溃）。拿不准就把 `transformer` 留 `None`。
