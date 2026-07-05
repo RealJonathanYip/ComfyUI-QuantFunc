@@ -40,7 +40,7 @@
 | `ipndm` / `ipndm_v` | Adams 隐式多步 |
 | `res_multistep` | RES 2 阶多步 |
 | `gradient_estimation` | Euler + 梯度动量 |
-| `ddim` | DDIM。`eta=0` 确定性；**`eta>0` 时变随机**（注入 ancestral 噪声，受 `sampler_eta` / `sampler_s_noise` 影响） |
+| `ddim` | DDIM。`eta=0` 确定性；**`eta>0` 时变随机**（注入 ancestral 噪声，只受 `sampler_eta` 影响；引擎 `DDIMSampler` 不吃 `sampler_s_noise`） |
 
 ### 1.2 随机 / 祖先采样器（用 `sampler_eta` + `sampler_s_noise`）
 
@@ -72,7 +72,7 @@
 | 参数 | 默认 | 取值 | 只对哪些采样器生效 | 含义 |
 |------|------|------|-------------------|------|
 | `sampler_eta` | `0.0` | `0`–`1.0`，步 0.05 | 随机 / 祖先 + SA-Solver（§1.2/§1.3）+ **`ddim`（eta>0 时）** | 随机性（eta）噪声尺度。`0` = 确定性 |
-| `sampler_s_noise` | `1.0` | `0`–`2.0`，步 0.05 | 同上（SDE / 祖先 + `ddim` eta>0） | SDE 噪声倍数。`1.0` = ComfyUI 默认；`0` = 不注入噪声；`>1` = 更多 |
+| `sampler_s_noise` | `1.0` | `0`–`2.0`，步 0.05 | 随机 / 祖先（SDE）采样器（§1.2/§1.3）。**注意：`ddim` 不吃 s_noise，只吃 eta** | SDE 噪声倍数。`1.0` = ComfyUI 默认；`0` = 不注入噪声；`>1` = 更多 |
 | `sampler_solver_order` | `4` | 1–4 | **仅 `lms`** | 线性多步 Adams-Bashforth 阶数。阶越低越稳、越高越准 |
 | `sampler_predictor_order` | `3` | 1–4 | **仅 `sa_solver` / `sa_solver_pece`** | SA-Solver 预测器 Adams 阶。越高越准但需更多历史 |
 | `sampler_corrector_order` | `4` | 1–4 | **仅 `sa_solver` / `sa_solver_pece`** | SA-Solver 校正器 Adams 阶。越高校正越准 |
