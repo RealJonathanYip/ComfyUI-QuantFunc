@@ -20,12 +20,12 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 下图是示例工作流里 **`Sample for text to image`** 分组的完整连线，把上面这条链画成了实物——左边三个 `Pick` 加载节点各输出 `MODEL` / `CLIP` / `VAE`，汇入中间的 **Build Pipeline**，再经 **LoRA Auto Loader** 到 **Generate**，最后进 **预览图像**：
 
-![加载 → Build Pipeline → Generate 的整体连线](assets/t2i-overview.png)
+![加载 → Build Pipeline → Generate 的整体连线](../assets/t2i-overview.png)
 
 三个关键角色：
 
 - **加载节点**只负责“**指向权重文件**”，输出 ComfyUI 原生的 `MODEL` / `CLIP` / `VAE` 三个接口（和官方 UNETLoader / CLIPLoader / VAELoader 同类型），本身**不做真正的 torch 加载**（“零加载”，只记录路径）。
-- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（高级旋钮）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。**权重的真正加载/量化发生在这里**（而不是加载节点里）。
+- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（接 **QuantFunc Pipeline Config** 节点覆盖 vae/text 精度、attention 后端、tiled VAE 等高级旋钮；细节见 [工作流参考](workflow-reference_zh.md)）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。**权重的真正加载/量化发生在这里**（而不是加载节点里）。
 - 之后 **Generate** 拿这个 pipeline 出图。
 
 > 综合示例工作流（同时演示三种加载方式）：
@@ -52,9 +52,7 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 | **B. 我已有本地模型目录** | **QuantFunc Model Loader** | 指向本地 diffusers 目录（或预量化模型），可选单独指定 transformer / 预量化调制权重。 |
 | **C. 我已有拆分好的组件文件 / 单文件全家桶** | **Pick Diffusion Model / Pick CLIP / Pick VAE**（分组件）或 **Pick Checkpoint**（全家桶单文件） | ComfyUI 原生风格的“按文件名挑选”，从 `models/` 下各目录扫描。 |
 
-三种方式的输出都是 `MODEL`/`CLIP`/`VAE`，都接到同一个 **Build Pipeline**，可以按需混用。下图把示例工作流里“加载模型”区域的三种方式框在一起（A 在最上、B 在中、C 是右侧那一列 Pick 节点）：
-
-![三种加载方式的分组](assets/load-methods.png)
+三种方式的输出都是 `MODEL`/`CLIP`/`VAE`，都接到同一个 **Build Pipeline**，可以按需混用。下面 A / B / C 三小节各配一张对应加载节点的特写图。
 
 ---
 
@@ -62,13 +60,13 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 最省事的方式，适合新手或没有本地模型的用户。它只有 3 个参数：
 
-![Model Auto Loader 参数](assets/node-model-auto-loader.png)
+![Model Auto Loader 参数](../assets/node-model-auto-loader.png)
 
 | 参数 | 取值 | 默认 | 说明 |
 |------|------|------|------|
 | `model_series` | `QuantFunc/Qwen-Image-Edit-Series`、`QuantFunc/Qwen-Image-Series`、`QuantFunc/Z-Image-Series`、`QuantFunc/Klein-4B-Series`、`QuantFunc/Klein-9B-Series` | 第一项 | 模型系列。选定后自动去对应仓库拉取该系列的基础模型 + 组件。 |
 | `data_source` | `modelscope` / `huggingface` | `modelscope` | 下载源。**国内选 `modelscope`**；海外可选 `huggingface`。 |
-| `transformer`（可选） | `[auto-detect]` / `None` / 具体权重（`Series/name`） | **`[auto-detect]`** | Transformer 权重变体。详见下方“关于 transformer 的自动判定”。 |
+| `transformer`（可选） | `None` / 具体权重（`Series/name`） | **`None`** | Transformer 权重变体。`None`（默认）= 用基础模型自带的默认 Transformer。详见下方“关于 transformer 下拉的过滤”。 |
 
 **基础模型的 GPU 变体是自动判定的**（你不用管）：节点内部根据你的 GPU 计算能力（SM）自动选——
 
@@ -77,19 +75,18 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 > 首次使用会下载（取决于网速），之后走本地缓存。
 
-#### 关于 `transformer` 的自动判定（重点，且和很多人以为的相反）
+#### 关于 `transformer` 下拉的过滤（按“模型系列”，不是按 GPU）
 
-`transformer` 默认是 **`[auto-detect]`**，它的行为是**安全**的，一般情况下你**不需要手动改**：
+`transformer` 默认是 **`None`** —— 即**用基础模型自带的默认 Transformer**（最省心，也最安全）。取值：
 
-- **`[auto-detect]`（默认）**：自动选“你的 GPU 能跑的**最高档**权重”。而且——它在 Build Pipeline **选定运行 GPU**（`device`）时会**按那张卡重新解析一次**：即使你把管线路由到一张**较弱的非默认 GPU**，它也会挑那张卡能跑的档，**不会崩**。
-- **`None`**：不挑独立 transformer，用**基础模型自带的默认 Transformer**（tier 一定和基础模型一致，也安全）。
-- **显式某个权重**：手动指定某个 `Series/name.safetensors`。
+- **`None`（默认）**：不额外挑 transformer，用基础模型自带的那个。它的档位和你的基础模型一致，一定能跑。
+- **显式某个权重**（`Series/name.safetensors`）：手动指定某个下载好的 transformer 变体。
 
-**关键事实：`transformer` 这个下拉本身已经按 GPU 过滤过了。** 代码里 `get_transformer_options()` 会把“最低 SM 要求高于你默认 GPU（CUDA device 0）”的权重**直接从列表里隐藏**——例如在一张 SM89（RTX 40 系）的卡上，**FP4 / `50x-above` 档的 transformer 根本不会出现在下拉里**，所以你**从下拉里选不到**会 `__trap()` 崩溃的权重。（SM 探测不到时保守处理：不过滤，全列出来。）
+**这个下拉会按“模型系列”过滤，但不按 GPU 过滤。** 具体机制在客户端 `web/quantfunc.js` 的 `TransformerFilter`：当你选定 `model_series` 后，下拉里只保留 `None` + **文件名前缀匹配该系列**的 transformer（例如选了 `Klein-9B-Series` 就只看到 `Klein-9B-Series/…` 的权重，看不到 Qwen 系的）——目的是**防止跨系列串选**（选了 Klein 却挑了 Qwen 的 transformer）。服务端列选项的 `get_transformer_options()`（`_build_dropdown()`）**不做任何 GPU / SM 过滤**，只是“系列内所有已知权重”。
 
-> ⚠️ **唯一残留的崩溃风险**：从**别人在更高档 GPU 上保存的工作流**导入时，里面写死的某个高档 transformer（例如别人 RTX 50 系存的 FP4 权重）会被**原样保留**——显式值不会被重新解析。这时在你**较弱的卡**上执行可能 `__trap()`。**拿不准就把 `transformer` 改回 `[auto-detect]`**，让它按你的卡重挑。
+> ⚠️ **GPU 档位要靠你自己对齐**：既然下拉**不按 GPU 过滤**，如果你**手动**挑了一个高于你显卡档位的 transformer（例如在 SM120 以下的卡上选了 FP4 / `50x-above` 档），引擎会在推理时 `__trap()` 崩溃（FP4 需要 Blackwell SM120+）。**拿不准就留 `None`**，用基础模型自带的默认 transformer。
 >
-> 注意：`transformer` 会按 GPU 过滤，但下一节的 **`precision_config` 下拉不会**——这两者行为不同，别混为一谈。
+> 补充：如果你在下拉里**看不到**某个权重，通常是①它不属于你当前选的 `model_series`（被系列过滤挡了），或②catalog / 本地目录里根本没有它——**不是**“被 GPU 过滤隐藏了”（下拉没有 GPU 过滤）。
 
 ---
 
@@ -97,7 +94,7 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 适合你已经把 diffusers 格式模型下载到本地的情况。三个都是**字符串路径**输入：
 
-![Model Loader 参数](assets/node-model-loader.png)
+![Model Loader 参数](../assets/node-model-loader.png)
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
@@ -122,7 +119,7 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 下图是全家桶单文件加载节点（一个文件同时给出 model/clip/vae）：
 
-![Pick Checkpoint（全家桶单文件）](assets/node-pick-checkpoint.png)
+![Pick Checkpoint（全家桶单文件）](../assets/node-pick-checkpoint.png)
 
 > 你也可以直接用 **ComfyUI 官方**的 UNETLoader / CLIPLoader / VAELoader / CheckpointLoaderSimple 喂给 Build Pipeline——它接收的就是标准 `MODEL`/`CLIP`/`VAE` 接口。Pick 系列的区别是“零加载”，更快、显存占用更小，且只服务 QuantFunc 分支。
 
@@ -148,7 +145,7 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 `precision_config` 是 **Build Pipeline** 上的一个下拉输入，定义 Transformer **每一层**的量化精度，是画质/速度/显存平衡的核心。下图是 Build Pipeline 节点，`precision_config` 和 `device` / `api_key` 都在上面：
 
-![Build Pipeline 上的 precision_config / device / api_key](assets/node-build-pipeline.png)
+![Build Pipeline 上的 precision_config / device / api_key](../assets/node-build-pipeline.png)
 
 它的取值有四类：
 
@@ -163,7 +160,7 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 > **重点 1：加载“原精度 diffusers 基础模型”或“原精度全家桶 checkpoint”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份并注入；如果你改成了 `[none]` 又没有量化元数据，模型会停留在原精度（**很慢、很占显存**）。
 >
-> **重点 2（和 transformer 不同！）：`precision_config` 这个下拉不按 GPU 过滤**——它把**所有档都列出来**，包括 FP4 / `50x-above`（在这张 SM89 的机器上也照样列出）。所以你**手动**选 precision_config 时，**务必选与你 GPU 同档**：在 **SM120 以下**的卡上手动选了 **FP4 / `50x-above` 档**的精度表，会在推理时触发 `__trap()` **崩溃**（FP4 需要 Blackwell SM120+）。**默认 `[auto-derive]` 不会有这个问题**（它按你的卡自动挑档）。
+> **重点 2：`precision_config` 这个下拉也不按 GPU 过滤**（和 `transformer` 一样，服务端 `_build_dropdown` 不做 SM 检查；区别只是 `transformer` 会按模型系列过滤，`precision_config` 连系列都不过滤，把**所有系列、所有档**都列出来，包括 FP4 / `50x-above`）。所以你**手动**选 precision_config 时，**务必选与你 GPU 同档**：在 **SM120 以下**的卡上手动选了 **FP4 / `50x-above` 档**的精度表，会在推理时触发 `__trap()` **崩溃**（FP4 需要 Blackwell SM120+）。**默认 `[auto-derive]` 不会有这个问题**——它按你**在 Build Pipeline 选定的运行 GPU** 自动挑档（SM120+ 用 FP4，否则用 INT4）。
 >
 > **重点 3：** precision_config **与模型架构绑定**，不同系列不能混用。
 
@@ -184,7 +181,7 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 **Precision Config Auto Loader** 有两个参数（`precision_config` 选系列内的哪份表、`data_source` 选下载源）：
 
-![Precision Config Auto Loader 参数](assets/node-precision-config-auto.png)
+![Precision Config Auto Loader 参数](../assets/node-precision-config-auto.png)
 
 > **三个“Base Model”加载器怎么选？**
 > - **Base Series Model Auto Loader** —— 你想用 **QuantFunc 官方系列**的基础模型：按系列一键下载，且自动挑对 GPU 变体。**最常用**。
@@ -251,8 +248,8 @@ A：下拉是联网懒加载的。检查网络与 `data_source`（国内选 `mod
 **Q：需要自己填 API Key 吗？**
 A：**免费测试期间不需要**——插件已内置共享测试 key。正式发布后到 https://www.quantfunc.com 注册，把 key 填到 Build Pipeline 的 `api_key` 或 `config.json`。
 
-**Q：`transformer` 和 `precision_config` 到底哪个按 GPU 过滤、哪个不过滤？**
-A：**`transformer` 下拉会按 GPU 过滤**（跑不了的档直接隐藏），且默认 `[auto-detect]` 会按你选定的运行 GPU 重挑——所以你从下拉里**选不到**会崩的 transformer；唯一例外是导入别人在更高档 GPU 上存的、写死了高档 transformer 的工作流（改回 `[auto-detect]` 即可）。**`precision_config` 下拉不过滤**（所有档都列出来），手动选时务必和你的 GPU 同档，否则在 SM120 以下选 FP4 会崩；默认 `[auto-derive]` 则自动挑对档、不会崩。
+**Q：`transformer` 和 `precision_config` 下拉是怎么过滤的？会不会替我挡掉跑不了的档？**
+A：**两个下拉都不按 GPU 过滤，都不会替你挡掉“比你显卡档位高”的选项。** `transformer` 下拉只按**模型系列**过滤（客户端 `web/quantfunc.js`：选定 `model_series` 后只显示 `None` + 该系列的 transformer，防跨系列串选）；`precision_config` 下拉**连系列都不过滤**（列出所有系列、所有档）。所以**手动**选了高于显卡档位的权重 / 精度表（如在 SM120 以下选 FP4 / `50x-above`）会在推理时 `__trap()` 崩溃。省心做法：`transformer` 留 `None`、`precision_config` 留 `[auto-derive]`——`[auto-derive]` 会按你在 Build Pipeline 选定的运行 GPU 自动挑对档，不会崩。（注意：**基础模型**的 50x-above/50x-below 变体是 Auto Loader 按 GPU 自动挑的，那个不用你管；要你自己对齐档位的只有**手动**选的 transformer / precision_config。）
 
 **Q：50x-below 和 50x-above 是什么？**
 A：这是**基础模型 / 权重的 GPU 档位**：`50x-above` = FP4，需 Blackwell（RTX 50 系，SM120+）；`50x-below` = INT4，其余所有卡（RTX 20/30/40）。基础模型由 Auto Loader 按你的 GPU 自动挑，不用你管。

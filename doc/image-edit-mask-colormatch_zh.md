@@ -21,7 +21,7 @@ Load Image → QuantFunc Image List ──────┘
 
 > **完整 workflow 例子：** [`QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里标题为 **`Sample for edit Image`** 的分组（示例用 `QuantFunc/Qwen-Image-Edit-Series` 模型 + Load Image → Image List → Generate）。
 
-![图像编辑整体连线](assets/edit-overview.png)
+![图像编辑整体连线](../assets/edit-overview.png)
 <!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截 `Sample for edit Image` 分组：加载(Qwen-Image-Edit-Series)→Build Pipeline→Generate；Load Image→Image List→Generate.ref_images 的完整连线 -->
 
 ---
@@ -64,7 +64,7 @@ Load Image → QuantFunc Image List ──────┘
 
 > **代价**：`origin` 编码的是全分辨率图，显存和耗时高于 `720`。大图 + `origin` 可能 OOM —— 显存紧张时先用 `720` 出草稿、确认构图后再切 `origin` 出终稿；或配合管线的 `vram_budget` / VAE tiling。
 
-![尺寸模式对比：720 vs origin](assets/edit-resize-origin.png)
+![尺寸模式对比：720 vs origin](../assets/edit-resize-origin.png)
 <!-- TODO-SCREENSHOT: QuantFunc Image List 节点，突出 main_image_resize 下拉展开（720/1024/origin），可并排放一张 720 输出与一张 origin 输出对比说明尺寸差异 -->
 
 ---
@@ -102,7 +102,7 @@ QuantFunc Mask Config          →  mask_config      ┘（可选，不连走默
 
 **相互作用**：`mask_grow` + `mask_blur` 一起用来消接缝（先膨胀再羽化）；`mask_no_snap` 与它们正交 —— 开了 no_snap 追求柔和过渡，就会牺牲保留区的严格一致性。`mask_strength=0` 会让整个 inpaint 失效（引擎侧 `inpaint_strength>0` 才走遮罩路径）。
 
-![Mask Config 四参数](assets/edit-mask-config.png)
+![Mask Config 四参数](../assets/edit-mask-config.png)
 <!-- TODO-SCREENSHOT: QuantFunc Mask Config 节点，展示 mask_strength / mask_grow / mask_blur / mask_no_snap 四个参数标签与默认值 -->
 
 ### 三.2 完整局部重绘步骤
