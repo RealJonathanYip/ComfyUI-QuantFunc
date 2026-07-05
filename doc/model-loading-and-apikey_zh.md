@@ -5,27 +5,31 @@
 1. **不同场景下有哪些加载模型的方式，它们各自适合谁、怎么连线**；
 2. **API Key 是什么、有什么用、去哪里拿、在哪里填**。
 
-> 本文对照插件当前代码（`nodes.py` / `nodes_format_adapters.py` / `model_auto_loader.py`）编写，节点名与参数以你 ComfyUI 里实际看到的为准。
+> 本文对照插件当前代码（`nodes.py` / `nodes_format_adapters.py` / `model_auto_loader.py`）逐节点、逐参数核对，节点名与参数以你 ComfyUI 里实际看到的、以及 `/object_info` 暴露的定义为准。
 
 ---
 
-## 一、加载模型的整体思路
+## 一、加载模型的整体思路（先看这张图）
 
-QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
+QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 ```
 [加载节点：拿到 model / clip / vae]  →  QuantFunc Build Pipeline  →  QuantFunc Generate  →  Preview Image
+        (只“指向权重”，零加载)            (真正组装成可运行管线)         (出图)
 ```
 
-- **加载节点**只负责“**指向权重文件**”，输出 ComfyUI 原生的 `MODEL` / `CLIP` / `VAE` 三个接口（和官方 UNETLoader / CLIPLoader / VAELoader 同类型），本身**不做真正的 torch 加载**（零加载，只记录路径）。
-- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（高级旋钮）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。
+下图是示例工作流里 **`Sample for text to image`** 分组的完整连线，把上面这条链画成了实物——左边三个 `Pick` 加载节点各输出 `MODEL` / `CLIP` / `VAE`，汇入中间的 **Build Pipeline**，再经 **LoRA Auto Loader** 到 **Generate**，最后进 **预览图像**：
+
+![加载 → Build Pipeline → Generate 的整体连线](assets/t2i-overview.png)
+
+三个关键角色：
+
+- **加载节点**只负责“**指向权重文件**”，输出 ComfyUI 原生的 `MODEL` / `CLIP` / `VAE` 三个接口（和官方 UNETLoader / CLIPLoader / VAELoader 同类型），本身**不做真正的 torch 加载**（“零加载”，只记录路径）。
+- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（高级旋钮）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。**权重的真正加载/量化发生在这里**（而不是加载节点里）。
 - 之后 **Generate** 拿这个 pipeline 出图。
 
 > 综合示例工作流（同时演示三种加载方式）：
 > [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json)
-
-![加载 → Build Pipeline → Generate 的整体连线](assets/model-loading-overview.png)
-<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截 `Sample for text to image` 分组，展示 加载节点 → QuantFunc Build Pipeline → QuantFunc Generate → Preview Image 的完整连线 -->
 
 ### 在 ComfyUI 里怎么添加这些节点？
 
@@ -42,52 +46,68 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 
 ## 二、三大类加载方式（按你的场景选一种）
 
-| 场景 | 用哪些节点 | 说明 |
-|------|-----------|------|
-| **A. 我没有本地模型 / 想一键下载** | **QuantFunc Model Auto Loader** | 从下拉菜单选模型系列，自动判定 GPU 变体并从 ModelScope / HuggingFace 下载，无需填任何路径。 |
+| 场景 | 用哪些节点 | 一句话 |
+|------|-----------|--------|
+| **A. 我没有本地模型 / 想一键下载** | **QuantFunc Model Auto Loader** | 下拉选模型系列，自动判定 GPU 变体并从 ModelScope / HuggingFace 下载，**无需填任何路径**。 |
 | **B. 我已有本地模型目录** | **QuantFunc Model Loader** | 指向本地 diffusers 目录（或预量化模型），可选单独指定 transformer / 预量化调制权重。 |
-| **C. 我已有拆分好的组件文件 / 单文件全家桶** | **QuantFunc Pick Diffusion Model / Pick CLIP / Pick VAE**（分组件）或 **QuantFunc Pick Checkpoint**（全家桶单文件） | ComfyUI 原生风格的“按文件名挑选”，从 `models/` 下各目录扫描。 |
+| **C. 我已有拆分好的组件文件 / 单文件全家桶** | **Pick Diffusion Model / Pick CLIP / Pick VAE**（分组件）或 **Pick Checkpoint**（全家桶单文件） | ComfyUI 原生风格的“按文件名挑选”，从 `models/` 下各目录扫描。 |
 
-三种方式的输出都是 `MODEL`/`CLIP`/`VAE`，都接到同一个 **Build Pipeline**，可以按需混用。
+三种方式的输出都是 `MODEL`/`CLIP`/`VAE`，都接到同一个 **Build Pipeline**，可以按需混用。下图把示例工作流里“加载模型”区域的三种方式框在一起（A 在最上、B 在中、C 是右侧那一列 Pick 节点）：
+
+![三种加载方式的分组](assets/load-methods.png)
+
+---
 
 ### A. 一键自动下载 —— QuantFunc Model Auto Loader
 
-最省事的方式，适合新手或没有本地模型的用户。
+最省事的方式，适合新手或没有本地模型的用户。它只有 3 个参数：
 
-| 参数 | 说明 |
-|------|------|
-| `model_series` | 模型系列，可选：`QuantFunc/Qwen-Image-Edit-Series`、`QuantFunc/Qwen-Image-Series`、`QuantFunc/Z-Image-Series`、`QuantFunc/Klein-4B-Series`、`QuantFunc/Klein-9B-Series` |
-| `data_source` | 下载源：`modelscope`（国内推荐）或 `huggingface` |
-| `transformer`（可选） | 具体的 Transformer 权重变体，格式 `Series/name`。选 `None` 则用基础模型自带的默认 Transformer |
+![Model Auto Loader 参数](assets/node-model-auto-loader.png)
 
-**GPU 变体是自动判定的**：节点内部根据你的 GPU 计算能力（SM）自动选择——
+| 参数 | 取值 | 默认 | 说明 |
+|------|------|------|------|
+| `model_series` | `QuantFunc/Qwen-Image-Edit-Series`、`QuantFunc/Qwen-Image-Series`、`QuantFunc/Z-Image-Series`、`QuantFunc/Klein-4B-Series`、`QuantFunc/Klein-9B-Series` | 第一项 | 模型系列。选定后自动去对应仓库拉取该系列的基础模型 + 组件。 |
+| `data_source` | `modelscope` / `huggingface` | `modelscope` | 下载源。**国内选 `modelscope`**；海外可选 `huggingface`。 |
+| `transformer`（可选） | `[auto-detect]` / `None` / 具体权重（`Series/name`） | **`[auto-detect]`** | Transformer 权重变体。详见下方“关于 transformer 的自动判定”。 |
 
-- `50x-above`：Blackwell（SM120+，如 RTX 50 系）——文本编码器用 FP4 基础模型；
-- `50x-below`：其他所有卡（SM<120，含 RTX 20 / 30 / 40）——文本编码器用 INT4 基础模型。
+**基础模型的 GPU 变体是自动判定的**（你不用管）：节点内部根据你的 GPU 计算能力（SM）自动选——
 
-> **只有“基础模型”按你的 GPU 自动选 50x-above / 50x-below**，你不用手动选。
->
-> ⚠️ **但 `transformer`（以及后面 precision_config）下拉不按 GPU 过滤**——它列出所有系列的全部变体，选择时只校验“系列匹配”，**不校验 GPU / SM tier**。所以手动指定 `transformer` 变体时，**务必选与你 GPU 同一 tier 的那个**：在 **SM120 以下**的 GPU 上选了 **FP4 / `50x-above` 档**的 transformer 或精度表，会在推理时触发 `__trap()` **崩溃**（FP4 需要 Blackwell SM120+）。拿不准就把 `transformer` 留 `None`，用基础模型自带的默认 Transformer——那个 tier 一定和你的基础模型一致。
->
+- **`50x-above`**：Blackwell（SM120+，如 RTX 50 系）——文本编码器用 **FP4** 基础模型；
+- **`50x-below`**：其他所有卡（SM<120，含 RTX 20 / 30 / 40）——文本编码器用 **INT4** 基础模型。
+
 > 首次使用会下载（取决于网速），之后走本地缓存。
 
-![Model Auto Loader 参数](assets/model-loading-autoloader.png)
-<!-- TODO-SCREENSHOT: QuantFunc-ControlNet.json 或 All-In-One 里的 QuantFunc Model Auto Loader 节点，展示 model_series / data_source / transformer 三个参数 -->
+#### 关于 `transformer` 的自动判定（重点，且和很多人以为的相反）
+
+`transformer` 默认是 **`[auto-detect]`**，它的行为是**安全**的，一般情况下你**不需要手动改**：
+
+- **`[auto-detect]`（默认）**：自动选“你的 GPU 能跑的**最高档**权重”。而且——它在 Build Pipeline **选定运行 GPU**（`device`）时会**按那张卡重新解析一次**：即使你把管线路由到一张**较弱的非默认 GPU**，它也会挑那张卡能跑的档，**不会崩**。
+- **`None`**：不挑独立 transformer，用**基础模型自带的默认 Transformer**（tier 一定和基础模型一致，也安全）。
+- **显式某个权重**：手动指定某个 `Series/name.safetensors`。
+
+**关键事实：`transformer` 这个下拉本身已经按 GPU 过滤过了。** 代码里 `get_transformer_options()` 会把“最低 SM 要求高于你默认 GPU（CUDA device 0）”的权重**直接从列表里隐藏**——例如在一张 SM89（RTX 40 系）的卡上，**FP4 / `50x-above` 档的 transformer 根本不会出现在下拉里**，所以你**从下拉里选不到**会 `__trap()` 崩溃的权重。（SM 探测不到时保守处理：不过滤，全列出来。）
+
+> ⚠️ **唯一残留的崩溃风险**：从**别人在更高档 GPU 上保存的工作流**导入时，里面写死的某个高档 transformer（例如别人 RTX 50 系存的 FP4 权重）会被**原样保留**——显式值不会被重新解析。这时在你**较弱的卡**上执行可能 `__trap()`。**拿不准就把 `transformer` 改回 `[auto-detect]`**，让它按你的卡重挑。
+>
+> 注意：`transformer` 会按 GPU 过滤，但下一节的 **`precision_config` 下拉不会**——这两者行为不同，别混为一谈。
+
+---
 
 ### B. 本地目录加载 —— QuantFunc Model Loader
 
-适合你已经把 diffusers 格式模型下载到本地的情况。
+适合你已经把 diffusers 格式模型下载到本地的情况。三个都是**字符串路径**输入：
 
-| 参数 | 说明 |
-|------|------|
-| `model_dir` | 基础模型目录（内含 `model_index.json`，以及 `transformer/`、`vae/`、`text_encoder/` 等子目录） |
-| `transformer_path` | Transformer 权重路径（`.safetensors` 文件或目录）。留空则用 `model_dir/transformer/` 下的第一个 `.safetensors` |
-| `prequant_weights`（可选） | 预量化调制权重 `.safetensors` 路径（仅 Lighting 后端；低显存 GPU 推荐） |
+![Model Loader 参数](assets/node-model-loader.png)
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `model_dir` | 空 | 基础模型目录（内含 `model_index.json`，以及 `transformer/`、`vae/`、`text_encoder/` 等子目录）。 |
+| `transformer_path` | 空 | Transformer 权重路径（`.safetensors` 文件或目录）。**留空**则用 `model_dir/transformer/` 下的第一个 `.safetensors`。 |
+| `prequant_weights`（可选） | 空 | 预量化**调制权重** `.safetensors` 路径。**仅 Lighting 后端**用；低显存 GPU 推荐。 |
 
 > **什么是 diffusers 格式？** 目录里有 `model_index.json`；其中的组件文件（transformer / text_encoder / vae）由节点在标准 HF 目录布局里自动定位。
 
-![Model Loader 参数](assets/model-loading-modelloader.png)
-<!-- TODO-SCREENSHOT: All-In-One 或 QuantFunc-Ideogram4.json 里的 QuantFunc Model Loader 节点，清晰展示 model_dir / transformer_path / prequant_weights 三个参数标签与输入框 -->
+---
 
 ### C. 组件挑选 / 全家桶 —— Pick 系列（ComfyUI 原生风格）
 
@@ -100,50 +120,52 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 | **QuantFunc Pick VAE (zero-load)** | `models/vae/` | `VAE` |
 | **QuantFunc Pick Checkpoint (zero-load, bundled)** | `models/checkpoints/` | 一次性输出 `MODEL`/`CLIP`/`VAE`（单文件全家桶，三路同源，按 key 前缀切片） |
 
-> 你也可以直接用 **ComfyUI 官方**的 UNETLoader / CLIPLoader / VAELoader / CheckpointLoaderSimple 喂给 Build Pipeline——它接收的就是标准 `MODEL`/`CLIP`/`VAE` 接口。Pick 系列的区别是“零加载”，更快、显存占用更小，且只服务 QuantFunc 分支。
+下图是全家桶单文件加载节点（一个文件同时给出 model/clip/vae）：
 
-![三种加载方式的分组](assets/model-loading-three-ways.png)
-<!-- TODO-SCREENSHOT: All-In-One 工作流“加载模型”区域，把 A(Model Auto Loader) / B(Model Loader) / C(Pick* + Pick Checkpoint) 三组框在一起 -->
+![Pick Checkpoint（全家桶单文件）](assets/node-pick-checkpoint.png)
+
+> 你也可以直接用 **ComfyUI 官方**的 UNETLoader / CLIPLoader / VAELoader / CheckpointLoaderSimple 喂给 Build Pipeline——它接收的就是标准 `MODEL`/`CLIP`/`VAE` 接口。Pick 系列的区别是“零加载”，更快、显存占用更小，且只服务 QuantFunc 分支。
 
 ---
 
-## 三、支持的模型格式（后端自动检测）
+## 三、支持的模型格式（Build Pipeline 自动检测，你不用选后端）
 
-Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权重，通常 < 1 MB），**自动判定**用哪个后端加载，你**不用手动选后端**：
+Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权重，通常 < 1 MB），**自动判定**用哪个后端加载：
 
 | 检测到的格式 | 依据 | 走的后端 | 含义 |
 |------|------|----------|------|
-| **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速，无需预量化模型。**必须配 precision_config**（见下节） |
+| **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速。**必须配 precision_config**（见下节） |
 | **Lighting 预量化模型** | 元数据 `method` 为 `lighting` / `lighting_precomputed` / `flux2klein_runtime`，或权重键含 `._qweight` | **Lighting** | QuantFunc Lighting 导出的预量化权重，加载即用，跳过运行时量化 |
 | **SVDQ 预量化模型** | 元数据判定：`model_class` 含 `Nunchaku`，或 `quantization_config.method == svdquant` | **SVDQ** | Nunchaku SVDQ 预量化权重 |
-| **全家桶（已量化）单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存），且带 QuantFunc stamp 的量化元数据 | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片，无需 CheckpointLoader。**自带逐层精度，无需配 precision_config** |
-| **全家桶（原精度）单文件 checkpoint** | 同上的键前缀，但权重是 FP16/BF16、无量化元数据 | 自动识别为 bundled checkpoint | 同样自动切片；但**精度处理跟原精度 diffusers 一样**——`[auto-derive]` 会像对待原精度基础模型那样**自动注入精度表**（见下节） |
+| **全家桶（已量化）单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存），且带 QuantFunc stamp 的量化元数据 | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片。**自带逐层精度，无需配 precision_config** |
+| **全家桶（原精度）单文件 checkpoint** | 同上键前缀，但权重是 FP16/BF16、无量化元数据 | 自动识别为 bundled checkpoint | 同样自动切片；但**精度处理跟原精度 diffusers 一样**——`[auto-derive]` 会自动注入精度表 |
 
 > 当头部无法读取、或格式无法判定时，安全回退到 **Lighting** 后端。若指向的权重文件根本不存在（路径写错、文件没下全），加载会在引擎侧失败并报出**明确的文件路径错误**，而不是静默出错。
 
 ---
 
-## 四、precision_config（逐层精度表）
+## 四、precision_config（逐层精度表）—— Build Pipeline 上最重要的旋钮
 
-`precision_config` 是 **Build Pipeline** 上的一个下拉输入，定义 Transformer 每一层的量化精度，是画质/速度平衡的核心。它的取值有四类：
+`precision_config` 是 **Build Pipeline** 上的一个下拉输入，定义 Transformer **每一层**的量化精度，是画质/速度/显存平衡的核心。下图是 Build Pipeline 节点，`precision_config` 和 `device` / `api_key` 都在上面：
+
+![Build Pipeline 上的 precision_config / device / api_key](assets/node-build-pipeline.png)
+
+它的取值有四类：
 
 | 选项 | 含义 |
 |------|------|
-| **`[auto-derive]`（默认）** | 对**没有量化元数据的原精度 diffusers 基础模型 / 原精度全家桶 checkpoint**，自动识别模型并按你选的 GPU 加载匹配的精度表（Blackwell SM120+ 用 FP4，其他用 INT4）；SVDQ / 已量化模型（含已 stamp 的全家桶）保留自身元数据里的逐层配置，不注入 |
-| **`[none]`** | 从不注入精度表 |
-| **`[builtin] xxx.json`** | 使用插件内置（`<plugin>/configs` 或 `$QUANTFUNC_CONFIGS_DIR`）的固定精度表 |
-| **`[series] yyy.json`** | 使用 QuantFunc 模型系列预设（按需从 ModelScope 下载） |
+| **`[auto-derive]`（默认）** | 对**没有量化元数据的原精度 diffusers 基础模型 / 原精度全家桶 checkpoint**，自动识别模型并**按你选的 GPU** 加载匹配的精度表（Blackwell SM120+ 用 **FP4**，其他用 **INT4**）；SVDQ / 已量化模型（含已 stamp 的全家桶）**保留自身元数据里的逐层配置，不注入**。 |
+| **`[none]`** | 从不注入精度表。 |
+| **`[builtin] xxx.json`** | 使用插件内置（`<plugin>/configs` 或 `$QUANTFUNC_CONFIGS_DIR`）的固定精度表。 |
+| **`[series] yyy.json`** | 使用 QuantFunc 模型系列预设（按需从 ModelScope 下载）。 |
 
-也可以把这个下拉**转成输入接口**，从 **QuantFunc Precision Config Loader (path)** 或 **QuantFunc Precision Config Auto Loader** 用绝对路径喂进来。
+也可以把这个下拉**转成输入接口**，从 **QuantFunc Precision Config Loader (path)** 或 **QuantFunc Precision Config Auto Loader** 用路径喂进来（见第五节）。
 
-> **重点：加载“原精度 diffusers 基础模型”或“原精度全家桶 checkpoint”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份并注入；如果你改成了 `[none]` 又没有量化元数据，模型会停留在原精度（很慢、很占显存）。
+> **重点 1：加载“原精度 diffusers 基础模型”或“原精度全家桶 checkpoint”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份并注入；如果你改成了 `[none]` 又没有量化元数据，模型会停留在原精度（**很慢、很占显存**）。
 >
-> **只有“已量化 / 已 stamp”的模型（Lighting 预量化、SVDQ、已量化的全家桶）自带逐层精度信息，无需额外配置。** 原精度全家桶不在此列——它和原精度基础模型一样要靠 `[auto-derive]` 注入。
+> **重点 2（和 transformer 不同！）：`precision_config` 这个下拉不按 GPU 过滤**——它把**所有档都列出来**，包括 FP4 / `50x-above`（在这张 SM89 的机器上也照样列出）。所以你**手动**选 precision_config 时，**务必选与你 GPU 同档**：在 **SM120 以下**的卡上手动选了 **FP4 / `50x-above` 档**的精度表，会在推理时触发 `__trap()` **崩溃**（FP4 需要 Blackwell SM120+）。**默认 `[auto-derive]` 不会有这个问题**（它按你的卡自动挑档）。
 >
-> precision_config **与模型架构绑定**，不同系列不能混用。
-
-![Build Pipeline 上的 precision_config](assets/model-loading-precision-config.png)
-<!-- TODO-SCREENSHOT: QuantFunc Build Pipeline 节点，突出 precision_config 下拉（展开显示 [auto-derive]/[none]/[builtin]/[series]），以及 device / api_key 输入 -->
+> **重点 3：** precision_config **与模型架构绑定**，不同系列不能混用。
 
 ---
 
@@ -159,6 +181,10 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 | **QuantFunc Transformer Auto Loader** | `transformer_path` | 从 `models/QuantFunc/transformer/` 挑 `.safetensors` |
 | **QuantFunc Prequant Auto Loader** | `prequant_weights` | 自动下载预量化调制权重 |
 | **QuantFunc Precision Config Auto Loader** | `precision_config` | 自动下载逐层精度表，接到 Build Pipeline 的 `precision_config` |
+
+**Precision Config Auto Loader** 有两个参数（`precision_config` 选系列内的哪份表、`data_source` 选下载源）：
+
+![Precision Config Auto Loader 参数](assets/node-precision-config-auto.png)
 
 > **三个“Base Model”加载器怎么选？**
 > - **Base Series Model Auto Loader** —— 你想用 **QuantFunc 官方系列**的基础模型：按系列一键下载，且自动挑对 GPU 变体。**最常用**。
@@ -204,17 +230,14 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 拿到自己的 key 后，有两种填法（任选其一）：
 
-1. **在节点里填**（推荐）：在 **QuantFunc Build Pipeline** 节点的 `api_key` 输入框里填入你的 `qf_xxx`。**节点里填的值会覆盖 config.json**。
-2. **改配置文件**：编辑 `bin/<os>/config.json` 里的 `api_key`（以及需要时的 `server_url`）。当 Build Pipeline 的 `api_key` 留空时，就回退到这个文件里的值。
+1. **在节点里填**（推荐）：在 **QuantFunc Build Pipeline** 节点的 `api_key` 输入框里填入你的 `qf_xxx`。**节点里填的值会覆盖 config.json**（`optional` 输入，展开可见，就是上面 Build Pipeline 截图里最下面那个 `api_key` 框）。
+2. **改配置文件**：编辑 `bin/<os>/config.json` 里的 `api_key`（以及需要时的 `server_url`）。当 Build Pipeline 的 `api_key` **留空**时，就回退到这个文件里的值。
 
 > 修改 `api_key` **不会**触发管线重建——插件内部对认证凭据做了热更新（`set_api_key`），所以切换 key 不需要重新加载模型。
 
-![Build Pipeline 的 api_key 输入框](assets/model-loading-apikey.png)
-<!-- TODO-SCREENSHOT: QuantFunc Build Pipeline 节点，突出可选的 api_key 输入框（展开 optional 输入），旁边可放一个 config.json 内容的示意 -->
-
 ---
 
-## 七、常见问题
+## 七、常见问题（FAQ）
 
 **Q：加载报错 “no transformer .safetensors found”？**
 A：Model Loader 在 `model_dir/transformer/` 下找不到权重。确认 `model_dir` 是标准 diffusers 布局（含 `model_index.json` + `transformer/`），或显式填 `transformer_path`。
@@ -228,5 +251,8 @@ A：下拉是联网懒加载的。检查网络与 `data_source`（国内选 `mod
 **Q：需要自己填 API Key 吗？**
 A：**免费测试期间不需要**——插件已内置共享测试 key。正式发布后到 https://www.quantfunc.com 注册，把 key 填到 Build Pipeline 的 `api_key` 或 `config.json`。
 
-**Q：50x-below 和 50x-above 怎么选？**
-A：**基础模型**不用手动选——Auto Loader 会按你的 GPU 自动判定（RTX 50 系 = 50x-above，其余 = 50x-below）。但 **`transformer` / 精度表下拉不按 GPU 过滤**，若你手动指定它们，务必和基础模型用**同一个 tier**；尤其别在 SM120 以下的卡上选 FP4 / `50x-above` 档（会 `__trap()` 崩溃）。拿不准就把 `transformer` 留 `None`。
+**Q：`transformer` 和 `precision_config` 到底哪个按 GPU 过滤、哪个不过滤？**
+A：**`transformer` 下拉会按 GPU 过滤**（跑不了的档直接隐藏），且默认 `[auto-detect]` 会按你选定的运行 GPU 重挑——所以你从下拉里**选不到**会崩的 transformer；唯一例外是导入别人在更高档 GPU 上存的、写死了高档 transformer 的工作流（改回 `[auto-detect]` 即可）。**`precision_config` 下拉不过滤**（所有档都列出来），手动选时务必和你的 GPU 同档，否则在 SM120 以下选 FP4 会崩；默认 `[auto-derive]` 则自动挑对档、不会崩。
+
+**Q：50x-below 和 50x-above 是什么？**
+A：这是**基础模型 / 权重的 GPU 档位**：`50x-above` = FP4，需 Blackwell（RTX 50 系，SM120+）；`50x-below` = INT4，其余所有卡（RTX 20/30/40）。基础模型由 Auto Loader 按你的 GPU 自动挑，不用你管。
