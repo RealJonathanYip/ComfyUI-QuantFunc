@@ -2,7 +2,7 @@
 
 **这篇是什么：** 把 QuantFunc 每个节点的 `INPUT_TYPES`（每个参数：类型 / 默认 / 含义）一次列全，当**查阅表**用。**详细用法**见对应专题文档（每节都有链接）。
 
-> 参数值 / 默认一律对插件当前代码（`nodes.py`，与仓库 `origin/main` 一致）核对。只收录 shipping 版真实存在的节点（视频 / Wan 等未发布的开发中节点不在此列）。
+> 参数值 / 默认一律对插件当前代码（`nodes.py`，与仓库 `origin/main` 一致）核对——**§七 的 Ideogram 4 Prompt Builder 除外**：它是第三方 **ComfyUI-KJNodes** 节点，不在本插件 `nodes.py` / NODE_CLASS_MAPPINGS 里，字段以该包为准（不在"对照 nodes.py"范围内）。只收录本插件真实注册的节点（**Wan 多专家**等未发布节点不在此列；视频生成节点 `QuantFuncGenerateVideo` 是已发布的真节点，已收录，见 §九）。
 
 ---
 
@@ -124,7 +124,7 @@
 | 节点 | 参数 | 说明 |
 |---|---|---|
 | **QuantFunc LoRA Auto Loader** | `pipeline`, `lora_file`(下拉), `scale`(默认 1.0, 0–2) | 从 models/loras/ 下拉挑；pipeline 进 / 出 |
-| **QuantFunc LoRA Loader** | `pipeline`, `lora_path`(STRING), `scale`(1.0) | 用绝对路径 |
+| **QuantFunc LoRA**（class `QuantFuncLoRALoader`） | `pipeline`, `lora_path`(STRING), `scale`(1.0) | 用绝对路径 |
 | **QuantFunc LoRA Config** | `pipeline`, `max_rank`(512), `merge_method`(auto) | SVD 合并参数：rank 越高越准越占显存；merge_method（auto/itc/awsvd/rop/concat） |
 
 ![](../assets/node-lora-config.png)
@@ -162,11 +162,11 @@
 
 ---
 
-## 七、Ideogram 4
+## 七、Ideogram 4（结构化提示词 · 第三方 KJNodes）
 
-> 详见 [Ideogram 4](ideogram4_zh.md)。
+> 详见 [Ideogram 4](ideogram4_zh.md)。**注意：Ideogram 4 Prompt Builder KJ 不是本插件节点**，由第三方 **ComfyUI-KJNodes** 提供（需单独安装）；本插件跑 Ideogram 4 只需 Model Loader + Build Pipeline + Generate（Generate 的 `prompt` 直接吃文本）。
 
-**Ideogram 4 Prompt Builder KJ** → 输出 `prompt`/`preview`/`bboxes`/`width`/`height`。关键参数：`width`/`height`(1024, 16 倍数)、`background`(必填)、`high_level_description`、`style`/`aesthetics`/`lighting`/`medium`、`import_mode`(when empty)、`bboxes`（区域编辑器）。
+（可选，第三方）**Ideogram 4 Prompt Builder KJ** → 输出 `prompt`/`preview`/`bboxes`/`width`/`height`。主要字段：`width`/`height`(1024, 16 倍数)、`background`、`high_level_description`、`style`(默认 none)/`art_style`/`aesthetics`/`lighting`/`medium`、`import_mode`(when empty) + 底部分区域编辑器。字段以 KJNodes 包为准。
 
 ![](../assets/node-ideogram4-prompt.png)
 
@@ -191,3 +191,21 @@
 
 ### QuantFunc Latent Preview
 接 Generate 的 `latent_preview`，在采样过程中预览潜空间。参数 `latent_preview`（接口）。
+
+---
+
+## 九、视频生成
+
+### QuantFunc Generate Video
+LTX-2 视频生成（+ 音频）节点（本插件自带，`QuantFuncGenerateVideo`）。用一个视频管线出一段视频帧序列。
+
+| 参数 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `pipeline` | 接口 | — | 视频管线（从 Build Pipeline 接入 LTX-2 类模型） |
+| `prompt` | 多行文本 | 空 | 正向提示词 |
+| `width` / `height` | 整数 | `512` | 帧尺寸（64–2048，步 8） |
+| `num_frames` | 整数 | `49` | 生成帧数（1–257） |
+| `steps` | 整数 | `30` | 采样步数（1–100） |
+| `guidance_scale` | 浮点 | `4.0` | 引导强度（0–20） |
+| `seed` | 整数 | `42` | 随机种子 |
+| `negative_prompt`(可选) | 多行文本 | 空 | 负向提示词 |
