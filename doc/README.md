@@ -49,12 +49,16 @@ See the main [README.md](../README.md) for installation instructions.
 | [模型加载与 API Key](model-loading-and-apikey_zh.md) | 不同场景的三大类加载方式、支持的模型格式、precision_config，以及 API Key 的作用/获取/填写 |
 | [基础文生图、img2img 与 ControlNet](basic-t2i-img2img-controlnet_zh.md) | 基础文生图参数、以图生图（init_img）、ControlNet 结构引导，各带完整 workflow 例子 |
 | [图像编辑：mask / color match / 尺寸对齐](image-edit-mask-colormatch_zh.md) | 参考图编辑、局部重绘遮罩（Mask Config / Mask Scale By）、色彩匹配、像素级对齐（origin），逐参数详解 |
+| [调度器与采样器手册](scheduler-and-sampler_zh.md) | Generate 上采样相关参数一次讲清：22 种采样器、9 种调度器、CFG、FBCache 加速，含快速推荐 |
+| [QwenImage-Layered：分解成 RGBA 图层](qwen-image-layered_zh.md) | 用 Qwen-Image-Layered 把图分解成 N 张透明图层（Layered Config / Layer Viewer） |
+| [Ideogram 4：结构化/分区域提示词](ideogram4_zh.md) | Ideogram 4 文生图 + Prompt Builder 结构化/分区域提示词编辑器 |
 
 ### 参考文档
 
 | 文档 | 说明 |
 |------|------|
 | [工作流参考](workflow-reference_zh.md) | 节点说明与快速上手指南 |
+| [节点速查（逐节点参数）](node-reference_zh.md) | 每个 QuantFunc 节点的 INPUT_TYPES 每参数（类型/默认/含义）+ 交叉链接 |
 
 ### 安装
 
