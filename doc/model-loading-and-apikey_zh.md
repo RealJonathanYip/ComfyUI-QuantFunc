@@ -25,7 +25,7 @@ QuantFunc 的加载分两步走，几乎所有工作流都是这个形状：
 > [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json)
 
 ![加载 → Build Pipeline → Generate 的整体连线](assets/model-loading-overview.png)
-<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截“文生图”那一组，展示 加载节点 → QuantFunc Build Pipeline → QuantFunc Generate → Preview Image 的完整连线 -->
+<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截 `Sample for text to image` 分组，展示 加载节点 → QuantFunc Build Pipeline → QuantFunc Generate → Preview Image 的完整连线 -->
 
 ### 在 ComfyUI 里怎么添加这些节点？
 
@@ -115,7 +115,7 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 |------|------|----------|------|
 | **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速，无需预量化模型。**必须配 precision_config**（见下节） |
 | **Lighting 预量化模型** | 元数据 `method` 为 `lighting` / `lighting_precomputed` / `flux2klein_runtime`，或权重键含 `._qweight` | **Lighting** | QuantFunc Lighting 导出的预量化权重，加载即用，跳过运行时量化 |
-| **SVDQ 预量化模型** | 元数据 `method=svdquant` / `model_class` 含 `Nunchaku`，或权重键含裸 `.qweight` + LoRA 旁挂 | **SVDQ** | Nunchaku SVDQ 预量化权重 |
+| **SVDQ 预量化模型** | 元数据判定：`model_class` 含 `Nunchaku`，或 `quantization_config.method == svdquant` | **SVDQ** | Nunchaku SVDQ 预量化权重 |
 | **全家桶（已量化）单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存），且带 QuantFunc stamp 的量化元数据 | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片，无需 CheckpointLoader。**自带逐层精度，无需配 precision_config** |
 | **全家桶（原精度）单文件 checkpoint** | 同上的键前缀，但权重是 FP16/BF16、无量化元数据 | 自动识别为 bundled checkpoint | 同样自动切片；但**精度处理跟原精度 diffusers 一样**——`[auto-derive]` 会像对待原精度基础模型那样**自动注入精度表**（见下节） |
 

@@ -20,10 +20,10 @@
 
 加载与 Build Pipeline 见文档《模型加载与 API Key》。核心生成节点是 **QuantFunc Generate**。
 
-> **完整 workflow 例子：** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里的**“文生图”分组**（画布内便签有标注）。
+> **完整 workflow 例子：** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里标题为 **`Sample for text to image`** 的分组。
 
 ![基础文生图连线](assets/basic-gen-t2i.png)
-<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截“文生图”分组：加载 → Build Pipeline → Generate → Preview Image 的完整连线 -->
+<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截 `Sample for text to image` 分组：加载 → Build Pipeline → Generate → Preview Image 的完整连线 -->
 
 ### QuantFunc Generate —— 必填参数
 
@@ -53,7 +53,7 @@
 |------|------|------|
 | `negative_prompt` | 空 | 负向提示词（配合 `true_cfg_scale > 1` 才起作用） |
 | `true_cfg_scale` | `1.0` | 经典 CFG。`1.0` = 关闭（少步 / 蒸馏模型正确值）；base 模型可升到 `4.0`，需要负向提示词 |
-| `sampler_name` | `euler` | 采样算法（共 23 种，详见文档《调度器与采样器》） |
+| `sampler_name` | `euler` | 采样算法（共 22 种，详见文档《调度器与采样器》） |
 | `scheduler` | `normal` | 噪声调度曲线（共 9 种，详见文档《调度器与采样器》） |
 | `vram_budget` | `100%` | 限制本管线可用显存上限（按所选设备总显存百分比）；`100%`/`off` = 用满整卡 |
 | `activate_unload` | `False` | 是否允许 ComfyUI 在需要显存时卸载本管线（默认 False = 权重常驻，后续更快） |
@@ -62,7 +62,7 @@
 
 ### 输出
 
-Generate 有三个输出：`image`（图像）、`mask`（编辑 / inpaint 时的遮罩，纯 t2i 为空）、`latent_preview`（潜空间预览）。文生图只需把 `image` 接到 **Preview Image** / **Save Image**。
+Generate 有三个输出：`image`（图像）、`mask`（编辑 / inpaint 时的遮罩；纯 t2i 时是一张**全白占位**，等价“无遮罩”）、`latent_preview`（潜空间预览）。文生图只需把 `image` 接到 **Preview Image** / **Save Image**。
 
 ---
 
@@ -95,7 +95,7 @@ Load Image  →  QuantFunc Image List (连 init_img)  →  QuantFunc Generate �
 
 > **`init_img` 与 `main_image` 互斥**：`init_img` 是 t2i 管线的“以图生图”（保留结构按 prompt 改）；`main_image` 是**编辑模式**（vision-edit，需要 Qwen-Image-Edit 这类编辑模型 + 可选遮罩）。Image List 只能二选一，编辑模式详见[图像编辑](image-edit-mask-colormatch_zh.md)文档。
 
-> **完整 workflow 例子：** 以 [`QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 的“图像编辑”分组为基础，把源图接到 Image List 的 `init_img`（而非 `main_image`）即成 img2img。
+> **参考 workflow：** [`QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里标题为 **`Sample for edit Image`** 的分组已接好 `Load Image → Image List → Generate`，但它默认连的是 `main_image`（编辑模式）。改成 img2img 只需**手动改一根线**：把 Load Image 从 Image List 的 `main_image` 拔下、改接到 **`init_img`** 输入，并设 `init_img_strength`。（该样例 JSON 未预置 `init_img` 连线，需你自己改这一根。）
 
 ![img2img 连线（init_img）](assets/basic-gen-img2img.png)
 <!-- TODO-SCREENSHOT: All-In-One 里 Load Image → QuantFunc Image List（突出 init_img 与 init_img_strength 输入）→ Generate 的 ref_images 的连线 -->
@@ -110,6 +110,8 @@ ControlNet 用一张**控制图**（canny 边缘 / depth 深度 / pose 姿态 / 
 2. **提供控制图 + 参数** —— 用 **QuantFunc Control Image** 节点，把它的 `control_image` 输出接到 **Generate** 的 `control_image` 输入。
 
 > ⚠️ **ControlNet 仅对文生图（t2i）生效**，在编辑 / img2img 路径上 `control_image` 会被忽略。
+>
+> ⚠️ **ControlNet 只支持 QwenImage 系与 ZImage 系模型**。挂到 Klein / Ideogram4 / Flux1Dev 等其他架构上会**静默无效**——引擎不会报错、生成照常进行，只在**控制台**打一条 warning（`ControlNet is NOT supported for '<arch>' pipelines … will be IGNORED`），前端看不到。所以用 ControlNet 时请选 QwenImage / ZImage 系的基础模型。
 
 ### 连线
 
@@ -163,7 +165,7 @@ A：多半是把 base 模型当蒸馏模型跑了。把 `steps` 提到 20–30�
 A：调 Image List 的 `init_img_strength`：太多改动 → 调低（0.2–0.4 强保留源图）；几乎没变 → 调高（越接近 1.0 越像纯文生图）。
 
 **Q：接了 ControlNet 没效果 / 报错？**
-A：确认两件事都做了——（1）用 ControlNet (Auto) Loader 把模型挂进了管线；（2）用 Control Image 提供了控制图并接到 Generate 的 `control_image`。还要确认走的是**文生图**路径（连了 `ref_images` / `init_img` 的编辑 / img2img 路径会忽略 ControlNet）。
+A：确认三件事——（1）用 ControlNet (Auto) Loader 把模型挂进了管线；（2）用 Control Image 提供了控制图并接到 Generate 的 `control_image`；（3）**基础模型是 QwenImage 系或 ZImage 系**——挂到 Klein / Ideogram4 / Flux1Dev 上 ControlNet 会静默无效（只在控制台 warning）。还要确认走的是**文生图**路径（连了 `ref_images` / `init_img` 的编辑 / img2img 路径会忽略 ControlNet）。
 
 **Q：ControlNet 出图洗白 / 噪点重？**
 A：先把 `control_scale` 降下来（PAI Fun-Control 约 0.2–0.4，InstantX/ZImage 约 0.5–0.9），必要时把 `control_guidance_end` 从 1.0 降到 0.7 左右。
