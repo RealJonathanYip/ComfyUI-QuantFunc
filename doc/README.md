@@ -42,6 +42,12 @@ See the main [README.md](../README.md) for installation instructions.
 | [教程 2：导出运行时量化模型](tutorial-2-export-quantized-models_zh.md) | 将 Lighting 运行时量化的所有模型导出到磁盘（支持融合 LoRA） |
 | [教程 3：下载并使用已导出的量化模型](tutorial-3-download-quantfunc-models_zh.md) | 下载 QuantFunc 提前导出的量化模型，加载即用（2x-11x 加速） |
 
+### 使用指南（图文）
+
+| 指南 | 说明 |
+|------|------|
+| [模型加载与 API Key](model-loading-and-apikey_zh.md) | 不同场景的三大类加载方式、支持的模型格式、precision_config，以及 API Key 的作用/获取/填写 |
+
 ### 参考文档
 
 | 文档 | 说明 |
