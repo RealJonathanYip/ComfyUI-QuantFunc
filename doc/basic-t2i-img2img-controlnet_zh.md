@@ -22,8 +22,7 @@
 
 > **完整 workflow 例子：** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里标题为 **`Sample for text to image`** 的分组。
 
-![基础文生图连线](assets/basic-gen-t2i.png)
-<!-- TODO-SCREENSHOT: 导入 QuantFunc-Sample-WorkFlow-All-In-One.json，截 `Sample for text to image` 分组：加载 → Build Pipeline → Generate → Preview Image 的完整连线 -->
+![基础文生图连线：三个 Pick 加载节点 → Build Pipeline → LoRA Auto Loader → Generate → 预览图像](../assets/t2i-overview.png)
 
 ### QuantFunc Generate —— 必填参数
 
@@ -35,6 +34,10 @@
 | `steps` | 整数 | `8` | 采样步数，范围 1–100 |
 | `seed` | 整数 | `42` | 随机种子（设 `randomize` 每次随机） |
 | `guidance_scale` | 浮点 | `0.0` | 引导强度，范围 0–30 |
+
+下图是 **QuantFunc Generate** 节点，上面这些必填项（`prompt` / `width` / `height` / `steps` / `seed` / `guidance_scale`）以及下方的采样器/CFG 进阶项都在同一个节点里：
+
+![QuantFunc Generate 节点参数](../assets/node-generate.png)
 
 ### steps / guidance_scale 怎么设？
 
@@ -97,8 +100,9 @@ Load Image  →  QuantFunc Image List (连 init_img)  →  QuantFunc Generate �
 
 > **参考 workflow：** [`QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) 里标题为 **`Sample for edit Image`** 的分组已接好 `Load Image → Image List → Generate`，但它默认连的是 `main_image`（编辑模式）。改成 img2img 只需**手动改一根线**：把 Load Image 从 Image List 的 `main_image` 拔下、改接到 **`init_img`** 输入，并设 `init_img_strength`。（该样例 JSON 未预置 `init_img` 连线，需你自己改这一根。）
 
-![img2img 连线（init_img）](assets/basic-gen-img2img.png)
-<!-- TODO-SCREENSHOT: All-In-One 里 Load Image → QuantFunc Image List（突出 init_img 与 init_img_strength 输入）→ Generate 的 ref_images 的连线 -->
+下图是 **QuantFunc Image List** 节点——img2img 的关键就是把 Load Image 接到最下方的 **`init_img`** 输入（**不是** `main_image`），并调它下面的 **`init_img_strength`**（默认 0.60），再把 `images` 输出接到 Generate 的 `ref_images`：
+
+![QuantFunc Image List：接 `init_img` + 调 `init_img_strength`](../assets/node-image-list.png)
 
 ---
 
@@ -124,8 +128,7 @@ Load Image → QuantFunc Control Image ─────────────�
 > **完整 workflow 例子：** [`workflow_sample/QuantFunc-ControlNet.json`](../workflow_sample/QuantFunc-ControlNet.json)
 > （示例用 `QuantFunc/Qwen-Image-Edit-Series` 模型 + `instantx_qwen_control.safetensors` ControlNet + canny 控制图。）
 
-![ControlNet 连线](assets/basic-gen-controlnet.png)
-<!-- TODO-SCREENSHOT: 导入 QuantFunc-ControlNet.json，截全图连线：ModelAutoLoader → BuildPipeline → ControlNet Auto Loader → Generate → Preview；LoadImage → Control Image → Generate.control_image -->
+![ControlNet 完整连线：Model Auto Loader → Build Pipeline → ControlNet Auto Loader → Generate → 预览；Load Image → Control Image → Generate 的 control_image](../assets/controlnet-overview.png)
 
 ### QuantFunc ControlNet Loader / Auto Loader
 
@@ -133,7 +136,9 @@ Load Image → QuantFunc Control Image ─────────────�
 |------|------|
 | `pipeline` | 从 Build Pipeline 接入 |
 | `controlnet_path`（Loader）/ `controlnet`（Auto Loader 下拉） | ControlNet `.safetensors` 路径，或 InstantX 模型目录；Auto Loader 从 `ComfyUI/models/controlnet/` 扫描 |
-| `arch` | ControlNet 架构：`auto`（默认，自动识别）/ `instantx_qwen` / `pai-fun` / `zimage-fun` |
+| `arch` | ControlNet 架构：`auto`（默认，自动识别）/ `instantx_qwen` / `pai-fun` / `zimage-fun`。`auto` 会从模型 config / `_class_name` 自动识别，一般不用改；只有当 auto 误判时才强制指定 |
+
+![QuantFunc ControlNet Auto Loader 节点](../assets/node-controlnet-loader.png)
 
 ### QuantFunc Control Image
 
@@ -144,6 +149,8 @@ Load Image → QuantFunc Control Image ─────────────�
 | `control_scale` | `0.5` | 控制强度（0 = 关）。⚠️ **太高会把图洗白 / 出噪点**（少步 lighting 模型会放大这个效应） |
 | `control_guidance_start` | `0.0` | 从调度的这个比例**开始**注入控制（0 = 第一步） |
 | `control_guidance_end` | `1.0` | 到这个比例**停止**注入（1 = 最后一步；调低如 0.7 可减少后期噪点） |
+
+![QuantFunc Control Image 节点参数](../assets/node-control-image.png)
 
 **`control_scale` 起始推荐值**（先从低值起，按需逐步加强）：
 
