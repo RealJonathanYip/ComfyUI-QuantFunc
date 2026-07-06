@@ -197,17 +197,17 @@ If the library was not found:
 
 See [doc/](doc/) for detailed tutorials and [workflow_sample/README.md](workflow_sample/README.md) for node reference.
 
-### Must-Read for Beginners: Generate Your First Image in 3 Nodes
+### Quick Start for Beginners
 
-The easiest way to get started — import the Easy Gen workflow, pick a model from the dropdown, and the plugin auto-downloads everything. No manual model downloads or path configuration needed.
+The easiest way to get started — add a **Model Auto Loader**, pick a model series from the dropdown, wire it into **Build Pipeline → Generate**, and the plugin auto-downloads everything. No manual model downloads or path configuration needed.
 
-> **[Beginners: Easy Gen →](doc/tutorial-0-easy-gen.md)**
+> **[Quick Start & documentation index →](doc/README.md)**
 
 ### 3.1 Runtime Quantization: Quantize BF16/FP16 Models to 4bit for Accelerated Inference
 
-The **Lighting backend** provides **runtime quantization** — it uses the Lighting engine to quantize any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just set `model_backend` to `lighting` and leave `transformer_path` empty — no pre-quantized model download needed.
+The **Lighting backend** provides **runtime quantization** — it quantizes any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just point **Model Loader** at the FP16 model and leave `transformer_path` empty; the backend is auto-detected — no pre-quantized model download needed.
 
-> **[Tutorial 1: Runtime Quantization →](doc/tutorial-1-use-without-quantfunc-models.md)**
+> **[Model Loading & Runtime Quantization →](doc/model-loading-and-apikey_zh.md)** (Chinese)
 
 ### 3.2 Export Runtime-Quantized Models (with LoRA Fusion Support)
 
