@@ -87,6 +87,8 @@
 | `vae_tile_size` | INT | `0` | VAE 分块像素（0=自动） |
 | `pinned_memory_limit` | STRING | 空 | 锁页内存上限（如 '60%' / '48G'，空=自动） |
 
+> **没有手动 offload 开关：** 显存/卸载策略由 libquantfunc 按你的 GPU **自动决定**——本节点**没有** `cpu_offload` / `layer_offload` / `adaptive_offload` 这类手动开关。旧工作流 JSON 里若还残留这些旧字段，会被引擎**静默忽略**（是 no-op，**不是坏了**），无需理会。大多数情况下你根本用不到 Pipeline Config 节点。
+
 ---
 
 ## 三、生成

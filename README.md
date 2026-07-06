@@ -207,7 +207,7 @@ The easiest way to get started — add a **Model Auto Loader**, pick a model ser
 
 The **Lighting backend** provides **runtime quantization** — it quantizes any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just point **Model Loader** at the FP16 model and leave `transformer_path` empty; the backend is auto-detected — no pre-quantized model download needed.
 
-> **[Model Loading & Runtime Quantization →](doc/model-loading-and-apikey_zh.md)**
+> **[Model Loading & Runtime Quantization →](doc/model-loading-and-apikey_zh.md)** (Chinese)
 
 ### 3.2 Export Runtime-Quantized Models (with LoRA Fusion Support)
 

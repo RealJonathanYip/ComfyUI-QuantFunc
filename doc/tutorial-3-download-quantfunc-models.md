@@ -25,7 +25,7 @@ QuantFunc provides different quantized model versions per GPU architecture:
 | `50x-below` | RTX 20/30/40 series | Optimized for Turing/Ampere/Ada |
 | `50x-above` | RTX 50 series | Optimized for Blackwell |
 
-> **Important:** The base model and transformer weights must use the **same GPU variant**. (Model AutoLoader auto-matches this when downloading — see [Model Loading & API Key](model-loading-and-apikey_zh.md), section A.)
+> **Important:** The base model and transformer weights must use the **same GPU variant**. (Model AutoLoader auto-matches this when downloading — see [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the Model Auto Loader section.)
 
 ## Step 2: Download the Model
 
@@ -84,7 +84,7 @@ In the **QuantFunc Model Loader** node, point at the model you downloaded (both 
 
 ![Configure Model Loader node](../assets/node-model-loader.png)
 
-> Model Loader has **no** `model_backend` or `device` parameter: the backend is auto-detected, and `device`/`precision_config` live on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md)). Since the model is already quantized, there's no runtime quantization — loading is fast.
+> Model Loader has **no** `model_backend` or `device` parameter: the backend is auto-detected, and `device`/`precision_config` live on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese)). Since the model is already quantized, there's no runtime quantization — loading is fast.
 
 ## Step 4: Configure Generation Parameters
 

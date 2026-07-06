@@ -40,7 +40,7 @@ The backend (lighting / svdq) is **auto-detected** by the engine from the weight
 
 Once you're happy with Lighting's runtime quantization, export it to disk. Future loads read the exported quantized weights directly, skipping runtime quantization — **loads are usually 2x+ faster**.
 
-Model Loader config (same as in [Model Loading & API Key](model-loading-and-apikey_zh.md), section B — local-directory loading):
+Model Loader config (same as in [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the local-directory loading section):
 
 | Parameter | Setting |
 |-----------|---------|
@@ -50,7 +50,7 @@ Model Loader config (same as in [Model Loading & API Key](model-loading-and-apik
 
 ![Configure Model Loader node](../assets/node-model-loader.png)
 
-> `device` and `precision_config` are set on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md), section 四). The modulation optimization (auto-fuse on high VRAM / `prequant_weights` on low VRAM) is covered there (section B); the choice at export time is written into the model metadata and auto-applied on load.
+> `device` and `precision_config` are set on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the `precision_config` section). The modulation optimization (auto-fuse on high VRAM / `prequant_weights` on low VRAM) is covered there (the Model Loader section); the choice at export time is written into the model metadata and auto-applied on load.
 
 ### Option B: Export from an existing SVDQ model
 
