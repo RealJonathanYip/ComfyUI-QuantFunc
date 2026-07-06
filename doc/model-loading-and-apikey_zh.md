@@ -25,7 +25,7 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 三个关键角色：
 
 - **加载节点**只负责“**指向权重文件**”，输出 ComfyUI 原生的 `MODEL` / `CLIP` / `VAE` 三个接口（和官方 UNETLoader / CLIPLoader / VAELoader 同类型），本身**不做真正的 torch 加载**（“零加载”，只记录路径）。
-- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（接 **QuantFunc Pipeline Config** 节点覆盖 vae/text 精度、attention 后端、tiled VAE 等高级旋钮；细节见 [工作流参考](workflow-reference_zh.md)）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。**权重的真正加载/量化发生在这里**（而不是加载节点里）。
+- **QuantFunc Build Pipeline** 才是真正“**组装成可运行管线**”的节点：它接收 `model`/`clip`/`vae`，加上 `device`（选哪张 GPU）、`precision_config`（逐层精度）、可选的 `pipeline_config`（接 **QuantFunc Pipeline Config** 节点覆盖 vae/text 精度、attention 后端、tiled VAE 等高级旋钮；细节见 [节点速查](node-reference_zh.md)）和 `api_key`，输出一个 `QUANTFUNC_PIPELINE`。**权重的真正加载/量化发生在这里**（而不是加载节点里）。
 - 之后 **Generate** 拿这个 pipeline 出图。
 
 > 综合示例工作流（同时演示三种加载方式）：

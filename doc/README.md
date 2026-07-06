@@ -12,16 +12,29 @@
 
 | Tutorial | Description |
 |----------|-------------|
-| [Beginners: Easy Gen](tutorial-0-easy-gen.md) | Generate your first image in 3 nodes — auto-download, no manual setup |
+| [Beginners: Easy Gen](tutorial-0-easy-gen.md) | Generate your first image with the Model AutoLoader — auto-download, no manual setup |
 | [Tutorial 1: Runtime Quantization](tutorial-1-use-without-quantfunc-models.md) | Quantize any BF16/FP16 model to 4bit at load time with Lighting — no pre-quantized models needed |
 | [Tutorial 2: Export Runtime-Quantized Models](tutorial-2-export-quantized-models.md) | Export all runtime-quantized models from Lighting to disk (with LoRA fusion support) |
 | [Tutorial 3: Download & Use Pre-exported Models](tutorial-3-download-quantfunc-models.md) | Download QuantFunc pre-exported quantized models for instant loading (2x-11x speedup) |
+
+### Illustrated Guides
+
+These in-depth, screenshot-rich guides are currently written in Chinese (`_zh`). English versions are planned.
+
+| Guide | Description |
+|----------|-------------|
+| [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese) | The three loading methods, supported model formats, `precision_config`, and the API Key |
+| [Basic t2i, img2img & ControlNet](basic-t2i-img2img-controlnet_zh.md) (Chinese) | Basic text-to-image params, image-to-image (`init_img`), ControlNet — each with a full workflow example |
+| [Image Edit: mask / color match / size align](image-edit-mask-colormatch_zh.md) (Chinese) | Reference-image editing, inpainting mask, color matching, pixel-align (`origin`) — per parameter |
+| [Scheduler & Sampler Handbook](scheduler-and-sampler_zh.md) (Chinese) | Every Generate sampling knob: 22 samplers, 9 schedulers, CFG, FBCache acceleration |
+| [QwenImage-Layered: decompose to RGBA layers](qwen-image-layered_zh.md) (Chinese) | Split an image into N transparent layers (Layered Config / Layer Viewer) |
+| [Ideogram 4: structured / regional prompts](ideogram4_zh.md) (Chinese) | Ideogram 4 text-to-image + the structured / regional Prompt Builder |
 
 ### Reference
 
 | Document | Description |
 |----------|-------------|
-| [Workflow Reference](workflow-reference.md) | Node reference and quick start guide for all workflows |
+| [Node Reference (per-node params)](node-reference_zh.md) (Chinese) | Every QuantFunc node's INPUT_TYPES — each param (type / default / meaning) + cross-links |
 
 ### Installation
 
@@ -37,7 +50,7 @@ See the main [README.md](../README.md) for installation instructions.
 
 | 教程 | 说明 |
 |------|------|
-| [新手入门必看](tutorial-0-easy-gen_zh.md) | 3 个节点生成第一张图——自动下载，无需手动配置 |
+| [新手入门必看](tutorial-0-easy-gen_zh.md) | 用 Model AutoLoader 生成第一张图——自动下载，无需手动配置 |
 | [教程 1：运行时量化](tutorial-1-use-without-quantfunc-models_zh.md) | 基于 Lighting 将任意 BF16/FP16 模型量化为 4bit 加速推理，无需下载预量化模型 |
 | [教程 2：导出运行时量化模型](tutorial-2-export-quantized-models_zh.md) | 将 Lighting 运行时量化的所有模型导出到磁盘（支持融合 LoRA） |
 | [教程 3：下载并使用已导出的量化模型](tutorial-3-download-quantfunc-models_zh.md) | 下载 QuantFunc 提前导出的量化模型，加载即用（2x-11x 加速） |
@@ -57,7 +70,6 @@ See the main [README.md](../README.md) for installation instructions.
 
 | 文档 | 说明 |
 |------|------|
-| [工作流参考](workflow-reference_zh.md) | 节点说明与快速上手指南 |
 | [节点速查（逐节点参数）](node-reference_zh.md) | 每个 QuantFunc 节点的 INPUT_TYPES 每参数（类型/默认/含义）+ 交叉链接 |
 
 ### 安装
