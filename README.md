@@ -213,13 +213,13 @@ The **Lighting backend** provides **runtime quantization** — it quantizes any 
 
 The Lighting export saves all runtime-quantized models to disk, so you don't need to re-quantize on every startup. If you've also stacked LoRAs, they are permanently fused into the exported weights — no LoRA nodes needed, no re-quantization, load and go.
 
-> **[Tutorial 2: Export Runtime-Quantized Models →](doc/tutorial-2-export-quantized-models.md)**
+> **[Export Quantized Models →](doc/export-quantized-models.md)**
 
 ### 3.3 Download and Use Pre-exported Quantized Models
 
 QuantFunc has pre-exported commonly used models (runtime-quantized and ready to use). Download them directly from [ModelScope](https://www.modelscope.cn/models/QuantFunc) or [HuggingFace](https://huggingface.co/QuantFunc) — same 2x–11x inference speedup as runtime quantization, but with faster loading since the quantization step is skipped.
 
-> **[Tutorial 3: Download & Use Pre-exported Models →](doc/tutorial-3-download-quantfunc-models.md)**
+> **[Model Loading & Downloads →](doc/model-loading-and-apikey_zh.md)** (Chinese)
 
 ### 3.4 Example Workflows
 

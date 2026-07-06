@@ -138,6 +138,41 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 > 你也可以直接用 **ComfyUI 官方**的 UNETLoader / CLIPLoader / VAELoader / CheckpointLoaderSimple 喂给 Build Pipeline——它接收的就是标准 `MODEL`/`CLIP`/`VAE` 接口。Pick 系列的区别是“零加载”，更快、显存占用更小，且只服务 QuantFunc 分支。
 
+### 附：下载 QuantFunc 预量化模型（手动）
+
+除了 A 小节的 Model Auto Loader 一键自动下载，你也可以**手动**下载 QuantFunc 提前量化好的模型，再用 **Model Loader**（B 小节）指向它——加载即用、无需运行时量化，推理 **2x–11x 加速**。
+
+**平台：**
+
+- **ModelScope**（国内推荐）：https://www.modelscope.cn/models/QuantFunc
+- **HuggingFace**：https://huggingface.co/QuantFunc
+
+QuantFunc 提供两种类型的预导出模型，都可直接用，后端由引擎从权重元数据自动识别：
+
+| 模型类型 | 引擎识别为 | 说明 |
+|----------|-----------|------|
+| SVDQ | `svdq` | 离线 SVD 量化；叠加 LoRA 需 LoRA Config 节点（见 [节点速查](node-reference_zh.md) §四） |
+| Lighting | `lighting` | 由运行时量化导出，无 low-rank 计算开销；LoRA 直接叠加 |
+
+> **SVDQ vs Lighting 怎么选：** 两者量化质量相当、推理都 2x–11x。**SVDQ**：必须下载 QuantFunc 预量化模型，首次加载快，叠 LoRA 需 LoRA Config 节点。**Lighting**：可量化**任意** diffusers FP16 模型（更灵活），首次加载需运行时量化（可用[导出](export-quantized-models_zh.md)一次导出后加速），LoRA 直接叠加，且在 **RTX 50 以下**机器上没有 SVDQ 的 low-rank 计算开销、约**快 20%**。
+
+**下载命令示例：**
+
+```bash
+# ModelScope（国内推荐）
+pip install modelscope
+modelscope download --model QuantFunc/YourModel-SVDQ --local_dir /path/to/QuantFunc-Model
+
+# 或 HuggingFace
+huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc-Model
+```
+
+![模型下载页面](../assets/t2-step2-download-model.png)
+
+> **GPU 变体要对齐（手动下载时你自己选）：** 每个系列按 GPU 档位提供 `50x-below`（RTX 20/30/40，Turing/Ampere/Ada，INT4）与 `50x-above`（RTX 50，Blackwell，FP4）两版；**基础模型和 Transformer 权重必须用同一档**。用 Model Auto Loader 自动下载则自动匹配（不用你管），**手动**下载才需要你自己对齐；混用会出错或降速。
+>
+> 下载好后，用 **Model Loader** 把 `model_dir` 指向该目录、`transformer_path` 指向其中的量化权重即可（后端自动识别，不会发生运行时量化，加载很快）。
+
 ---
 
 ## 三、支持的模型格式（Build Pipeline 自动检测，你不用选后端）
@@ -260,7 +295,7 @@ A：Model Loader 在 `model_dir/transformer/` 下找不到权重。确认 `model
 A：多半是没接精度表。Build Pipeline 的 `precision_config` 保持默认 `[auto-derive]`，或用 Precision Config (Auto) Loader 接一份匹配你模型系列的精度表。
 
 **Q：原精度模型首次加载/首次出图比后续慢很多？**
-A：正常。Lighting 运行时量化在**首次**加载时要额外花几十秒把 FP16 权重量化为 4bit，之后走缓存就快了。想彻底跳过每次的量化步骤，可用[教程 2：导出量化模型](tutorial-2-export-quantized-models_zh.md)把量化结果存到磁盘，以后加载即用（也可直接下载已导出模型，见[教程 3](tutorial-3-download-quantfunc-models_zh.md)）。
+A：正常。Lighting 运行时量化在**首次**加载时要额外花几十秒把 FP16 权重量化为 4bit，之后走缓存就快了。想彻底跳过每次的量化步骤，可用[导出量化模型](export-quantized-models_zh.md)把量化结果存到磁盘，以后加载即用（也可直接下载已导出模型，见上面第二节的「附：下载 QuantFunc 预量化模型」小节）。
 
 **Q：Model Auto Loader 下拉是空的 / 只有 None？**
 A：下拉是联网懒加载的。检查网络与 `data_source`（国内选 `modelscope`），首次会在后台刷新目录；保存的工作流里选过的值即便当前不在列表里也会在执行时解析下载，不会因“Value not in list”而失败。

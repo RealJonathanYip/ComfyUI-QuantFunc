@@ -177,7 +177,7 @@
 ## 八、导出 / 预览
 
 ### QuantFunc Export
-把管线导出为 diffusers 目录或单文件全家桶。详见 [导出量化模型教程](tutorial-2-export-quantized-models_zh.md)。
+把管线导出为 diffusers 目录或单文件全家桶。详见 [导出量化模型](export-quantized-models_zh.md)。
 
 ![](../assets/node-export.png)
 
