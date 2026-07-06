@@ -13,7 +13,7 @@ You **don't** need to download QuantFunc pre-quantized models to use this plugin
 
 ## Prerequisites
 
-1. ComfyUI-QuantFunc plugin installed (see [README_zh.md](../README_zh.md))
+1. ComfyUI-QuantFunc plugin installed (see [README.md](../README.md))
 2. CUDA 13.0+ runtime and cuDNN 9.x
 3. Download a diffusers-format model locally, e.g.:
 
