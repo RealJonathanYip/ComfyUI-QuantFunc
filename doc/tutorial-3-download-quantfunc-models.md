@@ -4,7 +4,7 @@
 
 ## Overview
 
-QuantFunc has pre-exported commonly used models that were runtime-quantized using the Lighting engine. You can download these **pre-exported quantized models** directly and use them immediately — no need to perform runtime quantization yourself.
+QuantFunc has pre-quantized and exported commonly used models. You can download these **pre-exported quantized models** directly and use them immediately — no need to perform runtime quantization yourself.
 
 These models offer:
 
@@ -12,36 +12,34 @@ These models offer:
 - **Fast inference**: 2x-11x speedup
 - **Ready to use**: Download, set path, and go
 
-![Workflow overview](../assets/t1t3-workflow-overview.png)
+![Text-to-image workflow overview](../assets/t2i-overview.png)
 
-> **Workflow files (use the SVDQ group on the left side):**
-> - Text-to-image: [`workflow_sample/QuantFunc-Text-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Text-to-Image-Workflow.json)
-> - Image editing: [`workflow_sample/QuantFunc-Image-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Image-to-Image-Workflow.json)
+> **Sample workflow:** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) — use the "Sample for text to image" group for t2i, or "Sample for edit Image" for editing.
 
 ## Step 1: Determine Your GPU Variant
 
-QuantFunc provides different quantized model versions by GPU architecture:
+QuantFunc provides different quantized model versions per GPU architecture:
 
-| GPU Variant | Compatible GPUs | Notes |
-|-------------|----------------|-------|
+| GPU Variant | GPUs | Notes |
+|-------------|------|-------|
 | `50x-below` | RTX 20/30/40 series | Optimized for Turing/Ampere/Ada |
 | `50x-above` | RTX 50 series | Optimized for Blackwell |
 
-> **Important:** Base model and transformer weights must use the **same GPU variant**.
+> **Important:** The base model and transformer weights must use the **same GPU variant**. (Model AutoLoader auto-matches this when downloading — see [Tutorial 0](tutorial-0-easy-gen.md).)
 
-## Step 2: Download Models
+## Step 2: Download the Model
 
 Download pre-quantized models from:
 
 - **ModelScope**: https://www.modelscope.cn/models/QuantFunc
 - **HuggingFace**: https://huggingface.co/QuantFunc
 
-QuantFunc provides two types of pre-exported models — **SVDQ** and **Lighting**. Both are ready to use, but use different backends:
+QuantFunc provides two types of pre-exported models — **SVDQ** and **Lighting**, both usable directly. The backend is **auto-detected** by the engine from the weight metadata — no manual selection:
 
-| Model Type | Backend | Transformer Weights | Notes |
-|------------|---------|-------------------|-------|
-| SVDQ | `svdq` | SVDQ transformer | Offline SVD quantization |
-| Lighting | `lighting` | Lighting transformer | Exported from runtime quantization, no low-rank overhead |
+| Model Type | Auto-detected as | Notes |
+|------------|------------------|-------|
+| SVDQ | `svdq` | Offline SVD quantization; stacking LoRA needs a LoRA Config node |
+| Lighting | `lighting` | Exported from runtime quantization, no low-rank compute overhead; LoRA stacks directly |
 
 Each model repo typically contains:
 
@@ -51,57 +49,42 @@ QuantFunc/SomeModel/
 ├── transformer/              # pre-quantized transformer weights
 │   └── *.safetensors
 ├── vae/                      # VAE weights
-├── tokenizer/                # Tokenizer
-├── text_encoder/             # Text encoder
-└── scheduler/                # Scheduler config
+├── tokenizer/                # tokenizer
+├── text_encoder/             # text encoder
+└── scheduler/                # scheduler config
 ```
 
 Download example:
 
 ```bash
-# Using modelscope (recommended for China)
+# with modelscope (recommended in China)
 pip install modelscope
 modelscope download --model QuantFunc/YourModel-SVDQ --local_dir /path/to/QuantFunc-Model
 
-# Or using huggingface-cli
+# or with huggingface-cli
 huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc-Model
 ```
 
 ![Model download page](../assets/t2-step2-download-model.png)
 
-## Step 3: Import Workflow and Configure
+## Step 3: Import the Workflow and Configure
 
-Import `workflow_sample/QuantFunc-Text-to-Image-Workflow.json` into ComfyUI. Choose the configuration that matches the model type you downloaded:
+Import `workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json` in ComfyUI and use the "Sample for text to image" group. The chain:
 
-### Option A: Load SVDQ Model
+```
+QuantFunc Model Loader → QuantFunc Build Pipeline → QuantFunc Generate → Preview Image
+```
 
-Use the **left-side SVDQ group** in the workflow.
+In the **QuantFunc Model Loader** node, point at the model you downloaded (both SVDQ and Lighting use the same Model Loader — the engine auto-detects the backend):
 
-![Import workflow and select SVDQ group](../assets/t2-step3-import-workflow.png)
+| Parameter | Setting |
+|-----------|---------|
+| `model_dir` | QuantFunc model directory, e.g. `/path/to/QuantFunc-Model` |
+| `transformer_path` | Transformer weights, e.g. `/path/to/QuantFunc-Model/transformer/model.safetensors` (SVDQ also accepts legacy nunchaku weights) |
 
-Configure the **QuantFunc Model Loader** node:
+![Configure Model Loader node](../assets/node-model-loader.png)
 
-| Parameter | Value |
-|-----------|-------|
-| `model_dir` | QuantFunc model directory, e.g., `/path/to/QuantFunc-Model` |
-| `transformer_path` | SVDQ transformer weight path, e.g., `/path/to/QuantFunc-Model/transformer/model.safetensors` (also compatible with legacy nunchaku quantized weights) |
-| `model_backend` | Select `svdq` |
-| `device` | GPU index (usually `0`) |
-
-### Option B: Load Lighting Pre-exported Model
-
-Use the **right-side Lighting group** in the workflow. The usage is the same as SVDQ — the only difference is that you select the Lighting transformer weights and set the backend to `lighting`.
-
-Configure the **QuantFunc Model Loader** node:
-
-| Parameter | Value |
-|-----------|-------|
-| `model_dir` | QuantFunc model directory, e.g., `/path/to/QuantFunc-Model` |
-| `transformer_path` | Lighting transformer weight path, e.g., `/path/to/QuantFunc-Model/transformer/model.safetensors` |
-| `model_backend` | Select `lighting` |
-| `device` | GPU index (usually `0`) |
-
-> **Note:** When loading a pre-exported Lighting model, `transformer_path` must point to the Lighting transformer weights. Since the model is already quantized, no runtime quantization occurs — it loads just as fast as SVDQ.
+> Model Loader has **no** `model_backend` or `device` parameter: the backend is auto-detected, and `device`/`precision_config` live on **Build Pipeline** (see [Tutorial 1, Step 3](tutorial-1-use-without-quantfunc-models.md)). Since the model is already quantized, there's no runtime quantization — loading is fast.
 
 ## Step 4: Configure Generation Parameters
 
@@ -111,73 +94,70 @@ In the **QuantFunc Generate** node:
 |-----------|-----------------|
 | `prompt` | Your text prompt |
 | `width` / `height` | `1024` x `1024` |
-| `steps` | `20`-`30` (full model) or `4` (Lightning distilled) |
-| `guidance_scale` | `3.5` |
+| `steps` | `20`-`30` (full model), `4` (Lightning distilled) |
+| `guidance_scale` | `3.5` (distilled models use `0`–`1`) |
 | `seed` | Any number |
 
-![Configure Generate node parameters](../assets/t1-step3-generate-params.png)
+![Configure Generate node parameters](../assets/node-generate.png)
 
 ## Step 5: Run
 
-Click **Queue Prompt**. SVDQ models load quickly with no runtime quantization overhead.
+Click **Queue Prompt**. Pre-quantized models load fast, and the first inference needs no runtime quantization.
 
-![SVDQ run result](../assets/t1-step4-run-result.png)
+## Using LoRA (SVDQ Backend)
 
-## Using LoRA with SVDQ Backend
-
-When using LoRA with SVDQ, you **must** add a **QuantFunc LoRA Config** node to control the merge strategy:
+When using LoRA with the SVDQ backend, you **must** add a **QuantFunc LoRA Config** node to control the merge strategy:
 
 ```
-Model Loader (svdq)
-    → QuantFunc LoRA (your LoRA)
-        → QuantFunc LoRA Config (merge strategy)
-            → QuantFunc Generate
+Build Pipeline → QuantFunc LoRA (your LoRA) → QuantFunc LoRA Config (merge strategy) → QuantFunc Generate
 ```
 
 **QuantFunc LoRA Config** parameters:
 
 | Parameter | Description |
 |-----------|-------------|
-| `merge_method` | `auto` (recommended) — auto-selects best method |
-| | `rop` — Rank-Orthogonal Projection (QuantFunc innovation, recommended) |
-| | `awsvd` — Activation-Weighted SVD |
+| `merge_method` | `auto` (recommended) — engine picks the best method |
 | | `itc` — IT+C method |
-| | `concat` — Direct concatenation (nunchaku's approach) |
-| `max_rank` | Max merged LoRA rank (1-1024, use default or `-1` for auto) |
+| | `awsvd` — Activation-Weighted SVD |
+| | `rop` — Rank-Orthogonal Projection (QuantFunc's algorithm) |
+| | `concat` — direct concatenation (nunchaku's approach) |
+| `max_rank` | Max merged LoRA rank (default is fine) |
 
-> This is needed because SVDQ models have pre-quantized low-rank structures fused in, and new LoRAs must be merged with the existing structure.
+> This is because the SVDQ model already has a fused pre-quantized low-rank structure, so a new LoRA must be merged with it. The Lighting backend does **not** need a LoRA Config node (see [Tutorial 1](tutorial-1-use-without-quantfunc-models.md)).
 
-![SVDQ + LoRA + LoRA Config connection](../assets/t2-svdq-lora-config.png)
+![SVDQ + LoRA + LoRA Config connection](../assets/node-lora-config.png)
 
 ## Image Editing Mode
 
-Same as [Tutorial 1](tutorial-1-use-without-quantfunc-models.md):
+Use the "Sample for edit Image" group instead:
 
-1. Import `workflow_sample/QuantFunc-Image-to-Image-Workflow.json`
-2. Configure Model Loader using the SVDQ group
-3. Load reference images → QuantFunc Image List → Generate's `ref_images`
+1. Load a reference image with **LoadImage** → **QuantFunc Image List** → Generate's `ref_images`
+2. Describe the edit in the prompt
 
-![SVDQ image editing mode](../assets/t1-optional-image-edit.png)
+Mask inpainting / color matching / size alignment are in the [Image Editing guide](image-edit-mask-colormatch_zh.md) (Chinese).
 
-## SVDQ vs Lighting Comparison
+![Image editing workflow](../assets/edit-overview.png)
 
-| Dimension | SVDQ (Offline Quantization) | Lighting (Runtime Quantization) |
-|-----------|-----------------------|----------------------|
-| Model source | Must download QuantFunc models | Any diffusers FP16 model |
-| First load | Fast (direct load) | Slow (runtime quantization on first load) |
-| Inference speed | 2x-11x | 2x-11x (on sub-RTX 50 GPUs, ~20% faster than SVDQ) |
-| Quantization quality | Good (offline optimized) | Good |
-| LoRA usage | Requires LoRA Config node | Direct stacking, zero cost |
-| Flexibility | Limited to pre-quantized models | Any model works |
-| Export | Re-export with LoRA fused in | Export all runtime-quantized models to skip re-quantization |
+## SVDQ vs Lighting
+
+| Dimension | SVDQ (offline quant) | Lighting (runtime quant) |
+|-----------|----------------------|--------------------------|
+| Model source | Must download QuantFunc pre-quantized models | Any diffusers FP16 model |
+| First load | Fast (direct load) | Slow (first load runtime-quantizes; export via [Tutorial 2](tutorial-2-export-quantized-models.md) to speed up) |
+| Inference speed | 2x-11x | 2x-11x (~20% faster than SVDQ on sub-RTX-50 machines) |
+| Quant quality | Good (offline-optimized) | Good |
+| LoRA usage | Needs a LoRA Config node | Stacks directly, zero cost |
+| Flexibility | Limited to pre-quantized models | Any model |
+
+> Both backends are auto-detected by the engine — you just point at the corresponding weights.
 
 ## FAQ
 
 **Q: What's the difference between model_dir and transformer_path?**
-A: `model_dir` points to the full diffusers model directory (includes VAE, tokenizer, etc.), while `transformer_path` points to the specific quantized transformer weight file (.safetensors).
+A: `model_dir` points at the full diffusers model directory (with VAE, tokenizer, etc.); `transformer_path` points at the specific quantized transformer weights file (.safetensors).
 
 **Q: Output is all noise?**
-A: Ensure `model_backend` matches the transformer weights — use `svdq` for SVDQ weights and `lighting` for Lighting weights. Mismatching backend and weights produces noisy output.
+A: Make sure `transformer_path` points at **complete weights that match this model**, and that `precision_config` (on Build Pipeline) matches the model series. The backend is auto-detected — it can't (and needn't) be set manually; precision_config from different series cannot be mixed.
 
 **Q: Can I mix 50x-below and 50x-above?**
-A: No. You must use the variant matching your GPU, otherwise you may get errors or degraded performance.
+A: No. Use the variant matching your GPU, or you may get errors or degraded performance.

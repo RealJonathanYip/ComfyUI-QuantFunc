@@ -10,9 +10,14 @@ Lighting 后端每次加载模型时都会进行**运行时量化**。**导出�
 - **LoRA 已融合**（可选）：导出时可将 LoRA 永久融合进模型，无需每次运行时重新加载
 - **可分享**：导出的模型可以分享给他人直接使用
 
-![教程 2 工作流全貌](../assets/t2-workflow-overview.png)
+![导出工作流全貌](../assets/export-overview.png)
 
-> **工作流文件：** [`workflow_sample/QuantFunc-Model-Export.json`](../workflow_sample/QuantFunc-Model-Export.json)
+> **示例工作流：** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) —— 用其中「Sample for exportation」分组。链路：
+>
+> ```
+> Model Loader → Build Pipeline →（可选 LoRA）→ QuantFunc Export
+> ```
+> Export 节点接的是 **Build Pipeline** 输出的 `pipeline`，不是直接接 Model Loader。
 
 ## 使用场景
 
@@ -25,78 +30,56 @@ Lighting 后端每次加载模型时都会进行**运行时量化**。**导出�
 
 ## 第一步：导入导出工作流
 
-在 ComfyUI 中导入 `workflow_sample/QuantFunc-Model-Export.json`。
+在 ComfyUI 中导入 `workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`，使用「Sample for exportation」分组。
 
-## 第二步：配置 Model Loader
+## 第二步：配置 Model Loader + Build Pipeline
 
-根据你的模型选择后端：
+后端类型（lighting / svdq）由引擎从权重元数据**自动检测**，Model Loader 上没有 `model_backend` 参数——你只需**指向不同的权重**：
 
-### 方案 A：导出运行时量化模型（Lighting 后端，从 FP16）
+### 方案 A：导出 Lighting 运行时量化模型（指向 FP16 原模型）
 
-当你使用 Lighting 运行时量化后觉得效果不错，可以将量化后的模型导出到磁盘。下次加载时直接读取已导出的量化权重，跳过运行时量化步骤，**加载速度通常提升两倍以上**。
+当你用 Lighting 运行时量化后觉得效果不错，可以把量化结果导出到磁盘。下次加载直接读取已导出的量化权重，跳过运行时量化，**加载速度通常提升两倍以上**。
 
-```
-QuantFunc Model Loader (lighting)
-    → QuantFunc LoRA (LoRA 1)
-        → QuantFunc LoRA (LoRA 2, 可选)
-            → QuantFunc Export
-```
-
-Lighting 后端的 Model Loader 配置与[教程 1](tutorial-1-use-without-quantfunc-models_zh.md) 相同：
+Model Loader 配置与[教程 1](tutorial-1-use-without-quantfunc-models_zh.md) 相同：
 
 | 参数 | 设置 |
 |------|------|
-| `model_dir` | 你的 FP16 基础模型路径，例如 `/path/to/Qwen-Image-Edit-2511` |
+| `model_dir` | 你的 FP16 基础模型目录，例如 `/path/to/Qwen-Image-Edit-2511` |
 | `transformer_path` | **留空** —— Lighting 会从 FP16 运行时量化 |
-| `model_backend` | `lighting` |
-| `device` | GPU 编号（通常为 `0`） |
-| `precision_config` | 逐层精度配置文件路径（详见[教程 1](tutorial-1-use-without-quantfunc-models_zh.md)） |
-| `fused_mod` | Qwen 系列模型建议开启 `True`（与 `prequant_weights` 互斥） |
-| `prequant_weights` | 预量化调制权重路径，低显存 GPU 推荐（与 `fused_mod` 互斥） |
+| `prequant_weights`（可选） | 预量化调制权重路径，低显存 GPU 推荐 |
 
-> **调制层优化选择：** 24 GB+ 显存用 `fused_mod = True`（画质更好）；8-12 GB 显存用 `prequant_weights`（模型从 ~14 GB 降到 ~11 GB）。导出时的选择会保存到模型元数据中，加载时自动启用。详见[教程 1 的调制层优化说明](tutorial-1-use-without-quantfunc-models_zh.md)。
+![配置 Model Loader 节点](../assets/node-model-loader.png)
 
-![Lighting 后端 Model Loader 配置](../assets/t1-step2-model-loader.png)
+> `device`、`precision_config` 在 **Build Pipeline** 上设置（详见[教程 1 第三步](tutorial-1-use-without-quantfunc-models_zh.md)）。调制层优化（高显存自动融合 / 低显存用 `prequant_weights`）见教程 1，导出时的选择会写进模型元数据，加载时自动启用。
 
-### 方案 B：从 SVDQ 模型导出（SVDQ 后端）
+### 方案 B：从现成 SVDQ 模型导出
 
-当你已有现成的 SVDQ 模型，并希望将指定的 LoRA 永久融合到模型中导出时，可以使用 SVDQ 后端导出。
-
-```
-QuantFunc Model Loader (svdq)
-    → QuantFunc LoRA (LoRA 1)
-        → QuantFunc LoRA Config (合并策略)
-            → QuantFunc Export
-```
-
-SVDQ 后端的 Model Loader 配置与[教程 3](tutorial-3-download-quantfunc-models_zh.md) 相同：
+当你已有现成的 SVDQ 量化模型，并希望把指定的 LoRA 永久融合进去再导出：
 
 | 参数 | 设置 |
 |------|------|
-| `model_dir` | QuantFunc 模型目录路径，例如 `/path/to/QuantFunc-Model` |
-| `transformer_path` | Transformer 权重路径，例如 `/path/to/QuantFunc-Model/transformer/model.safetensors`（也兼容旧版 nunchaku 的量化权重） |
-| `model_backend` | `svdq` |
-| `device` | GPU 编号（通常为 `0`） |
+| `model_dir` | QuantFunc 模型目录，例如 `/path/to/QuantFunc-Model` |
+| `transformer_path` | SVDQ Transformer 权重路径，例如 `/path/to/QuantFunc-Model/transformer/model.safetensors`（也兼容旧版 nunchaku 权重） |
 
-> SVDQ 后端导出时，如果叠加了 LoRA，必须添加 LoRA Config 节点。详见[教程 3 的 LoRA 配置说明](tutorial-3-download-quantfunc-models_zh.md)。
+引擎会从这些权重**自动识别为 svdq 后端**。
 
-![SVDQ 后端 Model Loader 配置](../assets/t2-step3-import-workflow.png)
+> SVDQ 导出若叠加 LoRA，**必须**加 **QuantFunc LoRA Config** 节点（合并策略）。详见[教程 3 的 LoRA 配置说明](tutorial-3-download-quantfunc-models_zh.md)。
 
 ## 第三步：添加 LoRA（可选）
 
-在 Model Loader 和 Export 之间插入 **QuantFunc LoRA** 节点：
+在 **Build Pipeline** 和 **Export** 之间插入 **QuantFunc LoRA Auto Loader**（或 **QuantFunc LoRA**）节点：
 
 ```
-Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
+Build Pipeline → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 ```
 
 每个 LoRA 节点：
-- `lora_path`：LoRA 文件路径
-- `scale`：LoRA 强度（0.0-2.0）
+- 选择 / 填写 LoRA `.safetensors`
+- `scale`：LoRA 强度（`0.0`–`2.0`，默认 `1.0`）
 
-> 你在这里设置的 LoRA 强度会被永久融合到导出的模型中。
+> 你在这里设置的 LoRA 强度会被永久融合到导出的模型中。SVDQ 后端还需接一个 **LoRA Config** 节点。
 
-![添加多个 LoRA 节点](../assets/t1-optional-add-lora.png)
+![添加 LoRA 节点](../assets/node-lora-auto-loader.png)
 
 ## 第四步：配置 Export 节点
 
@@ -105,20 +88,20 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 | 参数 | 说明 |
 |------|------|
 | `export_path` | 导出目录，例如 `/path/to/my-exported-model` |
-| `export_mode` | `all` —— 导出完整模型（推荐，包含 VAE、tokenizer 等） |
-| | `custom` —— 自定义选择导出组件 |
+| `export_format` | `diffusers`（HF 标准目录，每组件一个 safetensors，可当 `model_dir` 重新加载）或 `comfy_checkpoint`（单文件全家桶，可当 ComfyUI checkpoint 直接加载） |
+| `export_mode` | `all` —— 导出完整模型（推荐，含 VAE、tokenizer 等）；`custom` —— 自定义选择组件（仅 diffusers；comfy_checkpoint 强制 all） |
 
-如果选择 `custom`，可以单独控制：
+`export_mode = custom` 时用下面三个开关选择组件：
 
-| 参数 | 说明 |
-|------|------|
-| `export_transformer` | 导出 Transformer（量化权重 + 融合的 LoRA） |
-| `export_text_encoder` | 导出文本编码器 |
-| `export_vision_encoder` | 导出视觉编码器 |
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `export_transformer` | `True` | 导出 Transformer（量化权重 + 融合的 LoRA） |
+| `export_text_encoder` | `False` | 导出文本编码器 |
+| `export_vision_encoder` | `False` | 导出视觉编码器 |
 
-> **推荐使用 `all`**，这样导出的模型是完整的、独立的，可以直接作为 `model_dir` 使用。
+> **推荐 `export_mode = all`**，导出的模型完整独立，可直接作为 `model_dir` 使用。
 
-![配置 Export 节点](../assets/t3-step4-export-config.png)
+![配置 Export 节点](../assets/node-export.png)
 
 ## 第五步：执行导出
 
@@ -129,7 +112,7 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 3. 执行运行时量化（如果是 Lighting 从 FP16 量化）
 4. 将所有运行时量化的模型权重保存到指定目录
 
-导出完成后，目录结构类似：
+`diffusers` 格式导出完成后，目录结构类似：
 
 ```
 my-exported-model/
@@ -142,31 +125,27 @@ my-exported-model/
 └── scheduler/
 ```
 
-![导出完成](../assets/t3-step5-export-done.png)
+（`comfy_checkpoint` 格式则是单个 `model.safetensors` 全家桶。）
 
 ## 第六步：使用导出的模型
 
-导出的模型可以用两种方式加载：
+导出的模型可以用两种方式加载（后端由引擎从导出权重自动识别，无需选择）：
 
-### 方式 A：作为完整模型（推荐，适用于 `all` 导出模式）
+### 方式 A：作为完整模型（推荐，适用于 `all` / diffusers 导出）
 
 | 参数 | 设置 |
 |------|------|
 | `model_dir` | `/path/to/my-exported-model` |
 | `transformer_path` | 留空或指向导出的 Transformer 权重 |
-| `model_backend` | `lighting`（导出的运行时量化权重直接加载，无需重新量化） |
 
 ### 方式 B：仅替换 Transformer 权重
 
 | 参数 | 设置 |
 |------|------|
-| `model_dir` | 原始基础模型路径 |
+| `model_dir` | 原始基础模型目录 |
 | `transformer_path` | `/path/to/my-exported-model/transformer/model.safetensors` |
-| `model_backend` | 与导出时相同 |
 
-> 使用导出模型时**不需要**再添加之前的 LoRA 节点——LoRA 已经融合进去了。
-
-![使用导出的模型](../assets/t1-step2-model-loader.png)
+> 使用导出模型时**不需要**再添加之前的 LoRA 节点——LoRA 已经融合进去了。`comfy_checkpoint` 全家桶则用插件的 checkpoint 加载适配路径加载。
 
 ## 完整示例：从头到尾
 
@@ -178,27 +157,26 @@ my-exported-model/
 **导出流程：**
 
 ```
-Model Loader                    Export
-  model_dir: /models/FLUX.1-dev/    export_path: /models/my-anime-flux/
-  transformer_path: (空)             export_mode: all
-  model_backend: lighting
-      ↓
-  LoRA (anime-style, scale=0.8)
-      ↓
-  LoRA (detail-enhancer, scale=1.2)
-      ↓
-  Export
+Model Loader                     Build Pipeline        Export
+  model_dir: /models/FLUX.1-dev/    device: 0            export_path: /models/my-anime-flux/
+  transformer_path: (空)            precision_config:    export_format: diffusers
+                                      [auto-derive]      export_mode: all
+      ↓ model/clip/vae                   ↓ pipeline
+  Build Pipeline ───────────────→ LoRA (anime-style, 0.8)
+                                       ↓
+                                  LoRA (detail-enhancer, 1.2)
+                                       ↓
+                                  Export
 ```
 
 **使用导出模型：**
 
 ```
-Model Loader                    Generate
-  model_dir: /models/my-anime-flux/   prompt: "1girl, anime style..."
-  transformer_path: (空)               steps: 20
-  model_backend: lighting              ...
-      ↓
-  Generate → Preview Image
+Model Loader                     Build Pipeline    Generate
+  model_dir: /models/my-anime-flux/  device: 0        prompt: "1girl, anime style..."
+  transformer_path: (空)                              steps: 20
+      ↓                                ↓ pipeline          ↓
+  Build Pipeline ─────────────────────────────────→ Generate → Preview Image
 ```
 
 无需 LoRA 节点，加载即用！
