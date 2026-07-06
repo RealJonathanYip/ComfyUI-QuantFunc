@@ -213,13 +213,13 @@ pip install modelscope
 
 Lighting 导出功能将运行时量化产生的所有量化模型持久化到磁盘，避免每次启动都重新量化。如果叠加了 LoRA，LoRA 也会被永久融入导出的权重 —— 无需 LoRA 节点，无需重新量化，加载即用。
 
-> **[教程 2：导出运行时量化模型 →](doc/tutorial-2-export-quantized-models_zh.md)**
+> **[导出量化模型（含 LoRA 融合）→](doc/export-quantized-models_zh.md)**
 
 ### 3.3 下载并使用已导出的量化模型
 
 QuantFunc 已将常用模型提前进行运行时量化并导出，你可以直接从 [ModelScope](https://www.modelscope.cn/models/QuantFunc) 或 [HuggingFace](https://huggingface.co/QuantFunc) 下载这些**已导出的量化模型**，加载即用，无需自行量化。与运行时量化一样，这些模型同样能达到 2x-11x 推理加速，且跳过了量化步骤，加载更快。
 
-> **[教程 3：下载并使用已导出的量化模型 →](doc/tutorial-3-download-quantfunc-models_zh.md)**
+> **[模型加载与下载 →](doc/model-loading-and-apikey_zh.md)**
 
 ### 3.4 示例工作流
 

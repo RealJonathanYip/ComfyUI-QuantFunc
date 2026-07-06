@@ -1,25 +1,20 @@
-# Tutorial 2: Export Runtime-Quantized Models (with LoRA Fusion Support)
+# Export Quantized Models (with LoRA Fusion)
 
-[中文版本](tutorial-2-export-quantized-models_zh.md)
+[中文版本](export-quantized-models_zh.md)
 
-## Overview
+The Lighting backend runtime-quantizes a model every time it loads. The **export** function persists the runtime-quantized model to disk so later loads skip re-quantization entirely; if you've stacked LoRAs, they can be **permanently fused** into the exported weights. Exported models:
 
-The Lighting backend performs **runtime quantization** every time a model is loaded. The **export** function saves all runtime-quantized models to disk, so subsequent loads skip re-quantization entirely. If you've also stacked LoRAs, they are permanently fused into the exported weights. Exported models:
-
-- **All runtime-quantized models saved**: Skips runtime quantization on future loads — instant startup
-- **LoRA fused in** (optional): Export can permanently fuse LoRAs into the model — no need to reload them each run
-- **Shareable**: Exported models can be shared with others
+- **Skip runtime quantization** — instant load, usually 2x+ faster loading;
+- **LoRA fused in** (optional) — no need to re-attach LoRA nodes each run;
+- **Shareable** — package once and hand it to others.
 
 ![Export workflow overview](../assets/export-overview.png)
 
-> **Sample workflow:** [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) — use the "Sample for exportation" group. The chain:
->
-> ```
-> Model Loader → Build Pipeline → (optional LoRA) → QuantFunc Export
-> ```
-> The Export node takes the `pipeline` output of **Build Pipeline**, not the Model Loader directly.
+> This guide is checked per-parameter against the current plugin code (`nodes.py`'s `QuantFuncExport`); node names and parameters match what you see in ComfyUI.
 
-## Use Cases
+---
+
+## 1. What Export Is For (use cases)
 
 | Scenario | Description |
 |----------|-------------|
@@ -28,19 +23,27 @@ The Lighting backend performs **runtime quantization** every time a model is loa
 | Model distribution | Package a configured model to share with teammates |
 | Multi-LoRA merge | Merge several LoRAs into a single model to simplify workflows |
 
-## Step 1: Import the Export Workflow
+---
 
-Import `workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json` in ComfyUI and use the "Sample for exportation" group.
+## 2. The Export Chain
 
-## Step 2: Configure Model Loader + Build Pipeline
+Export is just an **Export** node appended to a normal loading pipeline:
 
-The backend (lighting / svdq) is **auto-detected** by the engine from the weight metadata — there is no `model_backend` parameter on Model Loader; you simply **point at different weights**:
+```
+QuantFunc Model Loader → QuantFunc Build Pipeline → (optional LoRA) → QuantFunc Export
+```
 
-### Option A: Export a Lighting runtime-quantized model (point at the FP16 model)
+> The Export node takes the `pipeline` output of **Build Pipeline**, not the Model Loader directly. The "Sample for exportation" group in [`workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json`](../workflow_sample/QuantFunc-Sample-WorkFlow-All-In-One.json) wires exactly this chain. Per-parameter details for the loader / Build Pipeline nodes are in [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese).
 
-Once you're happy with Lighting's runtime quantization, export it to disk. Future loads read the exported quantized weights directly, skipping runtime quantization — **loads are usually 2x+ faster**.
+---
 
-Model Loader config (same as in [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the local-directory loading section):
+## 3. Two Export Sources (backend auto-detected)
+
+The backend (lighting / svdq) is **auto-detected** by the engine from the weight metadata — there is no `model_backend` parameter on Model Loader; you just **point at different weights**.
+
+### A. Export a Lighting runtime-quantized model (point at the FP16 model)
+
+Once you're happy with Lighting's runtime quantization, export it. Model Loader config is the same as in [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the local-directory loading section:
 
 | Parameter | Setting |
 |-----------|---------|
@@ -50,11 +53,11 @@ Model Loader config (same as in [Model Loading & API Key](model-loading-and-apik
 
 ![Configure Model Loader node](../assets/node-model-loader.png)
 
-> `device` and `precision_config` are set on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the `precision_config` section). The modulation optimization (auto-fuse on high VRAM / `prequant_weights` on low VRAM) is covered there (the Model Loader section); the choice at export time is written into the model metadata and auto-applied on load.
+> `device` and `precision_config` are set on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese), the `precision_config` section). The modulation optimization (auto-fuse on high VRAM / `prequant_weights` on low VRAM) is covered there; the choice at export time is written into the model metadata and auto-applied on load.
 
-### Option B: Export from an existing SVDQ model
+### B. Export from an existing SVDQ model
 
-When you already have an SVDQ-quantized model and want to permanently fuse a LoRA into it before exporting:
+You already have an SVDQ-quantized model and want to permanently fuse a LoRA into it before exporting:
 
 | Parameter | Setting |
 |-----------|---------|
@@ -63,9 +66,11 @@ When you already have an SVDQ-quantized model and want to permanently fuse a LoR
 
 The engine **auto-detects svdq** from these weights.
 
-> For SVDQ export with a LoRA, you **must** add a **QuantFunc LoRA Config** node (merge strategy). See [Tutorial 3's LoRA config notes](tutorial-3-download-quantfunc-models.md).
+> For SVDQ export with a LoRA, you **must** add a **QuantFunc LoRA Config** node (merge strategy). LoRA / LoRA Config parameters (`merge_method`'s auto/itc/awsvd/rop/concat, `max_rank`) are in the [Node Reference](node-reference_zh.md) (Chinese), §4.
 
-## Step 3: Add LoRA (Optional)
+---
+
+## 4. Add LoRA (optional — fused into the exported weights)
 
 Insert **QuantFunc LoRA Auto Loader** (or **QuantFunc LoRA**) nodes between **Build Pipeline** and **Export**:
 
@@ -73,15 +78,15 @@ Insert **QuantFunc LoRA Auto Loader** (or **QuantFunc LoRA**) nodes between **Bu
 Build Pipeline → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 ```
 
-Each LoRA node:
-- Select / enter the LoRA `.safetensors`
-- `scale`: LoRA strength (`0.0`–`2.0`, default `1.0`)
-
-> The strength you set here is permanently fused into the exported model. The SVDQ backend additionally needs a **LoRA Config** node.
+Each LoRA node: select / enter the LoRA `.safetensors`; `scale` = LoRA strength (`0.0`–`2.0`, default `1.0`). The strength you set here is **permanently fused** into the exported model.
 
 ![Add LoRA node](../assets/node-lora-auto-loader.png)
 
-## Step 4: Configure the Export Node
+> The **Lighting backend** stacks LoRA directly and does **not** need a LoRA Config node; the **SVDQ backend** additionally needs a **LoRA Config** node (see [Node Reference](node-reference_zh.md) (Chinese), §4).
+
+---
+
+## 5. Export Node Parameters
 
 In the **QuantFunc Export** node:
 
@@ -89,7 +94,7 @@ In the **QuantFunc Export** node:
 |-----------|-------------|
 | `export_path` | Output directory, e.g. `/path/to/my-exported-model` |
 | `export_format` | `diffusers` (HF-style directory, one safetensors per component, reloadable as `model_dir`) or `comfy_checkpoint` (single-file all-in-one, loadable directly as a ComfyUI checkpoint) |
-| `export_mode` | `all` — export the full model (recommended, incl. VAE, tokenizer); `custom` — pick components (diffusers only; comfy_checkpoint forces all) |
+| `export_mode` | `all` — export the full model (recommended, incl. VAE, tokenizer); `custom` — pick components (`diffusers` only; `comfy_checkpoint` forces `all`) |
 
 When `export_mode = custom`, use these switches to pick components:
 
@@ -103,14 +108,16 @@ When `export_mode = custom`, use these switches to pick components:
 
 ![Configure Export node](../assets/node-export.png)
 
-## Step 5: Run the Export
+---
+
+## 6. Run the Export + Output Layout
 
 Click **Queue Prompt**. The export will:
 
-1. Load the base model
-2. Apply all LoRAs (at their configured strength and merge strategy)
-3. Run runtime quantization (if Lighting quantizing from FP16)
-4. Save all runtime-quantized model weights to the target directory
+1. Load the base model;
+2. Apply all LoRAs (at their configured strength and merge strategy);
+3. Run runtime quantization (when Lighting quantizes from FP16);
+4. Save all quantized model weights to the target directory.
 
 A `diffusers`-format export produces a directory like:
 
@@ -127,18 +134,20 @@ my-exported-model/
 
 (A `comfy_checkpoint` export is instead a single all-in-one `model.safetensors`.)
 
-## Step 6: Use the Exported Model
+---
 
-The exported model loads two ways (the backend is auto-detected from the exported weights — no selection needed):
+## 7. Use the Exported Model
 
-### Option A: As a complete model (recommended, for `all` / diffusers export)
+Two ways to load (the backend is auto-detected from the exported weights — no selection needed):
+
+**Option A: as a complete model** (recommended, for `all` / `diffusers` export)
 
 | Parameter | Setting |
 |-----------|---------|
 | `model_dir` | `/path/to/my-exported-model` |
 | `transformer_path` | Empty, or point at the exported transformer weights |
 
-### Option B: Replace only the transformer weights
+**Option B: replace only the transformer weights**
 
 | Parameter | Setting |
 |-----------|---------|
@@ -147,12 +156,11 @@ The exported model loads two ways (the backend is auto-detected from the exporte
 
 > You **don't** need to re-add the previous LoRA nodes — the LoRA is already fused in. A `comfy_checkpoint` all-in-one loads via the plugin's checkpoint-loader adapter path.
 
-## Complete Example: End to End
+---
 
-Suppose you have:
-- Base model: `/models/FLUX.1-dev/`
-- Style LoRA: `/loras/anime-style.safetensors` (strength 0.8)
-- Detail LoRA: `/loras/detail-enhancer.safetensors` (strength 1.2)
+## 8. Complete Example: End to End
+
+Say you have: base model `/models/FLUX.1-dev/`, style LoRA `/loras/anime-style.safetensors` (strength 0.8), detail LoRA `/loras/detail-enhancer.safetensors` (strength 1.2).
 
 **Export flow:**
 
@@ -169,19 +177,11 @@ Model Loader                     Build Pipeline        Export
                                   Export
 ```
 
-**Use the exported model:**
+**Use the exported model:** Model Loader (`model_dir: /models/my-anime-flux/`, `transformer_path` empty) → Build Pipeline → Generate. No LoRA nodes needed — load and go!
 
-```
-Model Loader                     Build Pipeline    Generate
-  model_dir: /models/my-anime-flux/  device: 0        prompt: "1girl, anime style..."
-  transformer_path: (empty)                           steps: 20
-      ↓                                ↓ pipeline          ↓
-  Build Pipeline ─────────────────────────────────→ Generate → Preview Image
-```
+---
 
-No LoRA nodes needed — load and go!
-
-## FAQ
+## 9. FAQ
 
 **Q: Can I stack new LoRAs on an exported model?**
 A: SVDQ-exported models can take new LoRAs (with a LoRA Config node). But **Lighting-exported models don't currently support stacking new LoRAs** — to change the LoRA combo, re-export from the original FP16 model.
