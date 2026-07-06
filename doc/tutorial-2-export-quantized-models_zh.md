@@ -40,7 +40,7 @@ Lighting 后端每次加载模型时都会进行**运行时量化**。**导出�
 
 当你用 Lighting 运行时量化后觉得效果不错，可以把量化结果导出到磁盘。下次加载直接读取已导出的量化权重，跳过运行时量化，**加载速度通常提升两倍以上**。
 
-Model Loader 配置与[教程 1](tutorial-1-use-without-quantfunc-models_zh.md) 相同：
+Model Loader 配置见 [模型加载与 API Key](model-loading-and-apikey_zh.md) 的 B 小节（本地目录加载）：
 
 | 参数 | 设置 |
 |------|------|
@@ -50,7 +50,7 @@ Model Loader 配置与[教程 1](tutorial-1-use-without-quantfunc-models_zh.md) 
 
 ![配置 Model Loader 节点](../assets/node-model-loader.png)
 
-> `device`、`precision_config` 在 **Build Pipeline** 上设置（详见[教程 1 第三步](tutorial-1-use-without-quantfunc-models_zh.md)）。调制层优化（高显存自动融合 / 低显存用 `prequant_weights`）见教程 1，导出时的选择会写进模型元数据，加载时自动启用。
+> `device`、`precision_config` 在 **Build Pipeline** 上设置（详见 [模型加载与 API Key](model-loading-and-apikey_zh.md) 第四节）。调制层优化（高显存自动融合 / 低显存用 `prequant_weights`）见同文 B 小节，导出时的选择会写进模型元数据，加载时自动启用。
 
 ### 方案 B：从现成 SVDQ 模型导出
 

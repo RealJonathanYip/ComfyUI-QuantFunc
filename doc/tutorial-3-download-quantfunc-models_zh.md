@@ -25,7 +25,7 @@ QuantFunc 根据 GPU 架构提供不同版本的量化模型：
 | `50x-below` | RTX 20/30/40 系列 | 针对 Turing/Ampere/Ada 优化 |
 | `50x-above` | RTX 50 系列 | 针对 Blackwell 优化 |
 
-> **重要：** 基础模型和 Transformer 权重必须使用**相同的 GPU 变体**。（用 Model AutoLoader 自动下载时会自动匹配，见[教程 0](tutorial-0-easy-gen_zh.md)。）
+> **重要：** 基础模型和 Transformer 权重必须使用**相同的 GPU 变体**。（用 Model AutoLoader 自动下载时会自动匹配，见 [模型加载与 API Key](model-loading-and-apikey_zh.md) A 小节。）
 
 ## 第二步：下载模型
 
@@ -84,7 +84,7 @@ QuantFunc Model Loader → QuantFunc Build Pipeline → QuantFunc Generate → P
 
 ![配置 Model Loader 节点](../assets/node-model-loader.png)
 
-> Model Loader 上**没有** `model_backend`、`device` 参数：后端自动识别，`device`/`precision_config` 在 **Build Pipeline** 上设置（详见[教程 1 第三步](tutorial-1-use-without-quantfunc-models_zh.md)）。因为模型已量化好，不会发生运行时量化，加载很快。
+> Model Loader 上**没有** `model_backend`、`device` 参数：后端自动识别，`device`/`precision_config` 在 **Build Pipeline** 上设置（详见 [模型加载与 API Key](model-loading-and-apikey_zh.md)）。因为模型已量化好，不会发生运行时量化，加载很快。
 
 ## 第四步：配置生成参数
 
@@ -123,7 +123,7 @@ Build Pipeline → QuantFunc LoRA (你的 LoRA) → QuantFunc LoRA Config (合�
 | | `concat` —— 直接拼接（nunchaku 的实现方式） |
 | `max_rank` | 最大合并 LoRA 秩（默认即可） |
 
-> 这是因为 SVDQ 模型中已经融合了预量化的低秩结构，新增 LoRA 需要与已有结构合并。Lighting 后端叠加 LoRA **不需要** LoRA Config 节点（见[教程 1](tutorial-1-use-without-quantfunc-models_zh.md)）。
+> 这是因为 SVDQ 模型中已经融合了预量化的低秩结构，新增 LoRA 需要与已有结构合并。Lighting 后端叠加 LoRA **不需要** LoRA Config 节点，直接串接即可。
 
 ![SVDQ + LoRA + LoRA Config 连接](../assets/node-lora-config.png)
 

@@ -25,7 +25,7 @@ QuantFunc provides different quantized model versions per GPU architecture:
 | `50x-below` | RTX 20/30/40 series | Optimized for Turing/Ampere/Ada |
 | `50x-above` | RTX 50 series | Optimized for Blackwell |
 
-> **Important:** The base model and transformer weights must use the **same GPU variant**. (Model AutoLoader auto-matches this when downloading — see [Tutorial 0](tutorial-0-easy-gen.md).)
+> **Important:** The base model and transformer weights must use the **same GPU variant**. (Model AutoLoader auto-matches this when downloading — see [Model Loading & API Key](model-loading-and-apikey_zh.md), section A.)
 
 ## Step 2: Download the Model
 
@@ -84,7 +84,7 @@ In the **QuantFunc Model Loader** node, point at the model you downloaded (both 
 
 ![Configure Model Loader node](../assets/node-model-loader.png)
 
-> Model Loader has **no** `model_backend` or `device` parameter: the backend is auto-detected, and `device`/`precision_config` live on **Build Pipeline** (see [Tutorial 1, Step 3](tutorial-1-use-without-quantfunc-models.md)). Since the model is already quantized, there's no runtime quantization — loading is fast.
+> Model Loader has **no** `model_backend` or `device` parameter: the backend is auto-detected, and `device`/`precision_config` live on **Build Pipeline** (see [Model Loading & API Key](model-loading-and-apikey_zh.md)). Since the model is already quantized, there's no runtime quantization — loading is fast.
 
 ## Step 4: Configure Generation Parameters
 
@@ -123,7 +123,7 @@ Build Pipeline → QuantFunc LoRA (your LoRA) → QuantFunc LoRA Config (merge s
 | | `concat` — direct concatenation (nunchaku's approach) |
 | `max_rank` | Max merged LoRA rank (default is fine) |
 
-> This is because the SVDQ model already has a fused pre-quantized low-rank structure, so a new LoRA must be merged with it. The Lighting backend does **not** need a LoRA Config node (see [Tutorial 1](tutorial-1-use-without-quantfunc-models.md)).
+> This is because the SVDQ model already has a fused pre-quantized low-rank structure, so a new LoRA must be merged with it. The Lighting backend does **not** need a LoRA Config node — it stacks LoRA directly.
 
 ![SVDQ + LoRA + LoRA Config connection](../assets/node-lora-config.png)
 

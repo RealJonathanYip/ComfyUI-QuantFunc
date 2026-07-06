@@ -104,6 +104,15 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 
 > **什么是 diffusers 格式？** 目录里有 `model_index.json`；其中的组件文件（transformer / text_encoder / vae）由节点在标准 HF 目录布局里自动定位。
 
+> **低显存优化：`prequant_weights`（QwenImage 系列）。** QwenImage 系列在低显存机器上可用**预量化调制权重**替代运行时的调制融合，二者互斥、按显存二选一：
+>
+> | 你的显存 | 推荐 | 说明 |
+> |----------|------|------|
+> | **24 GB+**（RTX 4090 等） | `prequant_weights` 留空 | 引擎自动做调制融合，画质更好，模型约 14 GB |
+> | **8–12 GB**（RTX 3060 等） | 设 `prequant_weights = 路径` | 模型约 11 GB，推理约 9 秒（无此优化需 20 秒+） |
+>
+> 从 [QuantFunc ModelScope](https://www.modelscope.cn/models/QuantFunc) 下载对应模型的 `mod_weights.safetensors`，把路径填进 `prequant_weights` 即可。
+
 ---
 
 ### C. 组件挑选 / 全家桶 —— Pick 系列（ComfyUI 原生风格）
@@ -117,7 +126,13 @@ QuantFunc 的加载**分两步走**，几乎所有工作流都是这个形状：
 | **QuantFunc Pick VAE (zero-load)** | `models/vae/` | `VAE` |
 | **QuantFunc Pick Checkpoint (zero-load, bundled)** | `models/checkpoints/` | 一次性输出 `MODEL`/`CLIP`/`VAE`（单文件全家桶，三路同源，按 key 前缀切片） |
 
-下图是全家桶单文件加载节点（一个文件同时给出 model/clip/vae）：
+下面三个是**分组件**加载节点，各输出一路 `MODEL` / `CLIP` / `VAE`：
+
+![Pick Diffusion Model 节点](../assets/node-pick-diffusion.png)
+![Pick CLIP 节点](../assets/node-pick-clip.png)
+![Pick VAE 节点](../assets/node-pick-vae.png)
+
+下图则是**全家桶**单文件加载节点（一个文件同时给出 model/clip/vae）：
 
 ![Pick Checkpoint（全家桶单文件）](../assets/node-pick-checkpoint.png)
 
@@ -131,7 +146,7 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 
 | 检测到的格式 | 依据 | 走的后端 | 含义 |
 |------|------|----------|------|
-| **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速。**必须配 precision_config**（见下节） |
+| **原精度 diffusers 基础模型** | 目录有 `model_index.json`，权重是 FP16/BF16 | **Lighting**（运行时量化） | 加载时把 FP16 权重量化为 4bit 加速（即“运行时量化”）——**无需预先转换或下载预量化模型**，任意 diffusers FP16 模型直接指过来即可。**必须配 precision_config**（见下节） |
 | **Lighting 预量化模型** | 元数据 `method` 为 `lighting` / `lighting_precomputed` / `flux2klein_runtime`，或权重键含 `._qweight` | **Lighting** | QuantFunc Lighting 导出的预量化权重，加载即用，跳过运行时量化 |
 | **SVDQ 预量化模型** | 元数据判定：`model_class` 含 `Nunchaku`，或 `quantization_config.method == svdquant` | **SVDQ** | Nunchaku SVDQ 预量化权重 |
 | **全家桶（已量化）单文件 checkpoint** | 单文件里同时含 `model.diffusion_model.` + `text_encoder(s).` + `vae.` 键前缀（≥2 类共存），且带 QuantFunc stamp 的量化元数据 | 自动识别为 bundled checkpoint | 一个文件打包 transformer + 文本编码器 + VAE，自动切片。**自带逐层精度，无需配 precision_config** |
@@ -156,7 +171,9 @@ Build Pipeline 读一次 safetensors 头部（只读 JSON 元数据，不读权�
 | **`[builtin] xxx.json`** | 使用插件内置（`<plugin>/configs` 或 `$QUANTFUNC_CONFIGS_DIR`）的固定精度表。 |
 | **`[series] yyy.json`** | 使用 QuantFunc 模型系列预设（按需从 ModelScope 下载）。 |
 
-也可以把这个下拉**转成输入接口**，从 **QuantFunc Precision Config Loader (path)** 或 **QuantFunc Precision Config Auto Loader** 用路径喂进来（见第五节）。
+也可以把这个下拉**转成输入接口**，从 **QuantFunc Precision Config Loader (path)** 或 **QuantFunc Precision Config Auto Loader** 用路径喂进来（见第五节）。下图是 **Precision Config Loader (path)** 节点（手动指向一份精度表 JSON，接到 Build Pipeline 的 `precision_config`）：
+
+![Precision Config Loader (path) 节点](../assets/node-precision-config-path.png)
 
 > **重点 1：加载“原精度 diffusers 基础模型”或“原精度全家桶 checkpoint”时，精度表几乎是必需的**——默认的 `[auto-derive]` 会替你自动挑一份并注入；如果你改成了 `[none]` 又没有量化元数据，模型会停留在原精度（**很慢、很占显存**）。
 >
@@ -241,6 +258,9 @@ A：Model Loader 在 `model_dir/transformer/` 下找不到权重。确认 `model
 
 **Q：原精度 diffusers 基础模型出图很慢、很占显存？**
 A：多半是没接精度表。Build Pipeline 的 `precision_config` 保持默认 `[auto-derive]`，或用 Precision Config (Auto) Loader 接一份匹配你模型系列的精度表。
+
+**Q：原精度模型首次加载/首次出图比后续慢很多？**
+A：正常。Lighting 运行时量化在**首次**加载时要额外花几十秒把 FP16 权重量化为 4bit，之后走缓存就快了。想彻底跳过每次的量化步骤，可用[教程 2：导出量化模型](tutorial-2-export-quantized-models_zh.md)把量化结果存到磁盘，以后加载即用（也可直接下载已导出模型，见[教程 3](tutorial-3-download-quantfunc-models_zh.md)）。
 
 **Q：Model Auto Loader 下拉是空的 / 只有 None？**
 A：下拉是联网懒加载的。检查网络与 `data_source`（国内选 `modelscope`），首次会在后台刷新目录；保存的工作流里选过的值即便当前不在列表里也会在执行时解析下载，不会因“Value not in list”而失败。

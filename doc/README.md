@@ -8,12 +8,21 @@
 
 ## English
 
+### Quick Start (Beginners)
+
+Fastest path to your first image — the **Model AutoLoader** downloads everything for you:
+
+1. Add a **QuantFunc Model Auto Loader**, pick a `model_series` (e.g. `QuantFunc/Z-Image-Series`). The GPU variant is auto-selected.
+2. Wire its `model` / `clip` / `vae` into **QuantFunc Build Pipeline** (set `device`; leave `precision_config` at `[auto-derive]`).
+3. Wire Build Pipeline into **QuantFunc Generate**, type a `prompt`, connect a **Preview Image** node.
+4. Queue Prompt — the model auto-downloads on first run (cached afterward).
+
+**No pre-quantized model needed:** point at a plain FP16 **diffusers** model and the **Lighting backend runtime-quantizes it to 4bit at load time** — no manual conversion. Full illustrated details (all three loading methods, `precision_config`, low-VRAM `prequant_weights`, API Key): [Model Loading & API Key](model-loading-and-apikey_zh.md) (Chinese).
+
 ### Tutorials
 
 | Tutorial | Description |
 |----------|-------------|
-| [Beginners: Easy Gen](tutorial-0-easy-gen.md) | Generate your first image with the Model AutoLoader — auto-download, no manual setup |
-| [Tutorial 1: Runtime Quantization](tutorial-1-use-without-quantfunc-models.md) | Quantize any BF16/FP16 model to 4bit at load time with Lighting — no pre-quantized models needed |
 | [Tutorial 2: Export Runtime-Quantized Models](tutorial-2-export-quantized-models.md) | Export all runtime-quantized models from Lighting to disk (with LoRA fusion support) |
 | [Tutorial 3: Download & Use Pre-exported Models](tutorial-3-download-quantfunc-models.md) | Download QuantFunc pre-exported quantized models for instant loading (2x-11x speedup) |
 
@@ -46,12 +55,21 @@ See the main [README.md](../README.md) for installation instructions.
 
 ## 中文
 
+### 快速上手（新手）
+
+出第一张图的最快路径 —— **Model AutoLoader** 帮你自动下载一切：
+
+1. 加一个 **QuantFunc Model Auto Loader**，选 `model_series`（如 `QuantFunc/Z-Image-Series`）。GPU 变体自动判定。
+2. 把它的 `model` / `clip` / `vae` 接到 **QuantFunc Build Pipeline**（选 `device`；`precision_config` 保持默认 `[auto-derive]`）。
+3. Build Pipeline 接到 **QuantFunc Generate**，填 `prompt`，再接一个 **Preview Image** 节点。
+4. 点 Queue Prompt —— 首次运行自动下载模型（之后走缓存）。
+
+**无需预量化模型：** 直接指向普通 FP16 **diffusers** 模型，**Lighting 后端会在加载时把它运行时量化为 4bit**，无需手动转换。完整图文详解（三大加载方式、`precision_config`、低显存 `prequant_weights`、API Key）见 [模型加载与 API Key](model-loading-and-apikey_zh.md)。
+
 ### 教程
 
 | 教程 | 说明 |
 |------|------|
-| [新手入门必看](tutorial-0-easy-gen_zh.md) | 用 Model AutoLoader 生成第一张图——自动下载，无需手动配置 |
-| [教程 1：运行时量化](tutorial-1-use-without-quantfunc-models_zh.md) | 基于 Lighting 将任意 BF16/FP16 模型量化为 4bit 加速推理，无需下载预量化模型 |
 | [教程 2：导出运行时量化模型](tutorial-2-export-quantized-models_zh.md) | 将 Lighting 运行时量化的所有模型导出到磁盘（支持融合 LoRA） |
 | [教程 3：下载并使用已导出的量化模型](tutorial-3-download-quantfunc-models_zh.md) | 下载 QuantFunc 提前导出的量化模型，加载即用（2x-11x 加速） |
 

@@ -197,17 +197,17 @@ pip install modelscope
 
 详细教程见 [doc/](doc/)，节点说明见 [workflow_sample/README_zh.md](workflow_sample/README_zh.md)。
 
-### 新手入门必看：3 个节点生成你的第一张图
+### 新手快速上手
 
-最简单的上手方式——导入 Easy Gen 工作流，从下拉菜单选择模型，插件自动下载，点击生成即可。无需手动下载模型或填写路径。
+最简单的上手方式——加一个 **Model Auto Loader**，从下拉菜单选择模型系列，接到 **Build Pipeline → Generate**，插件自动下载一切，点击生成即可。无需手动下载模型或填写路径。
 
-> **[新手入门必看 →](doc/tutorial-0-easy-gen_zh.md)**
+> **[快速上手与文档索引 →](doc/README.md)**
 
 ### 3.1 运行时量化：将 BF16/FP16 原模型量化为 4bit 加速推理
 
-**Lighting 后端**提供**运行时量化**能力 —— 基于 Lighting 引擎，在加载时将任意 diffusers 格式的 BF16/FP16 原模型（如 [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)）量化为 4bit 并加速推理。将 `model_backend` 设为 `lighting`，`transformer_path` 留空即可，无需下载预量化模型。
+**Lighting 后端**提供**运行时量化**能力 —— 在加载时将任意 diffusers 格式的 BF16/FP16 原模型（如 [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)）量化为 4bit 并加速推理。只需把 **Model Loader** 指向 FP16 原模型、`transformer_path` 留空即可（后端自动检测），无需下载预量化模型。
 
-> **[教程 1：运行时量化直接使用 →](doc/tutorial-1-use-without-quantfunc-models_zh.md)**
+> **[模型加载与运行时量化 →](doc/model-loading-and-apikey_zh.md)**
 
 ### 3.2 导出运行时量化模型（支持融合 LoRA）
 
