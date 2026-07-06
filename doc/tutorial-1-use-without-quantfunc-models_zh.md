@@ -79,7 +79,7 @@ QuantFunc Model Loader → QuantFunc Build Pipeline → QuantFunc Generate → P
 modelscope download --model QuantFunc/Qwen-Image-Edit-Series --include "precision-config/*" --local_dir /path/to/configs
 ```
 
-其他系列请在 [QuantFunc ModelScope 主页](https://www.modelscope.cn/models/QuantFunc) 找到对应仓库下的 `precision-config` 目录。下载后，用 **QuantFunc Precision Config (path)** 节点指向该 JSON 并接到 Build Pipeline 的 `precision_config`，或用 **Precision Config Auto Loader** 从下拉选择。
+其他系列请在 [QuantFunc ModelScope 主页](https://www.modelscope.cn/models/QuantFunc) 找到对应仓库下的 `precision-config` 目录。下载后，用 **QuantFunc Precision Config Loader (path)** 节点指向该 JSON 并接到 Build Pipeline 的 `precision_config`，或用 **Precision Config Auto Loader** 从下拉选择。
 
 ![Precision Config 节点](../assets/node-precision-config-path.png)
 

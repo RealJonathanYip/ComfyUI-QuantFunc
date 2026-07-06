@@ -79,7 +79,7 @@ Wire the Model Loader's `model`/`clip`/`vae` into **QuantFunc Build Pipeline**:
 modelscope download --model QuantFunc/Qwen-Image-Edit-Series --include "precision-config/*" --local_dir /path/to/configs
 ```
 
-For other series, find the `precision-config` folder under the matching repo on the [QuantFunc ModelScope homepage](https://www.modelscope.cn/models/QuantFunc). Then point a **QuantFunc Precision Config (path)** node at the JSON and wire it into Build Pipeline's `precision_config`, or select from the **Precision Config Auto Loader** dropdown.
+For other series, find the `precision-config` folder under the matching repo on the [QuantFunc ModelScope homepage](https://www.modelscope.cn/models/QuantFunc). Then point a **QuantFunc Precision Config Loader (path)** node at the JSON and wire it into Build Pipeline's `precision_config`, or select from the **Precision Config Auto Loader** dropdown.
 
 ![Precision Config node](../assets/node-precision-config-path.png)
 
